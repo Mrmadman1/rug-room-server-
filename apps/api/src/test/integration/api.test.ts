@@ -2,7 +2,7 @@ import { adminSecretsStore, env } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
-import { GAME_VERSION } from '@repo/domain'
+import { GAME_VERSION, seedRoomWithSubRooms, SUBROOM_SCHEMA_DDL } from '@repo/domain'
 
 import '../../api.app'
 
@@ -52,8 +52,10 @@ beforeAll(async () => {
 			creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL
 		)`
 	).run()
-	const insert = env.DB.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
-	await env.DB.batch(TEST_ROOMS.map((r) => insert.bind(JSON.stringify(r))))
+	// Subrooms live in their own table now; getRoomById hydrates from it, so create it and
+	// split each seeded room's subrooms into it (mirrors the rooms worker's 0007 migration).
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const r of TEST_ROOMS) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
 	// Accounts table (matching the auth worker's migration) — uploadsaved records
 	// profile thumbnails on the account row. Seed the account the test token (sub

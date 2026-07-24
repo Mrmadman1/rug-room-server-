@@ -15,6 +15,8 @@ import {
 	getRoomInstance,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
+	seedRoomWithSubRooms,
+	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
 import { scheduled } from '../../match.app'
@@ -90,8 +92,9 @@ beforeAll(async () => {
 			is_dorm INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsDorm')) VIRTUAL
 		)`
 	).run()
-	const insert = env.DB.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
-	await env.DB.batch(TEST_ROOMS.map((r) => insert.bind(JSON.stringify(r))))
+	// Subrooms live in their own table now; seed each room and split its subrooms into it.
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const r of TEST_ROOMS) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 	// Room instances (owned by the rooms worker) — matchmaking finds/creates here.
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (owned by the rooms worker) — written/read by matchmake + heartbeat.
@@ -506,6 +509,26 @@ describe('auth-gated endpoints', () => {
 			photonRoomId: first.roomInstance.photonRoomId,
 			roomInstanceId: first.roomInstance.roomInstanceId,
 		})
+	})
+
+	test('each player’s dorm gets a distinct global subroom id', async () => {
+		// Dorms used to copy the template subroom verbatim, so every dorm carried SubRoomId 1.
+		// With subrooms minted from the global sequence, each dorm gets its own unique id.
+		const dormSubRoomId = async (sub: string): Promise<number> => {
+			const body = (await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, {
+					method: 'POST',
+					headers: await bearer(sub),
+				})
+			).json()) as { roomInstance: { subRoomId: number } }
+			return body.roomInstance.subRoomId
+		}
+		const a = await dormSubRoomId('7001')
+		const b = await dormSubRoomId('7002')
+		expect(a).not.toBe(b)
+		// Neither reuses the seed dorm template's SubRoomId (1).
+		expect(a).not.toBe(1)
+		expect(b).not.toBe(1)
 	})
 
 	test('POST /matchmake/room/:roomId resolves a room by name from D1', async () => {

@@ -11,6 +11,7 @@ import {
 	getAccountByUsername,
 	getAccountsByPlatformId,
 	getPasswordHash,
+	getRoomById,
 	hashPassword,
 	RoomInstanceType,
 	setLastLoginTime,
@@ -101,12 +102,11 @@ async function placeNewPlayerInOrientation(
 	accountId: number,
 	deviceClass: number
 ): Promise<void> {
-	const row = await env.DB.prepare('SELECT data FROM room WHERE room_id = ?1')
-		.bind(ORIENTATION_ROOM_ID)
-		.first<{ data: string }>()
-	if (!row) return
+	// getRoomById hydrates the room's SubRooms from the subroom table (they no longer
+	// live in the room blob), so the Orientation scene resolves the same way match does.
+	const room = await getRoomById(env.DB, ORIENTATION_ROOM_ID)
+	if (!room) return
 
-	const room = JSON.parse(row.data) as Record<string, unknown>
 	const subRooms = room.SubRooms
 	const sub = (Array.isArray(subRooms) ? subRooms[0] : undefined) as
 		Record<string, unknown> | undefined

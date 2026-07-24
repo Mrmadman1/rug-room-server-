@@ -4,7 +4,14 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import '../../auth.app'
 
-import { getAccountsByDeviceId, hashPassword, PRESENCE_SCHEMA_DDL, SCHEMA_DDL } from '@repo/domain'
+import {
+	getAccountsByDeviceId,
+	hashPassword,
+	PRESENCE_SCHEMA_DDL,
+	SCHEMA_DDL,
+	seedRoomWithSubRooms,
+	SUBROOM_SCHEMA_DDL,
+} from '@repo/domain'
 
 import { isLinkedToPlatformIdentity } from '../../auth.app'
 import { REFRESH_SCHEMA_DDL } from '../../refresh-db'
@@ -48,16 +55,14 @@ beforeAll(async () => {
 			room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.RoomId')) VIRTUAL
 		)`
 	).run()
-	await env.DB.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
-		.bind(
-			JSON.stringify({
-				RoomId: 13,
-				Name: 'Orientation',
-				IsDorm: false,
-				SubRooms: [{ SubRoomId: 23, UnitySceneId: ORIENTATION_SCENE, MaxPlayers: 1 }],
-			})
-		)
-		.run()
+	// Subrooms live in their own table; seed the Orientation room and split its subroom into it.
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	await seedRoomWithSubRooms(env.DB, {
+		RoomId: 13,
+		Name: 'Orientation',
+		IsDorm: false,
+		SubRooms: [{ SubRoomId: 23, UnitySceneId: ORIENTATION_SCENE, MaxPlayers: 1 }],
+	})
 })
 
 /** Decode a JWT payload (no verification) for asserting claims. */

@@ -44,6 +44,24 @@ export const ROOM_SCHEMA_DDL: string[] = [
 	)`,
 ]
 
+/**
+ * Subroom schema DDL (mirror of migrations/0007_subrooms.sql). Subrooms are
+ * first-class entities with their own globally-unique, autoincrementing id — the
+ * original game mints `SubRoomId` from a single sequence, not per-room — so they
+ * live in their own table rather than inside the room JSON blob. `data` holds the
+ * rest of the subroom's client shape; `sub_room_id`/`room_id` are the authoritative
+ * columns (re-injected over `data` on read). Rooms re-embed their `SubRooms` array
+ * on read (see {@link getRoomById}); nothing persists SubRooms back into the room blob.
+ */
+export const SUBROOM_SCHEMA_DDL: string[] = [
+	`CREATE TABLE IF NOT EXISTS subroom (
+		sub_room_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		room_id INTEGER NOT NULL,
+		data TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_subroom_room ON subroom (room_id)`,
+]
+
 /** A stored room — the parsed JSON blob (full client-facing room response). */
 export type Room = Record<string, unknown>
 
@@ -120,7 +138,15 @@ export async function cloneRoom(
 		CreatedAt: new Date().toISOString(),
 	}
 
-	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(cloned)).run()
+	// serializeRoom drops the hydrated SubRooms from the blob; the clone's subrooms are
+	// inserted into the subroom table below with fresh globally-unique ids.
+	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(cloned)).run()
+	const sourceSubRooms = Array.isArray(source.SubRooms) ? (source.SubRooms as SubRoom[]) : []
+	const clonedSubRooms: SubRoom[] = []
+	for (const sub of sourceSubRooms) {
+		clonedSubRooms.push(await insertSubRoom(db, newRoomId, { ...sub, CreatorAccountId: accountId }))
+	}
+	cloned.SubRooms = clonedSubRooms
 	return cloned
 }
 
@@ -172,7 +198,7 @@ export async function updateRoomFields(
 	const updated: Room = { ...room, ...patch }
 	await db
 		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(updated))
+		.bind(roomId, serializeRoom(updated))
 		.run()
 	return updated
 }
@@ -207,7 +233,7 @@ export async function setRoomRole(
 	const updated: Room = { ...room, Roles: roles }
 	await db
 		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(updated))
+		.bind(roomId, serializeRoom(updated))
 		.run()
 	return updated
 }
@@ -249,16 +275,14 @@ export async function toggleRoomTag(
 	const updated: Room = { ...room, Tags: nextTags }
 	await db
 		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(updated))
+		.bind(roomId, serializeRoom(updated))
 		.run()
 	return updated
 }
 
-/** Find a subroom (by SubRoomId) inside a room's `SubRooms` array, or undefined. */
-export function findSubRoom(room: Room, subRoomId: number): Record<string, unknown> | undefined {
-	const subRooms = Array.isArray(room.SubRooms)
-		? (room.SubRooms as Array<Record<string, unknown>>)
-		: []
+/** Find a subroom (by SubRoomId) inside an already-hydrated room's `SubRooms`, or undefined. */
+export function findSubRoom(room: Room, subRoomId: number): SubRoom | undefined {
+	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
 	return subRooms.find((s) => s.SubRoomId === subRoomId)
 }
 
@@ -276,8 +300,9 @@ export interface SaveSubRoomDataInput {
 /**
  * Persist a room-save against a specific subroom: point the subroom at its newly
  * uploaded data blob (what the loader later downloads) and record the room-level
- * fields from the save. Returns the updated room, or null when the room or
- * subroom doesn't exist. The whole room JSON is rewritten (subrooms live in it).
+ * fields from the save. Returns the updated (hydrated) room, or null when the room or
+ * subroom doesn't exist. The subroom row is updated in the `subroom` table; the
+ * room-level fields are written to the room blob.
  */
 export async function saveSubRoomData(
 	db: D1Database,
@@ -288,7 +313,7 @@ export async function saveSubRoomData(
 ): Promise<Room | null> {
 	const room = await getRoomById(db, roomId)
 	if (!room) return null
-	const sub = findSubRoom(room, subRoomId)
+	const sub = await getSubRoom(db, roomId, subRoomId)
 	if (!sub) return null
 
 	// Populate the subroom's creator on first save — it starts null, and the
@@ -300,17 +325,19 @@ export async function saveSubRoomData(
 	if (input.roomDataFilename) sub.RoomDataBlob = input.roomDataFilename
 	sub.DataSavedAt = new Date().toISOString()
 	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
+	await updateSubRoom(db, sub)
 
 	// Room-level fields carried by the save.
 	if (typeof input.description === 'string') room.Description = input.description
 	if (input.persistenceVersion !== undefined) room.PersistenceVersion = input.persistenceVersion
 	if (input.inventionUsage !== undefined) room.InventionUsage = input.inventionUsage
-
 	await db
 		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(room))
+		.bind(roomId, serializeRoom(room))
 		.run()
-	return room
+
+	// Re-hydrate so the returned room reflects the just-saved subroom.
+	return hydrateRoom(db, room)
 }
 
 /** Fields from the client's subroom `modify` form (each applied only when supplied). */
@@ -322,9 +349,9 @@ export interface ModifySubRoomInput {
 
 /**
  * Modify a subroom's settings in place — its Name, Accessibility, and MaxPlayers
- * (the fields the client's subroom `modify` form carries). Only the supplied
- * fields are changed; the whole room JSON is rewritten (subrooms live in it).
- * Returns the updated room, or null when the room or subroom doesn't exist.
+ * (the fields the client's subroom `modify` form carries). Only the supplied fields
+ * are changed; the subroom row is updated in the `subroom` table. Returns the updated
+ * (hydrated) room, or null when the room or subroom doesn't exist.
  */
 export async function modifySubRoom(
 	db: D1Database,
@@ -332,61 +359,37 @@ export async function modifySubRoom(
 	subRoomId: number,
 	input: ModifySubRoomInput
 ): Promise<Room | null> {
-	const room = await getRoomById(db, roomId)
-	if (!room) return null
-	const sub = findSubRoom(room, subRoomId)
+	const sub = await getSubRoom(db, roomId, subRoomId)
 	if (!sub) return null
 
 	if (input.name !== undefined) sub.Name = input.name
 	if (input.accessibility !== undefined) sub.Accessibility = input.accessibility
 	if (input.maxPlayers !== undefined) sub.MaxPlayers = input.maxPlayers
+	await updateSubRoom(db, sub)
 
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(room))
-		.run()
-	return room
+	return getRoomById(db, roomId)
 }
 
 /**
  * Clone an existing subroom into a new subroom of the same room, owned by
  * `accountId`. The copy keeps the source's scene/settings (and its saved data
- * blobs, so it loads identical content) but gets a fresh SubRoomId — the next
- * integer above the room's current subrooms. Returns the updated room and the new
- * subroom, or null when the room or source subroom doesn't exist.
+ * blobs, so it loads identical content) but gets a fresh globally-unique SubRoomId
+ * minted from the `subroom` table's autoincrement sequence. Returns the updated
+ * (hydrated) room and the new subroom, or null when the room or source subroom
+ * doesn't exist.
  */
 export async function cloneSubRoom(
 	db: D1Database,
 	roomId: number,
 	subRoomId: number,
 	accountId: number
-): Promise<{ room: Room; subRoom: Record<string, unknown> } | null> {
-	const room = await getRoomById(db, roomId)
-	if (!room) return null
-	const source = findSubRoom(room, subRoomId)
+): Promise<{ room: Room; subRoom: SubRoom } | null> {
+	const source = await getSubRoom(db, roomId, subRoomId)
 	if (!source) return null
 
-	const subRooms = Array.isArray(room.SubRooms)
-		? (room.SubRooms as Array<Record<string, unknown>>)
-		: []
-	const nextSubRoomId =
-		subRooms.reduce((max, s) => {
-			const id = typeof s.SubRoomId === 'number' ? s.SubRoomId : 0
-			return id > max ? id : max
-		}, 0) + 1
-
-	const subRoom: Record<string, unknown> = {
-		...source,
-		SubRoomId: nextSubRoomId,
-		RoomId: room.RoomId,
-		CreatorAccountId: accountId,
-	}
-
-	room.SubRooms = [...subRooms, subRoom]
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, JSON.stringify(room))
-		.run()
+	const subRoom = await insertSubRoom(db, roomId, { ...source, CreatorAccountId: accountId })
+	const room = await getRoomById(db, roomId)
+	if (!room) return null
 	return { room, subRoom }
 }
 
@@ -397,10 +400,147 @@ interface RoomRow {
 const parseOne = (row: RoomRow | null): Room | null => (row ? (JSON.parse(row.data) as Room) : null)
 const parseAll = (rows: RoomRow[]): Room[] => rows.map((r) => JSON.parse(r.data) as Room)
 
+// ---- Subrooms -------------------------------------------------------------
+// Subrooms are their own table (globally-unique autoincrement `sub_room_id`); a
+// room's `SubRooms` array is reconstructed on read and never stored in the room blob.
+
+/** A stored subroom — the parsed JSON blob (its client shape). */
+export type SubRoom = Record<string, unknown>
+
+interface SubRoomRow {
+	sub_room_id: number
+	room_id: number
+	data: string
+}
+
+/** Materialize a subroom row into its client shape, with the columns authoritative. */
+const parseSubRoomRow = (row: SubRoomRow): SubRoom => ({
+	...(JSON.parse(row.data) as SubRoom),
+	SubRoomId: row.sub_room_id,
+	RoomId: row.room_id,
+})
+
+/** Serialize a subroom for storage — drop the id/room columns from the JSON blob. */
+const serializeSubRoom = (sub: SubRoom, roomId: number): string => {
+	const { SubRoomId: _id, RoomId: _room, ...rest } = sub
+	return JSON.stringify({ ...rest, RoomId: roomId })
+}
+
+/**
+ * Serialize a room for a full-blob write, dropping any hydrated `SubRooms` so it never
+ * gets denormalized back into the room JSON (subrooms are the `subroom` table's job).
+ */
+const serializeRoom = (room: Room): string => {
+	const { SubRooms: _subRooms, ...rest } = room
+	return JSON.stringify(rest)
+}
+
+/** Attach each room's `SubRooms` array from the subroom table (one batched query). */
+async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
+	const ids = rooms.map((r) => Number(r.RoomId)).filter((n) => Number.isFinite(n))
+	if (ids.length === 0) {
+		for (const room of rooms) room.SubRooms = []
+		return
+	}
+	const placeholders = ids.map((_, i) => `?${i + 1}`).join(',')
+	const { results } = await db
+		.prepare(
+			`SELECT sub_room_id, room_id, data FROM subroom
+			 WHERE room_id IN (${placeholders}) ORDER BY sub_room_id`
+		)
+		.bind(...ids)
+		.all<SubRoomRow>()
+	const byRoom = new Map<number, SubRoom[]>()
+	for (const r of results) {
+		const list = byRoom.get(r.room_id) ?? []
+		list.push(parseSubRoomRow(r))
+		byRoom.set(r.room_id, list)
+	}
+	for (const room of rooms) room.SubRooms = byRoom.get(Number(room.RoomId)) ?? []
+}
+
+/** Hydrate a single room's `SubRooms` (no-op for null). */
+async function hydrateRoom(db: D1Database, room: Room | null): Promise<Room | null> {
+	if (room) await attachSubRooms(db, [room])
+	return room
+}
+
+/** Hydrate many rooms' `SubRooms` in one batched query. */
+async function hydrateRooms(db: D1Database, rooms: Room[]): Promise<Room[]> {
+	await attachSubRooms(db, rooms)
+	return rooms
+}
+
+/** A single subroom of a room (columns authoritative), or null if it doesn't exist. */
+export async function getSubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number
+): Promise<SubRoom | null> {
+	const row = await db
+		.prepare('SELECT sub_room_id, room_id, data FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2')
+		.bind(roomId, subRoomId)
+		.first<SubRoomRow>()
+	return row ? parseSubRoomRow(row) : null
+}
+
+/** All of a room's subrooms, ordered by SubRoomId. */
+export async function getSubRooms(db: D1Database, roomId: number): Promise<SubRoom[]> {
+	const { results } = await db
+		.prepare('SELECT sub_room_id, room_id, data FROM subroom WHERE room_id = ?1 ORDER BY sub_room_id')
+		.bind(roomId)
+		.all<SubRoomRow>()
+	return results.map(parseSubRoomRow)
+}
+
+/**
+ * Insert a subroom for a room, minting a fresh globally-unique SubRoomId from the
+ * table's autoincrement sequence. Returns the created subroom (with its new id).
+ */
+export async function insertSubRoom(
+	db: D1Database,
+	roomId: number,
+	sub: SubRoom
+): Promise<SubRoom> {
+	const row = await db
+		.prepare('INSERT INTO subroom (room_id, data) VALUES (?1, ?2) RETURNING sub_room_id')
+		.bind(roomId, serializeSubRoom(sub, roomId))
+		.first<{ sub_room_id: number }>()
+	return { ...sub, SubRoomId: row!.sub_room_id, RoomId: roomId }
+}
+
+/** Overwrite a subroom's stored data blob in place. */
+async function updateSubRoom(db: D1Database, sub: SubRoom): Promise<void> {
+	await db
+		.prepare('UPDATE subroom SET data = ?2 WHERE sub_room_id = ?1')
+		.bind(sub.SubRoomId, serializeSubRoom(sub, Number(sub.RoomId)))
+		.run()
+}
+
+/**
+ * Seed a room together with its subrooms — inserts the room (SubRooms stripped from the
+ * blob) and each embedded subroom into the `subroom` table, preserving explicit ids.
+ * Used by the migration's data model in tests (mirrors 0007_subrooms.sql's backfill).
+ */
+export async function seedRoomWithSubRooms(db: D1Database, room: Room): Promise<void> {
+	const roomId = Number(room.RoomId)
+	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
+	await db.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
+	for (const sub of subRooms) {
+		await db
+			.prepare('INSERT INTO subroom (sub_room_id, room_id, data) VALUES (?1, ?2, ?3)')
+			.bind(Number(sub.SubRoomId), roomId, serializeSubRoom(sub, roomId))
+			.run()
+	}
+}
+
 /** Look up a single room by its RoomId. */
 export async function getRoomById(db: D1Database, roomId: number): Promise<Room | null> {
-	return parseOne(
-		await db.prepare('SELECT data FROM room WHERE room_id = ?1').bind(roomId).first<RoomRow>()
+	return hydrateRoom(
+		db,
+		parseOne(
+			await db.prepare('SELECT data FROM room WHERE room_id = ?1').bind(roomId).first<RoomRow>()
+		)
 	)
 }
 
@@ -420,11 +560,14 @@ export async function deleteRoom(db: D1Database, roomId: number): Promise<void> 
 
 /** Look up a single room by name (case-insensitive exact match). */
 export async function getRoomByName(db: D1Database, name: string): Promise<Room | null> {
-	return parseOne(
-		await db
-			.prepare('SELECT data FROM room WHERE name_lower = ?1')
-			.bind(name.toLowerCase())
-			.first<RoomRow>()
+	return hydrateRoom(
+		db,
+		parseOne(
+			await db
+				.prepare('SELECT data FROM room WHERE name_lower = ?1')
+				.bind(name.toLowerCase())
+				.first<RoomRow>()
+		)
 	)
 }
 
@@ -436,7 +579,7 @@ export async function getRoomsByIds(db: D1Database, ids: number[]): Promise<Room
 		.prepare(`SELECT data FROM room WHERE room_id IN (${placeholders})`)
 		.bind(...ids)
 		.all<RoomRow>()
-	return parseAll(results)
+	return hydrateRooms(db, parseAll(results))
 }
 
 /** All rooms created by an account (e.g. their dorm). */
@@ -445,7 +588,7 @@ export async function getRoomsByCreator(db: D1Database, accountId: number): Prom
 		.prepare('SELECT data FROM room WHERE creator_account_id = ?1')
 		.bind(accountId)
 		.all<RoomRow>()
-	return parseAll(results)
+	return hydrateRooms(db, parseAll(results))
 }
 
 /**
@@ -497,7 +640,7 @@ export async function getFavoritedRooms(
 		)
 		.bind(playerId)
 		.all<RoomRow>()
-	return parseAll(results).slice(skip, skip + take)
+	return hydrateRooms(db, parseAll(results).slice(skip, skip + take))
 }
 
 /**
@@ -522,7 +665,7 @@ export async function getVisitedRooms(
 		)
 		.bind(playerId)
 		.all<RoomRow>()
-	return parseAll(results).slice(skip, skip + take)
+	return hydrateRooms(db, parseAll(results).slice(skip, skip + take))
 }
 
 /** A player's interaction state with a room. */
@@ -686,7 +829,10 @@ export async function searchRooms(
 		}
 	}
 
-	return { Results: rooms.slice(skip, skip + take), TotalResults: rooms.length }
+	return {
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		TotalResults: rooms.length,
+	}
 }
 
 /** Engagement score used to order the hot feed (cheers weigh most, then favorites). */
@@ -723,7 +869,10 @@ export async function getHotRooms(
 
 	const roomId = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
 	rooms.sort((a, b) => hotScore(b) - hotScore(a) || roomId(a) - roomId(b))
-	return { Results: rooms.slice(skip, skip + take), TotalResults: rooms.length }
+	return {
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		TotalResults: rooms.length,
+	}
 }
 
 /**
@@ -741,10 +890,13 @@ export async function getRecommendedRooms(
 ): Promise<Room[]> {
 	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
 	const roomId = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
-	return parseAll(results)
-		.filter((r) => r.IsDorm !== true && r.Accessibility === 1 && r.ExcludeFromLists !== true)
-		.sort((a, b) => hotScore(b) - hotScore(a) || roomId(a) - roomId(b))
-		.slice(skip, skip + take)
+	return hydrateRooms(
+		db,
+		parseAll(results)
+			.filter((r) => r.IsDorm !== true && r.Accessibility === 1 && r.ExcludeFromLists !== true)
+			.sort((a, b) => hotScore(b) - hotScore(a) || roomId(a) - roomId(b))
+			.slice(skip, skip + take)
+	)
 }
 
 /** Compact room projection carried by a featured-room group. */
@@ -842,7 +994,10 @@ export async function getSimilarRooms(
 			roomIdOf(a.room) - roomIdOf(b.room)
 	)
 	const rooms = scored.map((x) => x.room)
-	return { Results: rooms.slice(skip, skip + take), TotalResults: rooms.length }
+	return {
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		TotalResults: rooms.length,
+	}
 }
 
 /**
@@ -856,10 +1011,13 @@ export async function getBaseRooms(db: D1Database, skip: number, take: number): 
 	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
 	const base = new Set(['base'])
 	const roomIdOf = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
-	return parseAll(results)
-		.filter((r) => roomHasAnyTag(r, base))
-		.sort((a, b) => roomIdOf(a) - roomIdOf(b))
-		.slice(skip, skip + take)
+	return hydrateRooms(
+		db,
+		parseAll(results)
+			.filter((r) => roomHasAnyTag(r, base))
+			.sort((a, b) => roomIdOf(a) - roomIdOf(b))
+			.slice(skip, skip + take)
+	)
 }
 
 /** The seeded template dorm (RoomId 1) that personal dorms are cloned from. */
@@ -878,11 +1036,14 @@ export async function getUsername(db: D1Database, accountId: number): Promise<st
 
 /** A player's personal dorm room (owned by them, IsDorm), or null if none yet. */
 export async function getDormRoom(db: D1Database, accountId: number): Promise<Room | null> {
-	return parseOne(
-		await db
-			.prepare('SELECT data FROM room WHERE creator_account_id = ?1 AND is_dorm = 1 LIMIT 1')
-			.bind(accountId)
-			.first<RoomRow>()
+	return hydrateRoom(
+		db,
+		parseOne(
+			await db
+				.prepare('SELECT data FROM room WHERE creator_account_id = ?1 AND is_dorm = 1 LIMIT 1')
+				.bind(accountId)
+				.first<RoomRow>()
+		)
 	)
 }
 
@@ -924,9 +1085,12 @@ export async function getOrCreateDormRoom(db: D1Database, accountId: number): Pr
 		Roles: [
 			{ AccountId: accountId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: 0 },
 		],
-		SubRooms: [{ ...templateSub, CreatorAccountId: accountId }],
 		CreatedAt: new Date().toISOString(),
 	}
-	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(room)).run()
+	// serializeRoom drops any SubRooms carried over from the template; the dorm's own
+	// subroom is inserted into the subroom table below with a fresh globally-unique id.
+	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
+	const subRoom = await insertSubRoom(db, roomId, { ...templateSub, CreatorAccountId: accountId })
+	room.SubRooms = [subRoom]
 	return room
 }

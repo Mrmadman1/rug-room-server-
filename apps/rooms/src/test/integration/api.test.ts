@@ -9,6 +9,8 @@ import {
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	seedRoomWithSubRooms,
+	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
 import importRooms from '../../../static/ImportRooms.json'
@@ -50,11 +52,12 @@ beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
 	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (read by the photon access-token handler).
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
-	const insert = env.DB.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)')
-	await env.DB.batch(importRooms.map((r) => insert.bind(JSON.stringify(r))))
+	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
+	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 })
 
 describe('rooms endpoints', () => {
@@ -1357,5 +1360,29 @@ describe('rooms endpoints', () => {
 			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${body.value?.SubRoomId}/data`)
 		).json()) as { SubRoomId: number }
 		expect(fetched.SubRoomId).toBe(body.value?.SubRoomId)
+	})
+
+	it('subroom clone mints a globally-unique SubRoomId (no cross-room clash)', async () => {
+		// The old per-room `max(SubRoomId)+1` allocator would mint id 3 for room 2's clone —
+		// colliding with another room that already owns subroom 3. The subroom table's
+		// autoincrement mints an id above every existing subroom instead.
+		const maxBefore = (await env.DB.prepare('SELECT MAX(sub_room_id) AS m FROM subroom').first<{
+			m: number
+		}>())!.m
+
+		const res = await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/clone`, {
+			method: 'POST',
+			headers: await bearer('1'),
+		})
+		const body = (await res.json()) as { value: { SubRoomId: number; RoomId: number } }
+		// Above every prior subroom id — a fresh global id, not a per-room collision.
+		expect(body.value.SubRoomId).toBeGreaterThan(maxBefore)
+		expect(body.value.RoomId).toBe(2)
+
+		// The id is unique across the whole table (exactly one row owns it).
+		const dupes = (await env.DB.prepare('SELECT COUNT(*) AS n FROM subroom WHERE sub_room_id = ?1')
+			.bind(body.value.SubRoomId)
+			.first<{ n: number }>())!.n
+		expect(dupes).toBe(1)
 	})
 })
