@@ -40,14 +40,14 @@ import {
 	EMPTY_OK,
 	ExclusiveLoginResponse,
 	form,
-	HeartbeatRequest as HeartbeatRequestSchema,
 	InProgressRequest,
 	InviteRequest,
 	JoinModeRequest,
 	json,
-	jsonBody,
+	LoginLockRequest,
 	MatchmakeResponse,
 	MatchmakeRoomRequest,
+	NotifyDisconnectRequest,
 	PlayerDto,
 	RoomInstanceDto,
 	StatusVisibilityRequest,
@@ -108,16 +108,6 @@ function playerPayload(playerId: number, presence?: Presence | null) {
 	}
 }
 
-/** Heartbeat body posted by the client (all fields optional). */
-interface HeartbeatRequest {
-	playerId?: number
-	statusVisibility?: number
-	deviceClass?: number
-	vrMovementMode?: number
-	appVersion?: string | null
-	platform?: number
-}
-
 /**
  * Resolve the account id from a Bearer token, mirroring the repeated
  * auth-header check. Returns `null` when the header is missing,
@@ -133,7 +123,7 @@ function unauthorized(c: Context<App>) {
 }
 
 /** A synthesized room instance (same shape for dorm and other rooms). */
-type RoomInstance = ReturnType<typeof dormRoomInstance>
+type RoomInstance = ReturnType<typeof roomInstanceFromRoom>
 
 /**
  * Stored presence for a player — the room instance they matchmade into plus the
@@ -165,7 +155,7 @@ const DEFAULT_GET_PLAYER = [{ ...playerPayload(1), isOnline: true }]
  * `photonRoomId` would let anyone who can read your presence `JoinByName` the Photon
  * room directly, bypassing the private-instance invite check — the friend list only
  * needs `roomId`/`name`/`isPrivate` to render the row, and joins go back through
- * matchmaking (`/goto/player/:id`), which enforces access. `photonRegion` is omitted
+ * matchmaking (`/matchmake/player/:playerId`), which enforces access. `photonRegion` is omitted
  * (not on the presence DTO); `name` is already the `^`-prefixed wire name.
  */
 function redactInstanceForPresence(instance: RoomInstance) {
@@ -260,6 +250,9 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 		vrMovementMode: prev?.vrMovementMode ?? 1,
 		platform: prev?.platform ?? account?.platform ?? 0,
 		appVersion: prev?.appVersion || GAME_VERSION,
+		// Carry the session lock recorded at login forward, so matchmake doesn't wipe it
+		// and the heartbeat can keep verifying against it.
+		loginLock: prev?.loginLock,
 	})
 	// Keep the destination instance's is_full flag in sync with live presence (the
 	// player's own presence, just written, is counted). Then re-evaluate the
@@ -276,15 +269,6 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	// fails the matchmake.
 	await notifyFriendsPresence(c, id)
 }
-
-/**
- * Fixed Photon room id for the dorm. With no RoomInstance DB we can't persist
- * the GUID minted at matchmake time, and the client's presence check compares
- * the *whole* instance (photonRoomId included). Every dorm entry point
- * (matchmake/goto, matchmake/none, the heartbeat) must therefore return the
- * exact same instance, so the id is a constant rather than random/per-account.
- */
-const DORM_PHOTON_ROOM_ID = '00000000-0000-4000-8000-000000000001'
 
 /** MatchmakingErrorCode.NoSuchRoom — returned when a room isn't in the DB. */
 const NO_SUCH_ROOM = 20
@@ -353,34 +337,6 @@ async function sendGameInvite(
 const ORIENTATION_INSTANCE_ID = -2
 
 /**
- * The canonical dorm room instance (room 1, instance 1.1). Returned identically
- * by every dorm entry point and the presence heartbeat so the client's local
- * presence never reads as out-of-sync.
- */
-function dormRoomInstance() {
-	return {
-		roomInstanceId: 1,
-		roomId: 1,
-		subRoomId: 1,
-		roomInstanceType: RoomInstanceType.Dormroom,
-		location: '76d98498-60a1-430c-ab76-b54a29b7a163',
-		dataBlob: '',
-		eventId: 0,
-		clubId: 0,
-		roomCode: '',
-		photonRegion: 'us',
-		photonRegionId: 'us',
-		photonRoomId: DORM_PHOTON_ROOM_ID,
-		name: '^DormRoom',
-		maxCapacity: 4,
-		isFull: false,
-		isPrivate: true,
-		isInProgress: false,
-		EncryptVoiceChat: false,
-	}
-}
-
-/**
  * Instance-relevant fields pulled from a stored room (scene, name, capacity, …).
  * The `location` is the SubRoom's real `UnitySceneId` — an empty/unknown location
  * makes the client reject the session with "unknown scene location ID".
@@ -426,7 +382,7 @@ function roomInstanceFromRoom(
 	instanceId: number,
 	photonRoomId: string,
 	subRoomId?: number
-): RoomInstance {
+) {
 	const f = instanceFieldsFromRoom(room, subRoomId)
 	return {
 		roomInstanceId: instanceId,
@@ -450,6 +406,12 @@ function roomInstanceFromRoom(
 	}
 }
 
+/** Read the session's `LoginLock` GUID from a form body (undefined when absent/empty). */
+async function readLoginLock(c: Context<App>): Promise<string | undefined> {
+	const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+	return typeof body.LoginLock === 'string' && body.LoginLock ? body.LoginLock : undefined
+}
+
 /** Read the `JoinMode` form field (2 = private instance). */
 async function readJoinMode(c: Context<App>): Promise<number> {
 	const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
@@ -460,9 +422,9 @@ async function readJoinMode(c: Context<App>): Promise<number> {
  * Read the room-matchmake form body once: `JoinMode` (2 = private) plus the party members
  * to pull along (`AdditionalPlayerIds`). The 2023 client posts its party on a room
  * matchmake so they can be invited into the instance the leader lands in;
- * `AdditionalPlayerIds` may repeat and/or be comma-separated, and ids are parsed
- * defensively, de-duplicated, and non-positive/garbage entries dropped. Parsed with
- * `{ all: true }` in one pass so repeated fields survive.
+ * `AdditionalPlayerIds` is a repeated field (one id each, never comma-separated), and
+ * ids are parsed defensively, de-duplicated, and non-positive/garbage entries dropped.
+ * Parsed with `{ all: true }` in one pass so the repeated fields survive.
  */
 async function readMatchmakeBody(
 	c: Context<App>
@@ -482,7 +444,6 @@ async function readMatchmakeBody(
 		...new Set(
 			values
 				.filter((v): v is string => typeof v === 'string')
-				.flatMap((v) => v.split(','))
 				.map((s) => Number.parseInt(s.trim(), 10))
 				.filter((n) => !Number.isNaN(n) && n > 0)
 		),
@@ -613,29 +574,62 @@ const app = new Hono<App>()
 	.notFound(withNotFound())
 
 	// ---- Player presence -----------------------------------------------------
-	// login/exclusivelogin are no-op acks and MUST NOT touch presence: the client
-	// fires exclusivelogin when going online, and clearing presence there would bounce
-	// the player to the dorm. Presence is overwritten by matchmake/goto and expires on
-	// its own TTL.
+	// login records the session's `LoginLock` in presence so the heartbeat can verify
+	// each beat belongs to this login; it must otherwise leave presence intact (clearing
+	// the room instance here would bounce the player to the dorm). Presence is overwritten
+	// by matchmake — which carries the lock forward — and expires on its own TTL.
 	.post(
 		'/player/login',
 		describeRoute({
 			tags: ['Presence'],
-			summary: 'Login ack (no-op)',
+			summary: 'Record the session login lock',
 			description: [
-				'A no-op ack. Must NOT touch presence — the client fires this going online, and',
-				'clearing presence here would bounce the player to the dorm.',
+				'Records the posted `LoginLock` in the player’s presence so later heartbeats can',
+				'verify they still own the session. Updates the live presence row if there is one,',
+				'otherwise seeds a lobby presence (no room) carrying the lock. Empty ack.',
 			].join(' '),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID'),
 			responses: { 200: EMPTY_OK },
 		}),
-		(c) => c.body(null, 200)
+		async (c) => {
+			const id = await authedId(c)
+			if (id !== null) {
+				const loginLock = await readLoginLock(c)
+				if (loginLock !== undefined) {
+					const presence = await getPresence<RoomInstance>(c.env.DB, id)
+					if (presence) {
+						presence.loginLock = loginLock
+						await setPresence(c.env.DB, presence)
+					} else {
+						// No live presence yet — seed a lobby row (roomInstance null) holding the
+						// lock, so it survives to the first matchmake (enterRoom carries it forward).
+						const account = await getAccount(c.env.DB, id)
+						await setPresence(c.env.DB, {
+							accountId: id,
+							roomInstance: null,
+							statusVisibility: 0,
+							deviceClass: account?.deviceClass ?? 0,
+							vrMovementMode: 1,
+							platform: account?.platform ?? 0,
+							appVersion: GAME_VERSION,
+							loginLock,
+						})
+					}
+				}
+			}
+			return c.body(null, 200)
+		}
 	)
 	.post(
 		'/player/exclusivelogin',
 		describeRoute({
 			tags: ['Presence'],
 			summary: 'Exclusive-login ack (no-op)',
-			description: 'A no-op ack returning a zero error code. Like login, must not touch presence.',
+			description: [
+				'Player exclusive login. Carries the session `LoginLock` (as every presence',
+				'lifecycle call does) but is currently a no-op ack. @todo implement login locking.',
+			].join(' '),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID'),
 			responses: { 200: json(ExclusiveLoginResponse, 'errorCode 0') },
 		}),
 		(c) => c.json({ errorCode: 0 })
@@ -649,7 +643,7 @@ const app = new Hono<App>()
 	// worker writes that presence with instance id -2). Clearing presence there wipes
 	// the seed and bounces the new player to the dorm — so a logout that still points
 	// at Orientation is left as a no-op ack. An unauthenticated logout is also a no-op
-	// (no player to clear).
+	// (no player to clear). @kludge probably a better solution for this.
 	.post(
 		'/player/logout',
 		describeRoute({
@@ -657,10 +651,12 @@ const app = new Hono<App>()
 			summary: 'Clear presence on logout',
 			description: [
 				'Clears the player’s presence so they read offline immediately and the instance',
-				'they were in frees up. EXCEPTION: a logout whose presence still points at the',
+				'they were in frees up. Carries the session `LoginLock` (as every presence',
+				'lifecycle call does). EXCEPTION: a logout whose presence still points at the',
 				'Orientation seed (instance -2) is left as a no-op, so the account-creation',
 				'bootstrap isn’t wiped. An unauthenticated logout is also a no-op.',
 			].join(' '),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID'),
 			responses: { 200: EMPTY_OK },
 		}),
 		async (c) => {
@@ -683,21 +679,35 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Fire-and-forget disconnect notification (form body `PlayerId`/`RoomInstanceId`).
-	// The client posts this when it drops a room; we don't act on it — presence is
-	// cleared by logout and otherwise expires on its own TTL — so just ack with 200.
+	// Photon disconnect notification (form body `PlayerId`/`RoomInstanceId`) — posted when
+	// Photon sees a player drop a room instance. We don't act on it yet (presence is cleared
+	// by logout and otherwise expires on its TTL), but the fields are parsed and logged so
+	// the hook is in place for a future background reconciliation check.
 	.post(
 		'/player/notifydisconnect',
 		describeRoute({
 			tags: ['Presence'],
-			summary: 'Disconnect notification (no-op ack)',
+			summary: 'Photon disconnect notification',
 			description: [
-				'Posted when the client drops a room. Not acted on — presence is cleared by logout',
-				'and otherwise expires on its TTL.',
+				'Posted by Photon when it sees a player drop a room instance (form body',
+				'`PlayerId`/`RoomInstanceId`). Currently just logged and acked — presence is cleared',
+				'by logout and otherwise expires on its TTL — but the hook is here for a future check.',
 			].join(' '),
+			requestBody: form(NotifyDisconnectRequest, 'The disconnecting player and the instance they left'),
 			responses: { 200: EMPTY_OK },
 		}),
-		(c) => c.body(null, 200)
+		async (c) => {
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const parseId = (v: unknown): number | null => {
+				const n = typeof v === 'string' ? Number.parseInt(v, 10) : NaN
+				return Number.isNaN(n) ? null : n
+			}
+			logger.info('player disconnect notification', {
+				playerId: parseId(body.PlayerId),
+				roomInstanceId: parseId(body.RoomInstanceId),
+			})
+			return c.body(null, 200)
+		}
 	)
 
 	.get(
@@ -706,27 +716,27 @@ const app = new Hono<App>()
 			tags: ['Presence'],
 			summary: 'Batch player presence lookup',
 			description: [
-				'Returns each requested player’s presence. `id` is repeatable and each value may',
-				'be a comma-separated list. With no ids, serves a single default (online) player.',
+				'Returns each requested player’s presence. `id` is a repeated query param',
+				'(`?id=2&id=155&id=153`) — one value each, not comma-separated. With no ids, serves',
+				'a single default (online) player.',
 			].join(' '),
 			parameters: [
 				{
 					name: 'id',
 					in: 'query',
 					required: false,
-					description: 'Repeatable; each value may be a comma-separated list of player ids',
+					description: 'Repeated once per player id (`?id=2&id=155`); not comma-separated',
 					schema: { type: 'array', items: { type: 'string' } },
 				},
 			],
 			responses: { 200: json(PlayerDto.array(), 'One entry per requested player') },
 		}),
 		async (c) => {
-			// Returns each requested player's presence. Reads the `id` query param(s);
-			// with none it serves the static getplayer.json default.
+			// Returns each requested player's presence. Reads the repeated `id` query
+			// param(s); with none it serves the static getplayer.json default.
 			const ids = c.req
 				.queries('id')
-				?.flatMap((v) => v.split(','))
-				.map((s) => Number.parseInt(s.trim(), 10))
+				?.map((s) => Number.parseInt(s.trim(), 10))
 				.filter((n) => !Number.isNaN(n))
 			if (!ids || ids.length === 0) return c.json(DEFAULT_GET_PLAYER)
 
@@ -743,16 +753,15 @@ const app = new Hono<App>()
 			tags: ['Presence'],
 			summary: 'Presence heartbeat',
 			description: [
-				'Merges the posted status fields into stored presence and echoes back the player',
-				'payload. Re-writes the row (refreshing its TTL) only when something changed or the',
-				'TTL is close to lapsing, so a still player isn’t written on every beat. With no',
-				'stored presence the player isn’t in a room yet (roomInstance null, isOnline false).',
+				'Returns the player’s current presence payload without mutating any stored fields —',
+				'the only side effect is refreshing the row’s TTL, and even that only when the TTL',
+				'is close to lapsing so a still player isn’t written on every beat. The posted',
+				'`LoginLock` is verified against the one recorded at login: a heartbeat carrying a',
+				'different lock is a superseded session and gets an empty body. With no stored',
+				'presence the player isn’t in a room yet (roomInstance null, isOnline false).',
 			].join(' '),
 			security: AUTHED,
-			requestBody: jsonBody(
-				HeartbeatRequestSchema,
-				'JSON status fields. A non-JSON (LoginLock) body is accepted and ignored.'
-			),
+			requestBody: form(LoginLockRequest, 'The session LoginLock GUID (verified, not stored)'),
 			responses: {
 				200: json(PlayerDto, 'The player’s current presence payload'),
 				401: UNAUTHORIZED_RESPONSE,
@@ -762,80 +771,38 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			// Body may be a JSON HeartbeatRequest or a form post (LoginLock); only JSON
-			// carries presence/status fields.
-			const raw = await c.req.text().catch(() => '')
-			let hb: HeartbeatRequest = {}
-			if (raw.trimStart().startsWith('{')) {
-				try {
-					hb = JSON.parse(raw) as HeartbeatRequest
-				} catch {
-					hb = {}
-				}
-			}
+			// The body is either a JSON status blob (no longer read — presence is returned
+			// verbatim) or a form carrying the session `LoginLock`. We only read the
+			// LoginLock, to verify this beat still owns the session; a JSON body simply
+			// yields no lock (parseBody fails and is swallowed).
+			const postedLock = await readLoginLock(c)
 
-			// Return the player's stored presence (set by matchmake/goto), mirroring the
+			// Return the player's stored presence (set at login/matchmake), mirroring the
 			// reference server's HeartbeatDB.GetPlayerHeartbeat. No presence → the player
-			// isn't in a room yet, so roomInstance=null / isOnline=false. Posted status
-			// fields are merged back; the row is re-written (refreshing the TTL) only when
-			// something changed or its TTL is close to lapsing — see below.
+			// isn't in a room yet, so roomInstance=null / isOnline=false.
 			const presence = await getPresence<RoomInstance>(c.env.DB, id)
 			if (presence) {
-				// Merge the posted status fields, tracking whether any actually changed.
-				let changed = false
-				const apply = <K extends keyof Presence>(key: K, value: Presence[K]) => {
-					if (presence[key] !== value) {
-						presence[key] = value
-						changed = true
-					}
+				// A heartbeat whose LoginLock disagrees with the one recorded at login belongs
+				// to a superseded session — return nothing so that stale client stops acting as
+				// the live one. (No posted lock, or none recorded yet, skips the check.)
+				if (
+					postedLock !== undefined &&
+					presence.loginLock !== undefined &&
+					presence.loginLock !== postedLock
+				) {
+					return c.body(null, 200)
 				}
-				if (hb.statusVisibility !== undefined) apply('statusVisibility', hb.statusVisibility)
-				if (hb.deviceClass !== undefined) apply('deviceClass', hb.deviceClass)
-				if (hb.vrMovementMode !== undefined) apply('vrMovementMode', hb.vrMovementMode)
-				if (hb.platform !== undefined) apply('platform', hb.platform)
-				if (hb.appVersion) apply('appVersion', hb.appVersion)
-				if (!presence.appVersion) apply('appVersion', GAME_VERSION)
 
-				// Extending the TTL means re-writing the row, so skip the write on an
-				// unchanged heartbeat until the TTL is within PRESENCE_REFRESH_THRESHOLD
-				// (s) of lapsing — a still player is refreshed periodically rather than on
-				// every beat. `expiresAt` is epoch seconds (set by setPresence).
+				// The heartbeat's only side effect is refreshing the TTL, and only once it's
+				// within PRESENCE_REFRESH_THRESHOLD (s) of lapsing — a still player is refreshed
+				// periodically rather than re-written on every beat. `expiresAt` is epoch seconds.
 				const nowSeconds = Math.floor(Date.now() / 1000)
-				const dueForRefresh = presence.expiresAt - nowSeconds <= PRESENCE_REFRESH_THRESHOLD
-				if (changed || dueForRefresh) {
+				if (presence.expiresAt - nowSeconds <= PRESENCE_REFRESH_THRESHOLD) {
 					await setPresence(c.env.DB, presence)
 				}
 			}
 
-			// The heartbeat echoes the same player payload `/player` serves; with no stored
-			// presence it falls back to what the client just posted.
-			const payload = {
-				...playerPayload(hb.playerId ? hb.playerId : id, presence),
-				statusVisibility: presence?.statusVisibility ?? hb.statusVisibility ?? 0,
-				deviceClass: presence?.deviceClass ?? hb.deviceClass ?? 0,
-				vrMovementMode: presence?.vrMovementMode ?? (hb.vrMovementMode ? hb.vrMovementMode : 1),
-				appVersion: presence?.appVersion || hb.appVersion || GAME_VERSION,
-				platform: presence?.platform ?? hb.platform ?? 0,
-			}
-
-			// Also push the presence over the websocket as a PresenceHeartbeatResponse,
-			// mirroring the reference's ReturnHeartbeat. Sent ephemerally (never queued) —
-			// a heartbeat fires on every beat, and a queued copy would pile up and arrive
-			// stale. Best-effort: the HTTP body carries the same payload regardless.
-			try {
-				await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayerEphemeral(
-					id,
-					NotificationType.PresenceHeartbeatResponse,
-					payload
-				)
-			} catch (err) {
-				logger.error('failed to push PresenceHeartbeatResponse notification', {
-					playerId: id,
-					error: err instanceof Error ? err.message : String(err),
-				})
-			}
-
-			return c.json(payload)
+			return c.json(playerPayload(id, presence))
 		}
 	)
 
@@ -870,85 +837,9 @@ const app = new Hono<App>()
 	)
 
 	// ---- Room navigation -----------------------------------------------------
-	// Each matchmake/goto persists the resulting instance as the player's presence
-	// so the heartbeat can replay it (keeping client presence in sync).
-	.post(
-		'/goto/room/:room',
-		describeRoute({
-			tags: ['Navigation'],
-			summary: 'Go to a room',
-			description: [
-				'Resolves the room (numeric id or name; `dormroom` → the player’s personal dorm),',
-				'finds or creates an instance, and stores it as presence. `JoinMode=2` requests a',
-				'private instance.',
-			].join(' '),
-			security: AUTHED,
-			requestBody: form(JoinModeRequest, 'Optional JoinMode'),
-			parameters: [
-				{
-					name: 'room',
-					in: 'path',
-					required: true,
-					description: 'Room id, room name, or `dormroom`',
-					schema: { type: 'string' },
-				},
-			],
-			responses: {
-				200: json(MatchmakeResponse, 'The instance (or errorCode 20 with null on unknown room)'),
-				401: UNAUTHORIZED_RESPONSE,
-			},
-		}),
-		async (c) => {
-			const id = await authedId(c)
-			if (id === null) return unauthorized(c)
-
-			const room = c.req.param('room')
-			const joinMode = await readJoinMode(c)
-			const instance =
-				room.toLowerCase() === 'dormroom'
-					? await playerDormInstance(c, id)
-					: await resolveRoomInstance(c, room, joinMode === 2, id)
-			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
-			await enterRoom(c, id, instance)
-			return c.json({ errorCode: 0, roomInstance: instance })
-		}
-	)
-
-	// Register the static `none` route before the `:room` param route so it
-	// isn't swallowed by the auth-gated matchmake handler.
-	.post(
-		'/matchmake/none',
-		describeRoute({
-			tags: ['Navigation'],
-			summary: 'Matchmake with no target (preserve or dorm)',
-			description: [
-				'Returns the player’s current instance if they have one (so Orientation isn’t warped',
-				'away), else their personal dorm when authed, or the shared offline dorm when not.',
-				'Not auth-gated.',
-			].join(' '),
-			responses: {
-				200: json(MatchmakeResponse, 'Current, personal-dorm, or offline-dorm instance'),
-			},
-		}),
-		async (c) => {
-			const id = await authedId(c)
-			// Return the player's *current* heartbeat here rather than forcing the dorm.
-			// Orientation is a solo room the client establishes via matchmake/none; if we
-			// force the dorm, the new player is warped out of Orientation within seconds.
-			// So: preserve existing presence; only fall back to the offline dorm when the
-			// player has none (e.g. the title screen before they've entered any room).
-			if (id !== null) {
-				const presence = await getPresence<RoomInstance>(c.env.DB, id)
-				if (presence?.roomInstance) {
-					return c.json({ errorCode: 0, roomInstance: presence.roomInstance })
-				}
-			}
-			// Authed but no presence → their personal dorm; unauthenticated → offline dorm.
-			const instance = id !== null ? await playerDormInstance(c, id) : dormRoomInstance()
-			if (id !== null) await enterRoom(c, id, instance)
-			return c.json({ errorCode: 0, roomInstance: instance })
-		}
-	)
+	// Each matchmake persists the resulting instance as the player's presence so the
+	// heartbeat can replay it (keeping client presence in sync).
+	//
 	// Matchmake into a club's clubhouse (`/matchmake/club/{clubId}`). Registered before
 	// the single-segment `/matchmake/:room` route so `club` isn't read as a room name.
 	// Members only: the clubhouse is the club's private space, so a non-member (or
@@ -1152,28 +1043,18 @@ const app = new Hono<App>()
 		}
 	)
 	.post(
-		'/matchmake/:room',
+		'/matchmake/dorm',
 		describeRoute({
 			tags: ['Navigation'],
-			summary: 'Matchmake into a room by id or name',
+			summary: 'Matchmake into the player’s dorm',
 			description: [
-				'Single-segment matchmake. `dorm` → the player’s personal dorm; otherwise resolves',
-				'the room by id or name. (Note: this dorm keyword is `dorm`, while goto/room uses',
-				'`dormroom`.)',
+				'Single-segment matchmake into the caller’s personal dorm, stored as presence. The',
+				'client only ever calls this with the `dorm` keyword — real rooms go through',
+				'`/matchmake/room/:roomId`.',
 			].join(' '),
 			security: AUTHED,
-			requestBody: form(JoinModeRequest, 'Optional JoinMode'),
-			parameters: [
-				{
-					name: 'room',
-					in: 'path',
-					required: true,
-					description: 'Room id, room name, or `dorm`',
-					schema: { type: 'string' },
-				},
-			],
 			responses: {
-				200: json(MatchmakeResponse, 'The instance (or errorCode 20 with null on unknown room)'),
+				200: json(MatchmakeResponse, 'The player’s personal dorm instance'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -1181,36 +1062,8 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			const room = c.req.param('room')
-			const joinMode = await readJoinMode(c)
-			// The dorm check here is "dorm" (goto/room uses "dormroom").
-			const instance =
-				room.toLowerCase() === 'dorm'
-					? await playerDormInstance(c, id)
-					: await resolveRoomInstance(c, room, joinMode === 2, id)
-			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			const instance = await playerDormInstance(c, id)
 			await enterRoom(c, id, instance)
-			return c.json({ errorCode: 0, roomInstance: instance })
-		}
-	)
-
-	// Offline dorm — also persisted as presence so the heartbeat stays in sync.
-	.post(
-		'/goto/none',
-		describeRoute({
-			tags: ['Navigation'],
-			summary: 'Go to the dorm',
-			description: [
-				'Authed → the player’s personal dorm (persisted as presence); unauthenticated → the',
-				'shared offline dorm. Unlike matchmake/none, this always goes to the dorm.',
-			].join(' '),
-			responses: { 200: json(MatchmakeResponse, 'The dorm instance') },
-		}),
-		async (c) => {
-			const id = await authedId(c)
-			// Authed → their personal dorm; unauthenticated → the offline dorm.
-			const instance = id !== null ? await playerDormInstance(c, id) : dormRoomInstance()
-			if (id !== null) await enterRoom(c, id, instance)
 			return c.json({ errorCode: 0, roomInstance: instance })
 		}
 	)

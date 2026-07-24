@@ -43,7 +43,7 @@ function defaultReputation(id: number) {
  * may itself be a comma-separated list, so `?id=1,2&id=3` is three ids.
  */
 const BULK_ID_QUERY = [
-	intQuery('id', 'Repeatable; each value may be a comma-separated list of account ids'),
+	intQuery('id', 'Repeated once per account id (`?id=1&id=2`); not comma-separated'),
 ]
 
 /** The `Ids` form body the bulk POST forms take. */

@@ -258,7 +258,7 @@ describe('public endpoints', () => {
 			}),
 		})
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ success: true, error: '' })
+		expect(await res.json()).toEqual([])
 	})
 
 	test('POST /api/playerReputation/v2/bulk returns a reputation per id', async () => {

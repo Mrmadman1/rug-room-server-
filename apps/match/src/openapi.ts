@@ -124,7 +124,7 @@ export const PlayerDto = z.object({
 })
 
 /**
- * The matchmake/goto result envelope. `errorCode` 0 with a `roomInstance` is success;
+ * The matchmake result envelope. `errorCode` 0 with a `roomInstance` is success;
  * a non-zero code (e.g. 20 NoSuchRoom) comes with `roomInstance: null`.
  */
 export const MatchmakeResponse = z.object({
@@ -136,17 +136,13 @@ export const MatchmakeResponse = z.object({
 export const ExclusiveLoginResponse = z.object({ errorCode: z.int().describe('Always 0') })
 
 /**
- * `POST /player/heartbeat` JSON body. All fields optional — the client also posts a
- * non-JSON (LoginLock form) body here, in which case none of these are read and stored
- * presence is echoed back unchanged.
+ * The session `LoginLock` GUID form field. The client posts it on every presence
+ * lifecycle call — `POST /player/login`, `/player/exclusivelogin`, `/player/logout`,
+ * and `/player/heartbeat` — so it's always present, not optional. Recorded in presence
+ * at login and verified on each heartbeat (a mismatched lock is a superseded session).
  */
-export const HeartbeatRequest = z.object({
-	playerId: z.int().optional(),
-	statusVisibility: z.int().optional(),
-	deviceClass: z.int().optional(),
-	vrMovementMode: z.int().optional(),
-	appVersion: z.string().nullable().optional(),
-	platform: z.int().optional(),
+export const LoginLockRequest = z.object({
+	LoginLock: z.string().describe('The session login-lock GUID (always sent)'),
 })
 
 /** `PUT /roominstance/:id/inprogress` form body. */
@@ -160,7 +156,16 @@ export const StatusVisibilityRequest = z.object({
 })
 
 /**
- * The `JoinMode` form field the matchmake/goto routes read (`2` = a private instance;
+ * `POST /player/notifydisconnect` form body — posted by Photon when it sees a player
+ * drop a room instance. Both fields are integer strings.
+ */
+export const NotifyDisconnectRequest = z.object({
+	PlayerId: z.string().describe('The account that disconnected'),
+	RoomInstanceId: z.string().describe('The room instance they dropped'),
+})
+
+/**
+ * The `JoinMode` form field the matchmake routes read (`2` = a private instance;
  * anything else = public). Posted as a urlencoded/multipart body.
  */
 export const JoinModeRequest = z.object({
@@ -170,16 +175,17 @@ export const JoinModeRequest = z.object({
 /**
  * The room-matchmake form body (`/matchmake/room/:roomId[/:subRoomId]`). Beyond
  * `JoinMode` the 2023 client posts `AdditionalPlayerIds` — the caller's party — so each
- * of them is invited (a game invite) into the instance the leader lands in. May repeat
- * and/or be comma-separated. Other fields the client sends (`LoginLock`,
- * `MaxPersistenceVersion`, `BypassMovementModeRestriction`) are accepted and ignored.
+ * of them is invited (a game invite) into the instance the leader lands in. It's a
+ * repeated field (one id each, not comma-separated). Other fields the client sends
+ * (`LoginLock`, `MaxPersistenceVersion`, `BypassMovementModeRestriction`) are accepted
+ * and ignored.
  */
 export const MatchmakeRoomRequest = z.object({
 	JoinMode: z.string().optional().describe('"2" requests a private instance'),
 	AdditionalPlayerIds: z
 		.string()
 		.optional()
-		.describe('Party members to invite into the room; repeatable and/or comma-separated'),
+		.describe('Party members to invite into the room; repeated once per id'),
 })
 
 /** `POST /invite` form body — invite a player into the caller's room instance. */

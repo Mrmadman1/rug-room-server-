@@ -258,22 +258,6 @@ describe('public endpoints', () => {
 		expect(players[0]).toMatchObject({ playerId: 1, isOnline: true, appVersion: GAME_VERSION })
 	})
 
-	test('POST /goto/none returns the offline dorm', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/goto/none`, { method: 'POST' })
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			errorCode: number
-			roomInstance: { name: string; location: string; photonRoomId: string }
-		}
-		expect(body.errorCode).toBe(0)
-		expect(body.roomInstance).toMatchObject({
-			name: '^DormRoom',
-			location: '76d98498-60a1-430c-ab76-b54a29b7a163',
-			isPrivate: true,
-		})
-		expect(body.roomInstance.photonRoomId).toMatch(/^[0-9a-f-]{36}$/)
-	})
-
 	test('POST /matchmake/room/:roomId resolves the room scene from D1', async () => {
 		const headers = await bearer('88')
 		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
@@ -425,45 +409,6 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual({ errorCode: 20, roomInstance: null })
 	})
 
-	test('POST /matchmake/none returns the offline dorm when the player has no presence', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/matchmake/none`, { method: 'POST' })
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			errorCode: number
-			roomInstance: { name: string; location: string; isPrivate: boolean; photonRoomId: string }
-		}
-		expect(body.errorCode).toBe(0)
-		expect(body.roomInstance).toMatchObject({
-			name: '^DormRoom',
-			location: '76d98498-60a1-430c-ab76-b54a29b7a163',
-			isPrivate: true,
-		})
-		expect(body.roomInstance.photonRoomId).toMatch(/^[0-9a-f-]{36}$/)
-	})
-
-	test('POST /matchmake/none preserves an existing presence (does not warp to the dorm)', async () => {
-		const auth = await bearer('314')
-		// Put the player in a room first (RecCenter), establishing presence.
-		await exports.default.fetch(`${ORIGIN}/matchmake/2`, { method: 'POST', headers: auth })
-		// matchmake/none must return that same room, not force the dorm — this is
-		// what keeps a new player in the solo Orientation room.
-		const res = await exports.default.fetch(`${ORIGIN}/matchmake/none`, {
-			method: 'POST',
-			headers: auth,
-		})
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			errorCode: number
-			roomInstance: { roomId: number; name: string; location: string }
-		}
-		expect(body.errorCode).toBe(0)
-		expect(body.roomInstance).toMatchObject({
-			roomId: 2,
-			name: '^RecCenter',
-			location: RECCENTER_SCENE,
-		})
-	})
-
 	test('PUT /player/statusvisibility returns 200', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/statusvisibility`, { method: 'PUT' })
 		expect(res.status).toBe(200)
@@ -483,80 +428,10 @@ describe('public endpoints', () => {
 })
 
 describe('auth-gated endpoints', () => {
-	test('POST /goto/room/:room 401s without a token', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/goto/room/dormroom`, { method: 'POST' })
-		expect(res.status).toBe(401)
-	})
-
-	test('POST /goto/room/dormroom creates and returns the player’s personal dorm', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/goto/room/dormroom`, {
-			method: 'POST',
-			headers: await bearer('42'),
-		})
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			errorCode: number
-			roomInstance: {
-				name: string
-				location: string
-				isPrivate: boolean
-				roomId: number
-				photonRoomId: string
-			}
-		}
-		expect(body.errorCode).toBe(0)
-		expect(body.roomInstance).toMatchObject({
-			// Named after the owner: `@<username>'s Dorm` (no `^` — the `@` is its prefix).
-			name: "@Tester's Dorm",
-			location: '76d98498-60a1-430c-ab76-b54a29b7a163',
-			isPrivate: true,
-		})
-		// The dorm gets its own unique Photon room id (isolated from other dorms).
-		expect(body.roomInstance.photonRoomId).toMatch(/^[0-9a-f-]{36}$/)
-		// A personal dorm room was created (not the seeded template RoomId 1)…
-		const roomId = body.roomInstance.roomId
-		expect(roomId).toBeGreaterThan(2)
-		// …owned by the player and flagged IsDorm so they can save it.
-		const row = await env.DB.prepare('SELECT data FROM room WHERE room_id = ?1')
-			.bind(roomId)
-			.first<{ data: string }>()
-		expect(JSON.parse(row!.data)).toMatchObject({ CreatorAccountId: 42, IsDorm: true })
-	})
-
-	test('POST /goto/room/:id resolves a real room scene from D1', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/goto/room/2`, {
-			method: 'POST',
-			headers: { ...(await bearer()), 'Content-Type': 'application/x-www-form-urlencoded' },
-			body: new URLSearchParams({ JoinMode: '2' }).toString(),
-		})
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			roomInstance: {
-				roomId: number
-				roomInstanceId: number
-				isPrivate: boolean
-				name: string
-				location: string
-				photonRoomId: string
-			}
-		}
-		expect(body.roomInstance).toMatchObject({
-			roomId: 2,
-			name: '^RecCenter',
-			location: RECCENTER_SCENE,
-			isPrivate: true,
-		})
-		// The instance id is the room_instance table id (high-based, so it never
-		// collides with the dorm's fixed instance id of 1).
-		expect(body.roomInstance.roomInstanceId).toBeGreaterThan(1)
-		// Every non-dorm instance gets a fresh random Photon room id (a bare UUID).
-		expect(body.roomInstance.photonRoomId).toMatch(/^[0-9a-f-]{36}$/)
-	})
-
-	test('POST /matchmake/:room reuses a public instance across players; a private one is fresh', async () => {
+	test('POST /matchmake/room/:roomId reuses a public instance across players; a private one is fresh', async () => {
 		const matchmake = async (sub: string, joinMode?: string) =>
 			(await (
-				await exports.default.fetch(`${ORIGIN}/matchmake/2`, {
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
 					method: 'POST',
 					headers: {
 						...(await bearer(sub)),
@@ -590,7 +465,7 @@ describe('auth-gated endpoints', () => {
 		expect(second).not.toBe(first)
 	})
 
-	test('POST /matchmake/:room 401s without a token', async () => {
+	test('POST /matchmake/dorm 401s without a token', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, { method: 'POST' })
 		expect(res.status).toBe(401)
 	})
@@ -633,8 +508,8 @@ describe('auth-gated endpoints', () => {
 		})
 	})
 
-	test('POST /matchmake/:room resolves a room by name from D1', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/matchmake/RecCenter`, {
+	test('POST /matchmake/room/:roomId resolves a room by name from D1', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/RecCenter`, {
 			method: 'POST',
 			headers: { ...(await bearer()), 'Content-Type': 'application/x-www-form-urlencoded' },
 			body: new URLSearchParams({ JoinMode: '2' }).toString(),
@@ -688,7 +563,7 @@ describe('auth-gated endpoints', () => {
 		expect(hb.roomInstance).toEqual(mm.roomInstance)
 	})
 
-	test('heartbeat merges posted status fields into stored presence', async () => {
+	test('heartbeat ignores posted status fields — stored presence is returned unchanged', async () => {
 		const headers = await bearer('8')
 		await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, { method: 'POST', headers })
 		const hb = (await (
@@ -703,37 +578,86 @@ describe('auth-gated endpoints', () => {
 			appVersion: string
 			isOnline: boolean
 		}
+		// Posted fields are NOT merged — the stored dorm presence (its defaults) is returned.
 		expect(hb).toMatchObject({
-			statusVisibility: 2,
-			platform: 5,
-			appVersion: '20210129',
+			statusVisibility: 0,
+			platform: 0,
+			appVersion: GAME_VERSION,
 			isOnline: true,
 		})
 	})
 
-	test('heartbeat pushes a PresenceHeartbeatResponse over the websocket', async () => {
+	test('heartbeat pushes no websocket frame', async () => {
 		// The notify DO is stubbed to record every send (see vitest.config).
 		type Sent = { playerId: number; notificationType: number; data: Record<string, unknown> }
 		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
-		await hub().fetch('http://do/all', { method: 'DELETE' })
 
 		const headers = await bearer('9600')
 		await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, { method: 'POST', headers })
+		// Clear whatever the matchmake fan-out recorded so we observe only the heartbeat.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
 		const res = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
 			method: 'POST',
-			headers: { ...headers, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ statusVisibility: 2 }),
+			headers,
 		})
 		expect(res.status).toBe(200)
-		const body = (await res.json()) as Record<string, unknown>
 
 		const sent = (await (await hub().fetch('http://do/all')).json()) as Sent[]
-		// Exactly one frame: PresenceHeartbeatResponse (4) to the beating player, whose
-		// payload is the very presence the HTTP body carried.
-		expect(sent).toHaveLength(1)
-		expect(sent[0].playerId).toBe(9600)
-		expect(sent[0].notificationType).toBe(4) // NotificationType.PresenceHeartbeatResponse
-		expect(sent[0].data).toEqual(body)
+		// The heartbeat no longer echoes itself back over the websocket.
+		expect(sent).toHaveLength(0)
+	})
+
+	test('login records the LoginLock; a superseded heartbeat gets an empty body', async () => {
+		const headers = await bearer('8100')
+		// Enter a room so there's live presence, then record this session's lock at login.
+		await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, { method: 'POST', headers })
+		await exports.default.fetch(`${ORIGIN}/player/login`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=session-one',
+		})
+
+		// A heartbeat carrying the recorded lock gets the presence back.
+		const ok = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=session-one',
+		})
+		expect(ok.status).toBe(200)
+		expect(((await ok.json()) as { isOnline: boolean }).isOnline).toBe(true)
+
+		// A heartbeat from a superseded session (different lock) gets nothing.
+		const stale = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=session-two',
+		})
+		expect(stale.status).toBe(200)
+		expect(await stale.text()).toBe('')
+	})
+
+	test('login with no live presence seeds a lobby row carrying the lock', async () => {
+		const headers = await bearer('8200')
+		await exports.default.fetch(`${ORIGIN}/player/login`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=lobby-lock',
+		})
+		// Online in the lobby (no room), and a mismatched heartbeat is rejected on the lock
+		// recorded at login even though no matchmake ever ran.
+		const hb = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=lobby-lock',
+		})
+		expect(((await hb.json()) as { isOnline: boolean; roomInstance: unknown }).isOnline).toBe(true)
+
+		const stale = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'LoginLock=other',
+		})
+		expect(await stale.text()).toBe('')
 	})
 
 	// Seed presence directly into D1 with a chosen `expiresAt` (epoch seconds) so the
@@ -822,7 +746,7 @@ describe('auth-gated endpoints', () => {
 	// Matchmake into a room, returning the resulting instance id.
 	const matchmakeInto = async (room: string, sub: string): Promise<number> => {
 		const res = (await (
-			await exports.default.fetch(`${ORIGIN}/matchmake/${room}`, {
+			await exports.default.fetch(`${ORIGIN}/matchmake/room/${room}`, {
 				method: 'POST',
 				headers: await bearer(sub),
 			})
@@ -1296,9 +1220,12 @@ describe('auth-gated endpoints', () => {
 			RoomId: 2,
 		})
 
-		// Multiple ids (comma-separated), de-duplicated, and the leader themselves is skipped.
+		// Multiple ids (repeated fields, not comma-separated), de-duplicated, and the leader
+		// themselves is skipped.
 		await reset()
-		await matchmake('AdditionalPlayerIds=153,154,153,9850&JoinMode=0')
+		await matchmake(
+			'AdditionalPlayerIds=153&AdditionalPlayerIds=154&AdditionalPlayerIds=153&AdditionalPlayerIds=9850&JoinMode=0'
+		)
 		const many = await sent()
 		expect(many.map((i) => i.playerId).sort((a, b) => a - b)).toEqual([153, 154])
 
@@ -1333,15 +1260,12 @@ describe('auth-gated endpoints', () => {
 			'GET /room/{roomId}/instances',
 			'GET /rooms/requiring/developer',
 			'GET /rooms/requiring/rrplus',
-			'POST /goto/none',
-			'POST /goto/room/{room}',
 			'POST /invite',
 			'POST /matchmake/club/{clubId}',
-			'POST /matchmake/none',
+			'POST /matchmake/dorm',
 			'POST /matchmake/player/{playerId}',
 			'POST /matchmake/room/{roomId}',
 			'POST /matchmake/room/{roomId}/{subRoomId}',
-			'POST /matchmake/{room}',
 			'POST /player/exclusivelogin',
 			'POST /player/heartbeat',
 			'POST /player/login',

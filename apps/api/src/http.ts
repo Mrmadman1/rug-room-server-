@@ -28,14 +28,13 @@ export async function parseFormIds(c: Context<App>): Promise<number[]> {
 		.filter((n) => !Number.isNaN(n))
 }
 
-/** Read integer ids from repeated/comma-separated `id` query params. The 2023
- * client passes these to the bulk GET endpoints (e.g. `?id=1&id=2`). */
+/** Read integer ids from repeated `id` query params. The 2023 client passes these to
+ * the bulk GET endpoints as one value per id (`?id=1&id=2`), never comma-separated. */
 export function queryIds(c: Context<App>): number[] {
 	return (
 		c.req
 			.queries('id')
-			?.flatMap((v) => v.split(','))
-			.map((s) => Number.parseInt(s.trim(), 10))
+			?.map((s) => Number.parseInt(s.trim(), 10))
 			.filter((n) => !Number.isNaN(n)) ?? []
 	)
 }

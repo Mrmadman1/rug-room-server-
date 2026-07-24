@@ -59,6 +59,13 @@ export interface PresenceInput<TRoomInstance = unknown> {
 	vrMovementMode: number
 	platform: number
 	appVersion: string
+	/**
+	 * The session's `LoginLock` GUID, bound from the form body at matchmake time. The
+	 * heartbeat posts it back purely to verify it still owns the session — a heartbeat
+	 * carrying a different lock is a superseded session and is rejected. Absent until a
+	 * matchmake supplies one.
+	 */
+	loginLock?: string
 }
 
 /** A stored presence row — the input plus its absolute expiry (epoch seconds). */
