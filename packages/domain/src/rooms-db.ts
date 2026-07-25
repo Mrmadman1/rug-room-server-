@@ -393,6 +393,79 @@ export async function cloneSubRoom(
 	return { room, subRoom }
 }
 
+/** Fallback scene, used only when a room has no existing subroom to inherit from. */
+const DEFAULT_SUBROOM_SCENE = '76d98498-60a1-430c-ab76-b54a29b7a163'
+
+/**
+ * The scene a brand-new subroom inherits: the room's own first (existing) subroom —
+ * lowest SubRoomId — read from the subroom table. Falls back to the base sandbox scene
+ * only when the room has no subrooms yet.
+ */
+async function baseSubRoomScene(db: D1Database, roomId: number): Promise<string> {
+	const row = await db
+		.prepare('SELECT data FROM subroom WHERE room_id = ?1 ORDER BY sub_room_id LIMIT 1')
+		.bind(roomId)
+		.first<{ data: string }>()
+	const scene = row ? (JSON.parse(row.data) as SubRoom).UnitySceneId : undefined
+	return typeof scene === 'string' ? scene : DEFAULT_SUBROOM_SCENE
+}
+
+/**
+ * Create a new (empty) subroom in a room, owned by `accountId` and named `name`. It
+ * inherits the room's existing subroom scene (see {@link baseSubRoomScene}) with a clean
+ * save, and gets a fresh globally-unique SubRoomId. Returns the updated (hydrated) room
+ * and the new subroom, or null when the room doesn't exist.
+ */
+export async function createSubRoom(
+	db: D1Database,
+	roomId: number,
+	accountId: number,
+	name: string
+): Promise<{ room: Room; subRoom: SubRoom } | null> {
+	const room = await getRoomById(db, roomId)
+	if (!room) return null
+
+	const subRoom = await insertSubRoom(db, roomId, {
+		Name: name,
+		CreatorAccountId: accountId,
+		UnitySceneId: await baseSubRoomScene(db, roomId),
+		MaxPlayers: 4,
+		Accessibility: Accessibility.Unlisted,
+		IsSandbox: true,
+		LastModeratedSaveModerationState: 0,
+		ShouldAutoStageSaves: true,
+		StagedSubRoomDataSaveId: null,
+	})
+	// Refresh the hydrated SubRooms so the returned room includes the one just inserted.
+	await attachSubRooms(db, [room])
+	return { room, subRoom }
+}
+
+/**
+ * Delete a subroom from a room. Refuses to remove a room's only subroom (that would
+ * leave it with no scene to load). Any saved-data blob the subroom pointed at is left in
+ * R2 (like {@link deleteRoom} leaves a room's images). Returns the updated (hydrated)
+ * room on success, or a reason: `not_found` (no such subroom) / `last_subroom`.
+ */
+export async function deleteSubRoom(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number
+): Promise<{ ok: true; room: Room } | { ok: false; reason: 'not_found' | 'last_subroom' }> {
+	const subRooms = await getSubRooms(db, roomId)
+	if (!subRooms.some((s) => s.SubRoomId === subRoomId)) return { ok: false, reason: 'not_found' }
+	if (subRooms.length <= 1) return { ok: false, reason: 'last_subroom' }
+
+	await db
+		.prepare('DELETE FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2')
+		.bind(roomId, subRoomId)
+		.run()
+
+	const room = await getRoomById(db, roomId)
+	if (!room) return { ok: false, reason: 'not_found' }
+	return { ok: true, room }
+}
+
 interface RoomRow {
 	data: string
 }

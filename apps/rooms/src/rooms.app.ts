@@ -6,7 +6,9 @@ import {
 	cloneRoom,
 	cloneSubRoom,
 	countRoomsByCreator,
+	createSubRoom,
 	deleteRoom,
+	deleteSubRoom,
 	findSubRoom,
 	getBaseRooms,
 	getFavoritedRooms,
@@ -823,6 +825,15 @@ const app = new Hono<App>()
 		return sub ? c.json(sub) : c.notFound()
 	})
 
+	// A subroom's saved-data versions — the room-history / "restore a save" list, paged as
+	// PagedResultsDTO<SubRoomDataSaveDTO> (`{ Results, TotalResults }`). We don't keep a save
+	// history yet: a save (POST …/data) overwrites the current blob inline on the subroom, so
+	// there are no distinct versions to list — this returns an empty page. The
+	// unityAssetTarget/unityAssetVersion/skip/take query params are accepted and ignored.
+	.get('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves', (c) =>
+		c.json({ Results: [], TotalResults: 0 })
+	)
+
 	// Save a subroom's data (room save). Auth-gated (401 with empty body). Editable
 	// by the room creator or a Creator/CoOwner role holder. Points the subroom at
 	// the uploaded data blobs and records the room-level save fields, notifies the
@@ -967,6 +978,69 @@ const app = new Hono<App>()
 
 		await pushRoomUpdate(c, accountId, result.room)
 		return roomEnvelope(c, result.subRoom)
+	})
+
+	// Create a new (empty) subroom in a room (form body `name`). Auth-gated (401) and
+	// owner-only. Mints a fresh globally-unique SubRoomId, bases the scene/capacity on the
+	// room's first subroom, notifies the owner (RoomUpdate), and returns the updated ROOM
+	// in the `{ success, error, value }` envelope (the client re-renders the room's subroom
+	// list from `value`, so it's the whole room, not the bare subroom).
+	.post('/rooms/:roomId{[0-9]+}/subrooms', async (c) => {
+		const accountId = await authedAccountId(c)
+		if (accountId === null) {
+			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+		}
+
+		const roomId = Number.parseInt(c.req.param('roomId'), 10)
+		const room = await getRoomById(c.env.DB, roomId)
+		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+		if (room.CreatorAccountId !== accountId) {
+			return roomEnvelope(c, null, 'You are not the owner of this room!')
+		}
+
+		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+		const name = typeof body.name === 'string' ? body.name.trim() : ''
+		if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
+
+		const result = await createSubRoom(c.env.DB, roomId, accountId, name)
+		if (!result) return roomEnvelope(c, null, 'This room does not exist!')
+
+		await pushRoomUpdate(c, accountId, result.room)
+		return roomEnvelope(c, result.room)
+	})
+
+	// Delete a subroom from a room. Auth-gated (401) and owner-only. Refuses to remove a
+	// room's only subroom. Notifies the owner (RoomUpdate) and returns the updated ROOM in
+	// the `{ success, error, value }` envelope (same shape as create, so the client
+	// re-renders the subroom list from `value`).
+	.delete('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}', async (c) => {
+		const accountId = await authedAccountId(c)
+		if (accountId === null) {
+			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+		}
+
+		const roomId = Number.parseInt(c.req.param('roomId'), 10)
+		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+		const room = await getRoomById(c.env.DB, roomId)
+		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+		if (room.CreatorAccountId !== accountId) {
+			return roomEnvelope(c, null, 'You are not the owner of this room!')
+		}
+
+		const result = await deleteSubRoom(c.env.DB, roomId, subRoomId)
+		if (!result.ok) {
+			return roomEnvelope(
+				c,
+				null,
+				result.reason === 'last_subroom'
+					? "You can't delete a room's only subroom!"
+					: 'This subroom does not exist!'
+			)
+		}
+
+		await pushRoomUpdate(c, accountId, result.room)
+		return roomEnvelope(c, result.room)
 	})
 
 	// Rooms similar to the given room (sharing tags). Paginated via skip/take (take

@@ -1385,4 +1385,112 @@ describe('rooms endpoints', () => {
 			.first<{ n: number }>())!.n
 		expect(dupes).toBe(1)
 	})
+
+	it('POST /rooms/:id/subrooms creates a new subroom (auth-gated, owner-only, fresh id)', async () => {
+		const create = async (roomId: number, name: string, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms`, {
+				method: 'POST',
+				headers: {
+					...(sub ? await bearer(sub) : {}),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ name }).toString(),
+			})
+		type SubRoom = { SubRoomId: number; RoomId: number; Name: string; CreatorAccountId: number }
+		const envelope = async (res: Response) =>
+			(await res.json()) as {
+				success: boolean
+				// The whole room comes back on success (the client re-renders its subroom list).
+				value: { RoomId: number; SubRooms: SubRoom[] } | null
+			}
+
+		// No token → 401.
+		expect((await create(2, 'ffff')).status).toBe(401)
+		// Valid token but not the owner → success:false envelope.
+		expect((await envelope(await create(2, 'ffff', '999'))).success).toBe(false)
+		// Blank name → success:false envelope.
+		expect((await envelope(await create(2, '  ', '1'))).success).toBe(false)
+		// Unknown room → success:false envelope.
+		expect((await envelope(await create(99999, 'ffff', '1'))).success).toBe(false)
+
+		const maxBefore = (await env.DB.prepare('SELECT MAX(sub_room_id) AS m FROM subroom').first<{
+			m: number
+		}>())!.m
+
+		// Owner creates → success, and the returned room now embeds the new subroom: a fresh
+		// global SubRoomId owned by the caller, named, and fetchable.
+		const body = await envelope(await create(2, 'ffff', '1'))
+		expect(body.success).toBe(true)
+		expect(body.value?.RoomId).toBe(2)
+		const created = body.value?.SubRooms.find((s) => s.Name === 'ffff')
+		expect(created).toMatchObject({ RoomId: 2, Name: 'ffff', CreatorAccountId: 1 })
+		expect(created!.SubRoomId).toBeGreaterThan(maxBefore)
+
+		const fetched = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${created?.SubRoomId}/data`)
+		).json()) as { SubRoomId: number; Name: string; UnitySceneId: string }
+		expect(fetched).toMatchObject({ SubRoomId: created?.SubRoomId, Name: 'ffff' })
+
+		// It inherits room 2's own existing (first) subroom scene.
+		const roomScene = (
+			JSON.parse(
+				(await env.DB.prepare(
+					'SELECT data FROM subroom WHERE room_id = 2 ORDER BY sub_room_id LIMIT 1'
+				).first<{ data: string }>())!.data
+			) as { UnitySceneId: string }
+		).UnitySceneId
+		expect(fetched.UnitySceneId).toBe(roomScene)
+	})
+
+	it('DELETE /rooms/:id/subrooms/:sid removes a subroom (auth-gated, owner-only, not the last)', async () => {
+		const del = async (roomId: number, subRoomId: number, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}`, {
+				method: 'DELETE',
+				headers: sub ? await bearer(sub) : {},
+			})
+		type SubRoom = { SubRoomId: number; Name: string }
+		const envelope = async (res: Response) =>
+			(await res.json()) as { success: boolean; value: { SubRooms: SubRoom[] } | null }
+
+		// Add a subroom to room 2 (which already has others), and capture its id by name.
+		const created = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms`, {
+				method: 'POST',
+				headers: { ...(await bearer('1')), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({ name: 'to-delete' }).toString(),
+			})
+		).json()) as { value: { SubRooms: SubRoom[] } }
+		const newId = created.value.SubRooms.find((s) => s.Name === 'to-delete')!.SubRoomId
+
+		// No token → 401. Not the owner → success:false. Unknown subroom → success:false.
+		expect((await del(2, newId)).status).toBe(401)
+		expect((await envelope(await del(2, newId, '999'))).success).toBe(false)
+		expect((await envelope(await del(2, 99999, '1'))).success).toBe(false)
+
+		// Owner deletes → success, and the subroom is gone from the returned room + not fetchable.
+		const body = await envelope(await del(2, newId, '1'))
+		expect(body.success).toBe(true)
+		expect(body.value?.SubRooms.some((s) => s.SubRoomId === newId)).toBe(false)
+		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${newId}/data`)).status).toBe(404)
+
+		// A room's only subroom can't be deleted (would leave it with no scene). Seed a
+		// dedicated single-subroom room owned by account 1 to exercise the guard.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 700,
+			Name: 'SoloSubRoom',
+			CreatorAccountId: 1,
+			SubRooms: [{ SubRoomId: 900, UnitySceneId: 'x', MaxPlayers: 4 }],
+		})
+		expect((await envelope(await del(700, 900, '1'))).success).toBe(false)
+		// The lone subroom survives the refused delete.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/700/subrooms/900/data`)).status).toBe(200)
+	})
+
+	it('GET /rooms/:id/subrooms/:sid/saves returns an empty paged result', async () => {
+		const res = await SELF.fetch(
+			`${ORIGIN}/rooms/2/subrooms/2/saves?unityAssetTarget=0&unityAssetVersion=1&skip=0&take=20`
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ Results: [], TotalResults: 0 })
+	})
 })
