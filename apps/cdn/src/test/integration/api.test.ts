@@ -52,6 +52,27 @@ describe('cdn endpoints', () => {
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([12, 13, 14]))
 	})
 
+	// The other two Range forms. Both resolve to a concrete offset/length inside R2, so
+	// they exercise the same Content-Range math as the closed range above — which read
+	// every range as a suffix range and emitted `bytes NaN-NaN/6` until it was fixed.
+	test('GET /sigs/:sigName honors open-ended and suffix Range requests', async () => {
+		await env.CDN_ASSETS.put('sigs/ranged2', new Uint8Array([10, 11, 12, 13, 14, 15]))
+		const fetchRange = (range: string) =>
+			exports.default.fetch(`${ORIGIN}/sigs/ranged2`, { headers: { Range: range } })
+
+		// `bytes=4-` — from an offset to the end.
+		const open = await fetchRange('bytes=4-')
+		expect(open.status).toBe(206)
+		expect(open.headers.get('content-range')).toBe('bytes 4-5/6')
+		expect(new Uint8Array(await open.arrayBuffer())).toEqual(new Uint8Array([14, 15]))
+
+		// `bytes=-2` — the last N bytes.
+		const suffix = await fetchRange('bytes=-2')
+		expect(suffix.status).toBe(206)
+		expect(suffix.headers.get('content-range')).toBe('bytes 4-5/6')
+		expect(new Uint8Array(await suffix.arrayBuffer())).toEqual(new Uint8Array([14, 15]))
+	})
+
 	test('GET /room/:dataBlob streams the room blob from R2', async () => {
 		await env.CDN_ASSETS.put('room/94tp5zjtwz0gppp8xlv1j9l5b.room', new Uint8Array([9, 8, 7]))
 		const res = await exports.default.fetch(`${ORIGIN}/room/94tp5zjtwz0gppp8xlv1j9l5b.room`)
@@ -78,5 +99,43 @@ describe('cdn endpoints', () => {
 	test('GET /invention/:dataBlob 404s when the blob is absent', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/invention/missing.inv`)
 		expect(res.status).toBe(404)
+	})
+
+	test('GET /openapi.json documents every route', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
+		expect(res.status).toBe(200)
+		const spec = (await res.json()) as {
+			openapi: string
+			paths: Record<string, Record<string, { summary?: string }>>
+		}
+		expect(spec.openapi).toMatch(/^3\.1/)
+
+		// The spec route hides itself.
+		expect(spec.paths['/openapi.json']).toBeUndefined()
+
+		// Every route the worker serves is described. This is the drift guard: adding a
+		// route without a describeRoute() block fails here rather than silently shipping
+		// an incomplete spec. Hono's `:param` syntax becomes OpenAPI's `{param}`.
+		const documented = new Set(
+			Object.entries(spec.paths).flatMap(([path, ops]) =>
+				Object.keys(ops).map((method) => `${method.toUpperCase()} ${path}`)
+			)
+		)
+		expect([...documented].sort()).toEqual([
+			'GET /',
+			'GET /config/LoadingScreenTipData',
+			'GET /invention/{dataBlob}',
+			'GET /room/{dataBlob}',
+			'GET /sigs/{sigName}',
+		])
+
+		// Every operation carries a summary — a path present but undescribed is not
+		// documentation.
+		for (const ops of Object.values(spec.paths)) {
+			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
+		}
+
+		// Schemas must inline: a `$ref` here is a dangling reference (see openapi.ts).
+		expect(JSON.stringify(spec).includes('"$ref"')).toBe(false)
 	})
 })

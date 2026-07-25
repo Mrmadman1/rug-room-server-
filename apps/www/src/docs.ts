@@ -25,6 +25,7 @@ export const DOCUMENTED_SERVICES: ReadonlyArray<{ slug: string; title: string }>
 	{ slug: 'clubs', title: 'clubs — clubs & clubhouses' },
 	{ slug: 'chat', title: 'chat — threads & messages' },
 	{ slug: 'img', title: 'img — image serving & resizing' },
+	{ slug: 'cdn', title: 'cdn — binary asset delivery' },
 	{ slug: 'storage', title: 'storage — uploads to the CDN bucket' },
 	{ slug: 'playersettings', title: 'playersettings — per-player settings' },
 	{ slug: 'api', title: 'api — everything else' },

@@ -1,17 +1,26 @@
 import { Hono } from 'hono'
+import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { withNotFound, withOnError } from '@repo/hono-helpers'
+import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 
 import loadingScreenTipData from '../static/loading-screen-tip-data.json'
+import {
+	assetResponses,
+	CONDITIONAL_HEADERS,
+	json,
+	keyParam,
+	LoadingScreenTip,
+	ServiceStatus,
+} from './openapi'
 
 import type { Context } from 'hono'
 import type { App, Env } from './context'
 
 /**
  * CDN routes. The `cdn` prefix maps to this worker's subdomain, so method routes
- * are served bare. File-backed routes (`sigs`, `upload`) have no storage binding
- * yet and are stubbed.
+ * are served bare. Everything but the liveness probe and the bundled tip data is
+ * streamed out of the shared `recflare-cdn` R2 bucket, keyed by prefix.
  */
 
 /** Parse a single-range `Range: bytes=start-end` header into an R2 range. */
@@ -60,16 +69,16 @@ async function serveAsset(c: Context<App>, key: string) {
 
 	// Range honored → 206 Partial Content with Content-Range.
 	if (object.range && c.req.header('range')) {
-		const r = object.range
-		let offset: number
-		let length: number
-		if ('suffix' in r) {
-			length = r.suffix
-			offset = object.size - length
-		} else {
-			offset = r.offset ?? 0
-			length = r.length ?? object.size - offset
-		}
+		// R2 hands back the RESOLVED range, and the object it returns carries all three
+		// keys with the inapplicable ones set to undefined — so `'suffix' in r` is true
+		// even for an offset/length range and cannot discriminate between the two forms.
+		// (It read as a suffix range every time, making offset/length NaN and the
+		// Content-Range header garbage.) Read the values, not the keys. A `bytes=-N`
+		// request already comes back resolved to a concrete offset/length; the suffix
+		// fallback below is only there in case that ever stops being true.
+		const r = object.range as { offset?: number; length?: number; suffix?: number }
+		const length = r.length ?? r.suffix ?? object.size - (r.offset ?? 0)
+		const offset = r.offset ?? object.size - length
 		headers.set('content-length', String(length))
 		headers.set('content-range', `bytes ${offset}-${offset + length - 1}/${object.size}`)
 		return new Response(object.body, { status: 206, headers })
@@ -92,25 +101,136 @@ const app = new Hono<App>()
 	.onError(withOnError())
 	.notFound(withNotFound())
 
-	.get('/', (c) => c.json({ service: 'cdn', status: 'ok' }))
+	.get(
+		'/',
+		describeRoute({
+			tags: ['Service'],
+			summary: 'Service liveness',
+			description: 'A fixed `{ service, status }` body. No auth — a plain liveness probe.',
+			responses: { 200: json(ServiceStatus, 'Always `{ service: "cdn", status: "ok" }`') },
+		}),
+		(c) => c.json({ service: 'cdn', status: 'ok' })
+	)
 
 	// Loading-screen tips, bundled here as static JSON.
-	.get('/config/LoadingScreenTipData', (c) => c.json(loadingScreenTipData))
+	.get(
+		'/config/LoadingScreenTipData',
+		describeRoute({
+			tags: ['Config'],
+			summary: 'Loading-screen tips',
+			description: [
+				'The tips the client cycles through on a loading screen. A bundled static file',
+				'(`static/loading-screen-tip-data.json`), captured from the real service and served',
+				'verbatim — nothing here is editable at runtime, and every client gets the same list',
+				'regardless of platform or room. The per-tip `Context`/`Visibility`/`PlatformMask`',
+				'fields are the client’s own filters, applied client-side.',
+			].join(' '),
+			responses: { 200: json(LoadingScreenTip.array(), 'The bundled tips') },
+		}),
+		(c) => c.json(loadingScreenTipData)
+	)
 
 	// Signature blobs by name. Streamed from R2 under the `sigs/` key prefix;
 	// 404 when missing.
-	.get('/sigs/:sigName', (c) => serveAsset(c, `sigs/${c.req.param('sigName')}`))
+	.get(
+		'/sigs/:sigName',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve a signature blob',
+			description: [
+				'Streams the object stored under `sigs/<sigName>`. These are the anti-cheat signature',
+				'blobs the client fetches at startup; nothing here inspects or validates them.',
+			].join(' '),
+			parameters: [keyParam('sigName', 'The blob name.', false), ...CONDITIONAL_HEADERS],
+			responses: assetResponses('The signature blob'),
+		}),
+		(c) => serveAsset(c, `sigs/${c.req.param('sigName')}`)
+	)
 
 	// Room build data by name. The client fetches this for a SubRoom's DataBlob to
 	// load the room. Streamed from R2 under `room/`. The name may contain slashes
 	// (uploads are foldered by date, e.g. `2026-02-03/<uuid>`), so match the rest of
 	// the path.
-	.get('/room/:dataBlob{.+}', (c) => serveAsset(c, `room/${c.req.param('dataBlob')}`))
+	.get(
+		'/room/:dataBlob{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve room build data',
+			description: [
+				'Streams the object stored under `room/<dataBlob>` — the saved scene the client',
+				'downloads to load a room. The name comes from a subroom’s `DataBlob` (see the `rooms`',
+				'worker) and is date-foldered by the upload, e.g. `2026-02-03/<uuid>`, so it contains',
+				'slashes.',
+				'',
+				'A room’s IMAGE also lives under this prefix, stored by its bare `ImageName` — the',
+				'same route serves both.',
+			].join('\n'),
+			parameters: [keyParam('dataBlob', 'The blob name.', true), ...CONDITIONAL_HEADERS],
+			responses: assetResponses('The room data'),
+		}),
+		(c) => serveAsset(c, `room/${c.req.param('dataBlob')}`)
+	)
 
 	// Invention data by name. The client fetches this for an invention's
 	// `CurrentVersion.BlobName` to spawn it. Streamed from R2 under `invention/`.
 	// Like room blobs the name is date-foldered, and it carries the `.inv` extension
 	// the upload stored it under, so the rest of the path is matched as-is.
-	.get('/invention/:dataBlob{.+}', (c) => serveAsset(c, `invention/${c.req.param('dataBlob')}`))
+	.get(
+		'/invention/:dataBlob{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve invention data',
+			description: [
+				'Streams the object stored under `invention/<dataBlob>` — the data the client',
+				'downloads to spawn an invention. The name comes from an invention’s',
+				'`CurrentVersion.BlobName` (see the `api` worker); like room blobs it is date-foldered,',
+				'and it keeps the `.inv` extension the upload stored it under.',
+			].join(' '),
+			parameters: [
+				keyParam('dataBlob', 'The blob name, including `.inv`.', true),
+				...CONDITIONAL_HEADERS,
+			],
+			responses: assetResponses('The invention data'),
+		}),
+		(c) => serveAsset(c, `invention/${c.req.param('dataBlob')}`)
+	)
+
+// The generated spec. Documentation only — no request is validated against it (see
+// openapi.ts). `hide: true` keeps this route out of its own output.
+app.get(
+	'/openapi.json',
+	describeRoute({ hide: true }),
+	withCleanSpec(
+		openAPIRouteHandler(app, {
+			documentation: {
+				info: {
+					title: 'recflare cdn',
+					version: '1.0.0',
+					description: [
+						'Binary asset delivery for recflare, a private-server reimplementation of the Rec',
+						'Room backend. Streams the blobs the client downloads while playing — anti-cheat',
+						'signatures, saved room scenes and invention data — out of the shared `recflare-cdn`',
+						'R2 bucket, plus the one bundled config file the loading screen reads.',
+						'',
+						'Everything is keyed by prefix (`sigs/`, `room/`, `invention/`) and served as',
+						'`application/octet-stream`; the worker never interprets what it hands back. Reads',
+						'are unauthenticated — a caller needs the exact key, which only comes from an',
+						'authenticated call to another worker.',
+						'',
+						'This worker only READS. Uploads go through the `storage` worker, which writes the',
+						'same bucket, and images are served by `img` rather than from here.',
+						'',
+						'Every asset route supports conditional GETs (`If-None-Match` → 304) and single',
+						'byte ranges (`Range` → 206). The ranges matter: large-file downloaders fetch in',
+						'chunks, and answering 200 where a 206 is expected corrupts the reassembled file —',
+						'which surfaces as an anti-cheat “Signatures don’t match” failure, not a download',
+						'error.',
+					].join('\n'),
+				},
+				servers: [{ url: 'https://cdn.recflare.net', description: 'Production' }],
+			},
+		})
+	)
+)
 
 export default app
