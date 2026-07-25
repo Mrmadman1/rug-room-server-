@@ -1,28 +1,54 @@
-/* RecFlare brand: vivid orange (#FE7101) on warm cream (#FCEFDC), sampled from the logo. */
+/*
+ * RecFlare — a live-service readout.
+ *
+ * The page's job is to show that this server is actually up and that real people are
+ * on it, then get you into the Discord. So the surface is warm-dark (the room the
+ * screenshots are lit against), and the logo orange (#FE7101) is spent only on actions
+ * and the brand mark — never as decoration, or it stops reading as "click this". Green
+ * means one thing throughout, healthy: the server is up, or the change saved.
+ *
+ * Type: Archivo for the nameplate, IBM Plex Sans for prose, IBM Plex Mono for anything
+ * the server itself would say (handles, room names, counts, endpoint paths).
+ */
 :root {
-	color-scheme: light dark;
-	--bg: #fdf3e7;
-	--card: #ffffff;
-	--text: #33241a;
-	--muted: #8a7360;
-	--border: #efe0cc;
+	color-scheme: dark light;
+
+	--bg: #14100c;
+	--surface: #1e1813;
+	--surface-hi: #26201a;
+	--line: #33291f;
+	--text: #f5ede1;
+	--muted: #a8927c;
 	--accent: #fe7101;
-	--accent-hover: #e86400;
-	--accent-text: #ffffff;
-	--error: #dc2626;
-	--ok: #15803d;
+	--accent-hover: #ff8c33;
+	/* Dark ink on orange: white on this orange is only ~2.9:1 and fails AA. */
+	--accent-text: #17110a;
+	--live: #35d07f;
+	--error: #ff6b5e;
+	--ok: #35d07f;
+
+	--display: Archivo, system-ui, sans-serif;
+	--body: 'IBM Plex Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+	--mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+	--radius: 10px;
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
 	:root {
-		--bg: #17120d;
-		--card: #221a12;
-		--text: #f4eadb;
-		--muted: #b49b84;
-		--border: #362a1e;
-		--accent: #ff8320;
-		--accent-hover: #ff9540;
-		--ok: #22c55e;
+		/* Off-white with just enough warmth to sit under the orange — not a cream wash. */
+		--bg: #f7f5f2;
+		--surface: #ffffff;
+		--surface-hi: #fbf9f6;
+		--line: #e2ddd6;
+		--text: #201a14;
+		--muted: #736656;
+		--accent: #e05f00;
+		--accent-hover: #c65300;
+		--accent-text: #fffaf4;
+		--live: #12855a;
+		--error: #c62f22;
+		--ok: #12855a;
 	}
 }
 
@@ -34,145 +60,426 @@ body {
 	margin: 0;
 	background: var(--bg);
 	color: var(--text);
-	font:
-		15px/1.5 system-ui,
-		-apple-system,
-		Segoe UI,
-		Roboto,
-		sans-serif;
+	font: 400 16px/1.6 var(--body);
+	-webkit-font-smoothing: antialiased;
 }
+
+/* Keyboard focus stays visible everywhere, including on the dark surfaces. */
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+	border-radius: 4px;
+}
+
+/* ---- Containers --------------------------------------------------------- */
 
 .shell {
-	max-width: 460px;
+	max-width: 440px;
 	margin: 0 auto;
-	padding: 32px 20px 64px;
+	padding: 40px 20px 80px;
 }
 
-/* Widened for the account tab layout and the homepage slideshow. */
+/* The account dashboard: room for the tab rail without stranding the forms. */
 .shell.wide {
-	max-width: 760px;
+	max-width: 880px;
 }
 
-/* Top navigation, shown on every page. */
+/* The homepage: the stage runs full-bleed above this, so it brings its own top space. */
+.shell.home {
+	max-width: 1040px;
+	padding-top: 0;
+}
+
+/* ---- Navigation --------------------------------------------------------- */
+
 .nav {
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	max-width: 760px;
+	gap: 16px;
+	max-width: 1040px;
 	margin: 0 auto;
-	padding: 16px 20px;
-	border-bottom: 1px solid var(--border);
+	padding: 20px;
+	border-bottom: 1px solid var(--line);
 }
 
 .brand {
-	font-weight: 700;
-	font-size: 1.15rem;
-	color: var(--accent);
+	display: inline-flex;
+	align-items: center;
+	gap: 9px;
+	font-family: var(--display);
+	font-weight: 800;
+	font-size: 1.05rem;
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+	color: var(--text);
 	text-decoration: none;
-	letter-spacing: -0.01em;
+}
+
+.brand::before {
+	content: '';
+	width: 9px;
+	height: 9px;
+	border-radius: 2px;
+	background: var(--accent);
 }
 
 .nav-links {
 	display: flex;
 	align-items: center;
-	gap: 16px;
+	gap: 20px;
 }
 
-.nav-links a {
+.nav-links a,
+.linkish {
+	font-family: var(--mono);
+	font-size: 0.8rem;
+	letter-spacing: 0.02em;
 	color: var(--muted);
 	text-decoration: none;
-	font-size: 0.9rem;
-}
-
-.nav-links a:hover,
-.nav-links a.active {
-	color: var(--text);
 }
 
 .linkish {
 	background: none;
 	border: none;
 	padding: 0;
-	color: var(--muted);
-	font-size: 0.9rem;
 	cursor: pointer;
 }
 
+.nav-links a:hover,
+.nav-links a.active,
 .linkish:hover {
 	color: var(--text);
 }
 
-/* Homepage slideshow. */
-.slide-stage {
+/* ---- The stage (hero) --------------------------------------------------- */
+
+/*
+ * Full-bleed, edge to edge under the nav: a photo somebody actually took in game,
+ * with the headline and the way in over it. The photo is the backdrop and never the
+ * payload — with no photo the stage is still a solid panel carrying the same words.
+ */
+.stage {
 	position: relative;
-	aspect-ratio: 16 / 9;
-	background: var(--card);
-	border: 1px solid var(--border);
-	border-radius: 12px;
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+	min-height: min(40vh, 320px);
 	overflow: hidden;
+	background: var(--surface-hi);
+	isolation: isolate;
 }
 
-.slide-stage img {
+.stage-photo {
+	position: absolute;
+	inset: 0;
 	width: 100%;
 	height: 100%;
 	object-fit: cover;
-	display: block;
+	z-index: -2;
+	animation: photo-in 0.7s ease;
 }
 
-.slide-nav {
+@keyframes photo-in {
+	from {
+		opacity: 0;
+	}
+}
+
+/* Scrim: enough weight at the bottom to hold white text over any screenshot. */
+.stage::before {
+	content: '';
 	position: absolute;
-	top: 50%;
-	transform: translateY(-50%);
-	width: 40px;
-	height: 40px;
-	border: none;
-	border-radius: 50%;
-	background: rgba(0, 0, 0, 0.45);
-	color: #fff;
-	font-size: 1.6rem;
+	inset: 0;
+	z-index: -1;
+	background: linear-gradient(
+		to top,
+		rgb(10 7 4 / 90%) 0%,
+		rgb(10 7 4 / 64%) 30%,
+		rgb(10 7 4 / 16%) 62%,
+		rgb(10 7 4 / 26%) 100%
+	);
+}
+
+.stage-body {
+	max-width: 1040px;
+	width: 100%;
+	margin: 0 auto;
+	padding: 0 20px 28px;
+}
+
+.stage-title {
+	font-family: var(--display);
+	font-weight: 800;
+	font-size: clamp(2rem, 5vw, 3.4rem);
 	line-height: 1;
+	letter-spacing: -0.03em;
+	color: #fff;
+	margin: 0 0 20px;
+	max-width: 15ch;
+	text-wrap: balance;
+}
+
+/* The one place the orange carries meaning in the headline: the year it restores. */
+.stage-title em {
+	font-style: normal;
+	color: var(--accent);
+}
+
+/* Credit line and slide dots, sitting under the headline on the photo itself. */
+.stage-foot {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px 20px;
+	max-width: 1040px;
+	width: 100%;
+	margin: 0 auto;
+	padding: 0 20px 22px;
+	font-size: 0.8rem;
+	color: rgb(255 255 255 / 72%);
+}
+
+/* The dots are the only way to steer the stage, so each one gets a 24px target
+   even though the mark itself is 7px. */
+.dots {
+	display: flex;
+	margin: -8px -6px;
+}
+
+.dots button {
+	display: grid;
+	place-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	border: none;
+	background: none;
 	cursor: pointer;
 }
 
-.slide-nav:hover {
-	background: rgba(0, 0, 0, 0.65);
+.dots button::after {
+	content: '';
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: rgb(255 255 255 / 34%);
+	transition: background 0.2s ease;
 }
 
-.slide-nav.prev {
-	left: 12px;
+.dots button:hover::after {
+	background: rgb(255 255 255 / 65%);
 }
 
-.slide-nav.next {
-	right: 12px;
+.dots button.on::after {
+	background: var(--accent);
 }
 
-.slide-meta {
+/* ---- What it is (below the stage) --------------------------------------- */
+
+.about {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 32px 48px;
+	align-items: start;
+	padding: 56px 0 8px;
+}
+
+.about-title {
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: clamp(1.35rem, 2.6vw, 1.75rem);
+	line-height: 1.15;
+	letter-spacing: -0.02em;
+	margin: 0 0 12px;
+	max-width: 34ch;
+	text-wrap: balance;
+}
+
+.about-lede {
+	font-size: 1.05rem;
+	color: var(--muted);
+	margin: 0;
+	max-width: 56ch;
+}
+
+/* Emphasis in the lede lifts to full text colour — bolder alone barely reads
+   against the muted grey it sits in. */
+.about-lede strong {
+	font-weight: 600;
+	color: var(--text);
+}
+
+.about-side {
 	display: flex;
-	justify-content: space-between;
-	align-items: baseline;
-	gap: 12px;
-	margin-top: 14px;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 20px;
 }
+
+.about-links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+}
+
+/* Status of the actual server, not decoration — see About. */
+.status {
+	display: inline-flex;
+	align-items: center;
+	gap: 9px;
+	margin: 0;
+	font-family: var(--mono);
+	font-size: 0.75rem;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+	color: var(--muted);
+}
+
+.status .dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--muted);
+	flex: none;
+}
+
+.status.online .dot {
+	background: var(--live);
+	box-shadow: 0 0 0 4px color-mix(in srgb, var(--live) 22%, transparent);
+}
+
+.status.online {
+	color: var(--text);
+}
+
+.status.down .dot {
+	background: var(--error);
+}
+
+.cta {
+	display: inline-block;
+	font-family: var(--body);
+	font-weight: 600;
+	font-size: 0.975rem;
+	text-decoration: none;
+	padding: 13px 30px;
+	border-radius: var(--radius);
+	border: 1px solid var(--accent);
+	background: var(--accent);
+	color: var(--accent-text);
+	transition:
+		background 0.15s ease,
+		border-color 0.15s ease;
+}
+
+.cta:hover {
+	background: var(--accent-hover);
+	border-color: var(--accent-hover);
+}
+
+.stage-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+}
+
+/* Discord blurple, so the button is recognisable before the label is read. Fixed
+   colours rather than tokens: it sits on a photo, so it can't follow the theme. */
+.cta.discord {
+	background: #5865f2;
+	border-color: #5865f2;
+	color: #fff;
+}
+
+.cta.discord:hover {
+	background: #4752c4;
+	border-color: #4752c4;
+}
+
+/* Secondary action: same shape, outlined instead of filled. */
+.cta.ghost {
+	background: transparent;
+	border-color: var(--line);
+	color: var(--text);
+}
+
+.cta.ghost:hover {
+	background: var(--surface);
+	border-color: var(--muted);
+}
+
+/* ---- Footer ------------------------------------------------------------- */
+
+.footer {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px 24px;
+	max-width: 1040px;
+	margin: 0 auto;
+	padding: 24px 20px 40px;
+	border-top: 1px solid var(--line);
+	font-family: var(--mono);
+	font-size: 0.75rem;
+	color: var(--muted);
+}
+
+.footer nav {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 20px;
+}
+
+.footer a {
+	color: var(--muted);
+	text-decoration: none;
+}
+
+.footer a:hover {
+	color: var(--text);
+}
+
+/* The licence link sits inside a sentence rather than the link row, so it needs an
+   underline to be findable at all. */
+.footer span a {
+	text-decoration: underline;
+	text-underline-offset: 2px;
+	text-decoration-color: color-mix(in srgb, var(--muted) 50%, transparent);
+}
+
+.footer span a:hover {
+	text-decoration-color: currentcolor;
+}
+
+/* ---- Cards and the account workspace ------------------------------------ */
 
 h1 {
-	font-size: 1.5rem;
-	margin: 0 0 20px;
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: 1.7rem;
+	letter-spacing: -0.02em;
+	margin: 0 0 24px;
 }
 
 h2 {
-	font-size: 1rem;
-	margin: 0 0 12px;
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: 1.05rem;
+	letter-spacing: -0.01em;
+	margin: 0 0 14px;
 }
 
 .card {
-	background: var(--card);
-	border: 1px solid var(--border);
-	border-radius: 12px;
-	padding: 20px;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	padding: 22px;
 	margin-bottom: 16px;
 }
 
-/* Signed-in layout: a vertical tab rail on the left, the active section on the right. */
 .workspace {
 	display: grid;
 	grid-template-columns: 190px 1fr;
@@ -191,48 +498,42 @@ h2 {
 	background: transparent;
 	border: 1px solid transparent;
 	color: var(--muted);
-	padding: 9px 12px;
+	padding: 10px 13px;
 	border-radius: 8px;
 	cursor: pointer;
+	font-family: var(--body);
 	font-size: 0.9rem;
 }
 
 .vtabs button:hover {
 	color: var(--text);
-	background: var(--card);
+	background: var(--surface);
 }
 
 .vtabs button.active {
-	background: var(--card);
-	border-color: var(--border);
+	background: var(--surface);
+	border-color: var(--line);
 	color: var(--text);
 	font-weight: 600;
 }
 
-/* The active section's card already carries its own margin; drop it inside the panel. */
+/* The active section's card carries its own margin; drop it inside the panel. */
 .panel .card {
 	margin-bottom: 0;
 }
 
-/* Stack the rail above the panel on narrow screens. */
-@media (max-width: 620px) {
-	.workspace {
-		grid-template-columns: 1fr;
-	}
-
-	.vtabs {
-		flex-direction: row;
-		flex-wrap: wrap;
-	}
-
-	.vtabs button {
-		border-color: var(--border);
-	}
+/* Identity strip on the account page: the account's own record, set in mono. */
+.identity .handle {
+	font-family: var(--mono);
+	font-size: 0.85rem;
+	color: var(--muted);
 }
+
+/* ---- Forms -------------------------------------------------------------- */
 
 label {
 	display: block;
-	margin-bottom: 12px;
+	margin-bottom: 14px;
 	font-size: 0.85rem;
 	color: var(--muted);
 }
@@ -241,9 +542,9 @@ input,
 textarea {
 	display: block;
 	width: 100%;
-	margin-top: 4px;
-	padding: 9px 11px;
-	border: 1px solid var(--border);
+	margin-top: 6px;
+	padding: 10px 12px;
+	border: 1px solid var(--line);
 	border-radius: 8px;
 	background: var(--bg);
 	color: var(--text);
@@ -266,13 +567,15 @@ textarea:focus {
 button[type='submit'] {
 	border: none;
 	border-radius: 8px;
-	padding: 10px 16px;
+	padding: 11px 18px;
+	font-family: var(--body);
 	font-size: 0.95rem;
+	font-weight: 600;
 	cursor: pointer;
 	background: var(--accent);
 	color: var(--accent-text);
-	font-weight: 600;
-	width: 100%;
+	/* Hugs its label: a full-width orange bar for "save email" outshouts the hero. */
+	width: auto;
 }
 
 button[type='submit']:not(:disabled):hover {
@@ -280,29 +583,80 @@ button[type='submit']:not(:disabled):hover {
 }
 
 button[type='submit']:disabled {
-	opacity: 0.6;
+	opacity: 0.55;
 	cursor: default;
 }
 
+/* ---- Utilities ---------------------------------------------------------- */
+
 .big {
-	font-size: 1.1rem;
-	font-weight: 600;
-	margin: 2px 0;
+	font-family: var(--display);
+	font-size: 1.2rem;
+	font-weight: 700;
+	letter-spacing: -0.01em;
+	margin: 3px 0;
 }
 
 .muted {
 	color: var(--muted);
-	font-size: 0.85rem;
+	font-size: 0.875rem;
+}
+
+.error,
+.ok {
+	font-size: 0.875rem;
+	margin: 0 0 12px;
 }
 
 .error {
 	color: var(--error);
-	font-size: 0.85rem;
-	margin: 0 0 12px;
 }
 
 .ok {
 	color: var(--ok);
-	font-size: 0.85rem;
-	margin: 0 0 12px;
+}
+
+/* ---- Responsive --------------------------------------------------------- */
+
+@media (max-width: 760px) {
+	/* One column: the copy first, then the links and the status under it. */
+	.about {
+		grid-template-columns: 1fr;
+		gap: 26px;
+		padding-top: 40px;
+	}
+}
+
+@media (max-width: 620px) {
+	.stage {
+		min-height: min(38vh, 300px);
+	}
+
+	.about-links .cta {
+		flex: 1 1 auto;
+		text-align: center;
+	}
+
+	.workspace {
+		grid-template-columns: 1fr;
+	}
+
+	.vtabs {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	.vtabs button {
+		border-color: var(--line);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
 }

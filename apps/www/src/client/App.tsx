@@ -1,4 +1,18 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+
+import type { ReactNode } from 'react'
+
+/** The community Discord — the join instructions and the build both live there. */
+const DISCORD_INVITE = 'https://discord.gg/HhmMAKhrz'
+
+/** Where the stage's "Download for PC" button goes: the client's release listing. */
+const DOWNLOAD_URL = 'https://github.com/djdevin/recflare-client/releases'
+
+/** The public source repo, linked from the homepage and footer. */
+const SOURCE_REPO = 'https://github.com/djdevin/recflare'
+
+/** The repo's licence, behind the footer's "MIT licensed". */
+const LICENSE_URL = `${SOURCE_REPO}/blob/main/LICENSE`
 
 /** The self-account shape returned by the www BFF (`/api/me`, `/api/login`, …). */
 interface SelfAccount {
@@ -105,7 +119,30 @@ export function App() {
 			) : (
 				<HomePage />
 			)}
+			<SiteFooter />
 		</>
+	)
+}
+
+/** Footer: where to go next, plus the affiliation disclaimer. */
+function SiteFooter() {
+	return (
+		<footer className="footer">
+			<span>
+				<a href={LICENSE_URL} target="_blank" rel="noreferrer">
+					MIT licensed
+				</a>{' '}
+				· a fan project, not affiliated with Rec Room Inc.
+			</span>
+			<nav>
+				<a href={DISCORD_INVITE} target="_blank" rel="noreferrer">
+					Discord
+				</a>
+				<a href={SOURCE_REPO} target="_blank" rel="noreferrer">
+					GitHub
+				</a>
+			</nav>
+		</footer>
 	)
 }
 
@@ -127,6 +164,9 @@ function NavBar({
 				RecFlare
 			</Link>
 			<nav className="nav-links">
+				<a href={DISCORD_INVITE} target="_blank" rel="noreferrer">
+					Discord
+				</a>
 				{account === undefined ? null : account ? (
 					<>
 						<Link to="/account" navigate={navigate} className={path === '/account' ? 'active' : ''}>
@@ -146,15 +186,6 @@ function NavBar({
 	)
 }
 
-/** Public homepage: a slideshow of recent public photos. */
-function HomePage() {
-	return (
-		<main className="shell wide">
-			<Slideshow />
-		</main>
-	)
-}
-
 /** A recent public image plus who took it and where. */
 interface Slide {
 	url: string
@@ -162,10 +193,10 @@ interface Slide {
 	roomName: string | null
 }
 
-function Slideshow() {
+/** Loads the public photo feed once. `slides === null` means still in flight. */
+function useSlideshow() {
 	const [slides, setSlides] = useState<Slide[] | null>(null)
 	const [error, setError] = useState('')
-	const [idx, setIdx] = useState(0)
 
 	useEffect(() => {
 		api<{ images: Slide[] }>('/api/slideshow')
@@ -173,44 +204,127 @@ function Slideshow() {
 			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
 	}, [])
 
+	return { slides, error }
+}
+
+/**
+ * Public homepage. The stage leads: photos players actually took, with the way in
+ * on top of them. Everything about how the thing is built sits below, for whoever
+ * scrolls looking for it.
+ */
+function HomePage() {
+	const feed = useSlideshow()
+
+	return (
+		<main>
+			<Stage slides={feed.slides} />
+			<div className="shell home">
+				<About slides={feed.slides} error={feed.error} />
+			</div>
+		</main>
+	)
+}
+
+/**
+ * The hero: a rotating in-game photo with the headline and the way in over it. The
+ * photo is the backdrop, never the payload — when the feed is slow or down the stage
+ * still renders, so "Play now!" is reachable either way.
+ */
+function Stage({ slides }: { slides: Slide[] | null }) {
+	const [idx, setIdx] = useState(0)
+
 	useEffect(() => {
 		if (!slides || slides.length < 2) return
-		const t = setInterval(() => setIdx((i) => (i + 1) % slides.length), 5000)
+		const t = setInterval(() => setIdx((i) => (i + 1) % slides.length), 6000)
 		return () => clearInterval(t)
 	}, [slides])
 
-	if (error) return <p className="error">Couldn’t load the slideshow: {error}</p>
-	if (!slides) return <p className="muted">Loading…</p>
-	if (slides.length === 0) return <p className="muted">No photos yet.</p>
-
-	const slide = slides[idx]
-	const step = (delta: number) => setIdx((i) => (i + delta + slides.length) % slides.length)
+	const slide = slides && slides.length > 0 ? slides[idx] : null
 
 	return (
-		<div className="slideshow">
-			<div className="slide-stage">
-				<img src={slide.url} alt={`Photo by ${slide.username}`} />
-				{slides.length > 1 && (
-					<>
-						<button className="slide-nav prev" onClick={() => step(-1)} aria-label="Previous photo">
-							‹
-						</button>
-						<button className="slide-nav next" onClick={() => step(1)} aria-label="Next photo">
-							›
-						</button>
-					</>
-				)}
-			</div>
-			<div className="slide-meta">
-				<div>
-					<span className="big">@{slide.username}</span>
-					{slide.roomName && <span className="muted"> · {slide.roomName}</span>}
+		<section className="stage">
+			{slide && (
+				<img
+					className="stage-photo"
+					key={slide.url}
+					src={slide.url}
+					alt={`Photo taken in game by ${slide.username}`}
+				/>
+			)}
+			<div className="stage-body">
+				{/* Deliberately doesn't name the game: this is a fan project, so the
+				    trademark stays out of the headline and appears lower down, in
+				    plain nominative use next to the disclaimer. */}
+				<h1 className="stage-title">
+					Play like it&apos;s <em>2023</em>.
+				</h1>
+				<div className="stage-actions">
+					<a className="cta" href={DOWNLOAD_URL} target="_blank" rel="noreferrer">
+						Download for PC
+					</a>
+					<a className="cta discord" href={DISCORD_INVITE} target="_blank" rel="noreferrer">
+						Join the Discord
+					</a>
 				</div>
-				<div className="muted">
-					{idx + 1} / {slides.length}
-				</div>
 			</div>
-		</div>
+			{slide && (
+				<div className="stage-foot">
+					<span className="credit">
+						Photo by @{slide.username}
+						{slide.roomName && ` in ${slide.roomName}`}
+					</span>
+					{slides && slides.length > 1 && (
+						<span className="dots">
+							{slides.map((s, i) => (
+								<button
+									key={s.url}
+									className={i === idx ? 'on' : ''}
+									onClick={() => setIdx(i)}
+									aria-label={`Show photo ${i + 1} of ${slides.length}`}
+									aria-current={i === idx}
+								/>
+							))}
+						</span>
+					)}
+				</div>
+			)}
+		</section>
+	)
+}
+
+/** What RecFlare is, under the fold, for whoever wants it. */
+function About({ slides, error }: { slides: Slide[] | null; error: string }) {
+	// The feed answering is proof the server replied, so the indicator can't claim
+	// the server is up when it isn't.
+	const state = slides !== null ? 'online' : error ? 'down' : 'checking'
+
+	return (
+		<section className="about">
+			<div>
+				<h2 className="about-title">
+					An open source implementation of the 2023 RecNet servers, designed for the cloud
+				</h2>
+				<p className="about-lede">
+					A free, independent fan project, aiming to be <strong>feature-complete</strong> and
+					infinitely scalable. No gatekeeping, no basement server. Designed for Cloudflare Workers.
+				</p>
+			</div>
+			<div className="about-side">
+				<div className="about-links">
+					<a className="cta ghost" href={SOURCE_REPO} target="_blank" rel="noreferrer">
+						View the source
+					</a>
+				</div>
+				<p className={`status ${state}`}>
+					<span className="dot" />
+					{state === 'online'
+						? 'Server online'
+						: state === 'down'
+							? 'Server unreachable'
+							: 'Checking the server'}
+				</p>
+			</div>
+		</section>
 	)
 }
 
@@ -232,6 +346,10 @@ function LoginPage({
 		<main className="shell">
 			<section className="card">
 				<h2>Sign in</h2>
+				<p className="muted">
+					Launch the game first — that creates an account linked to your Steam ID. Once you set a
+					password, use your username and that password to sign in here.
+				</p>
 				<LoginForm
 					onAuthed={(a) => {
 						onAuthed(a)
@@ -355,7 +473,11 @@ function Dashboard({
 	// The dashboard sections, shown one at a time via the left tab rail. Admin-only
 	// sections are appended when the session carries an admin role.
 	const sections = [
-		{ id: 'email', label: 'Email', render: () => <EmailForm account={account} onChange={onChange} /> },
+		{
+			id: 'email',
+			label: 'Email',
+			render: () => <EmailForm account={account} onChange={onChange} />,
+		},
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
 		...(account.isAdmin
 			? [
@@ -369,14 +491,12 @@ function Dashboard({
 
 	return (
 		<>
-			<section className="card">
+			<section className="card identity">
 				<div className="muted">Signed in as</div>
-				<div className="big">
-					{account.displayName || account.username}{' '}
-					<span className="muted">#{account.accountId}</span>
+				<div className="big">{account.displayName || account.username}</div>
+				<div className="handle">
+					@{account.username} · #{account.accountId} · {account.email ?? 'no email set'}
 				</div>
-				<div className="muted">@{account.username}</div>
-				<div className="muted">{account.email ?? 'no email set'}</div>
 			</section>
 			<div className="workspace">
 				<nav className="vtabs">
