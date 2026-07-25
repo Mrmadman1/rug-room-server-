@@ -315,14 +315,18 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
 						View the source
 					</a>
 				</div>
-				<p className={`status ${state}`}>
-					<span className="dot" />
-					{state === 'online'
-						? 'Server online'
-						: state === 'down'
-							? 'Server unreachable'
-							: 'Checking the server'}
-				</p>
+				<div className="status-block">
+					<p className={`status ${state}`}>
+						<span className="dot" />
+						{state === 'online'
+							? 'Server online'
+							: state === 'down'
+								? 'Server unreachable'
+								: 'Checking the server'}
+					</p>
+					{/* Only when it's actually up: when it isn't, people want the status, not the joke. */}
+					{state === 'online' && <p className="status-quip">The cloud never goes down, right?</p>}
+				</div>
 			</div>
 		</section>
 	)
