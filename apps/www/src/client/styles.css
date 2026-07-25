@@ -177,6 +177,10 @@ body {
 	height: 100%;
 	object-fit: cover;
 	z-index: -2;
+	/* Softened so the headline reads over any screenshot. Scaled up past the frame
+	   because blur samples past the edges and would otherwise feather them. */
+	filter: blur(5px) saturate(1.08);
+	transform: scale(1.06);
 	animation: photo-in 0.7s ease;
 }
 
@@ -195,9 +199,8 @@ body {
 	background: linear-gradient(
 		to top,
 		rgb(10 7 4 / 90%) 0%,
-		rgb(10 7 4 / 64%) 30%,
-		rgb(10 7 4 / 16%) 62%,
-		rgb(10 7 4 / 26%) 100%
+		rgb(10 7 4 / 74%) 40%,
+		rgb(10 7 4 / 44%) 100%
 	);
 }
 
@@ -218,6 +221,9 @@ body {
 	margin: 0 0 20px;
 	max-width: 15ch;
 	text-wrap: balance;
+	/* Bloom: a wide, soft shadow rather than a hard one, so it separates the type from
+	   a bright screenshot without reading as a drop shadow. */
+	text-shadow: 0 2px 30px rgb(8 5 2 / 55%);
 }
 
 /* The one place the orange carries meaning in the headline: the year it restores. */
@@ -239,6 +245,7 @@ body {
 	padding: 0 20px 22px;
 	font-size: 0.8rem;
 	color: rgb(255 255 255 / 72%);
+	text-shadow: 0 1px 12px rgb(8 5 2 / 60%);
 }
 
 /* The dots are the only way to steer the stage, so each one gets a 24px target
