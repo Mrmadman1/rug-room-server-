@@ -349,7 +349,12 @@ describe('rooms endpoints', () => {
 		expect(body.length).toBeLessThanOrEqual(3)
 	})
 
-	it('GET /featuredrooms/current returns a featured-room group of public rooms', async () => {
+	// Skipped: the endpoint is disabled. Serving it broke the client — the other room
+	// listings started failing with NREs, apparently because the featured-room load
+	// corrupts the client's room cache — so the route is registered under an `XXX`
+	// prefix (see rooms.app.ts) and this path 404s. The handler and its test are kept
+	// intact for whenever the cause is found; un-prefix the route to re-enable both.
+	it.skip('GET /featuredrooms/current returns a featured-room group of public rooms', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/featuredrooms/current`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
@@ -1492,5 +1497,78 @@ describe('rooms endpoints', () => {
 		)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ Results: [], TotalResults: 0 })
+	})
+
+	it('GET /openapi.json documents every route', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/openapi.json`)
+		expect(res.status).toBe(200)
+		const spec = (await res.json()) as {
+			openapi: string
+			paths: Record<string, Record<string, { summary?: string }>>
+		}
+		expect(spec.openapi).toMatch(/^3\.1/)
+
+		// The spec route hides itself.
+		expect(spec.paths['/openapi.json']).toBeUndefined()
+
+		// Every route the worker serves is described. This is the drift guard: adding a
+		// route without a describeRoute() block fails here rather than silently shipping
+		// an incomplete spec. Hono's `:param` syntax becomes OpenAPI's `{param}`.
+		const documented = new Set(
+			Object.entries(spec.paths).flatMap(([path, ops]) =>
+				Object.keys(ops).map((method) => `${method.toUpperCase()} ${path}`)
+			)
+		)
+		expect([...documented].sort()).toEqual([
+			'DELETE /rooms/{roomId}',
+			'DELETE /rooms/{roomId}/interactionby/me/cheer',
+			'DELETE /rooms/{roomId}/interactionby/me/favorite',
+			'DELETE /rooms/{roomId}/subrooms/{subRoomId}',
+			'GET /',
+			'GET /XXXfeaturedrooms/current',
+			'GET /photon_access_token',
+			'GET /rooms',
+			'GET /rooms/base',
+			'GET /rooms/bulk',
+			'GET /rooms/createdby/me',
+			'GET /rooms/favoritedby/me',
+			'GET /rooms/hot',
+			'GET /rooms/ownedby/me',
+			'GET /rooms/ownedby/{accountId}',
+			'GET /rooms/recommendations',
+			'GET /rooms/search',
+			'GET /rooms/visitedby/me',
+			'GET /rooms/{roomId}',
+			'GET /rooms/{roomId}/interactionby/me',
+			'GET /rooms/{roomId}/playerdata/me',
+			'GET /rooms/{roomId}/similar',
+			'GET /rooms/{roomId}/subrooms/{subRoomId}/data',
+			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
+			'GET /roomserver/photon_access_token',
+			'GET /roomserver/rooms/createdby/me',
+			'POST /rooms/{roomId}/clone',
+			'POST /rooms/{roomId}/subrooms',
+			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
+			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',
+			'PUT /rooms/{roomId}/accessibility',
+			'PUT /rooms/{roomId}/cloning',
+			'PUT /rooms/{roomId}/description',
+			'PUT /rooms/{roomId}/image',
+			'PUT /rooms/{roomId}/interactionby/me/cheer',
+			'PUT /rooms/{roomId}/interactionby/me/favorite',
+			'PUT /rooms/{roomId}/loadscreen',
+			'PUT /rooms/{roomId}/name',
+			'PUT /rooms/{roomId}/restrictions',
+			'PUT /rooms/{roomId}/roles/{accountId}',
+			'PUT /rooms/{roomId}/subrooms/{subRoomId}/modify',
+			'PUT /rooms/{roomId}/tags',
+			'PUT /rooms/{roomId}/warning',
+		])
+
+		// Every operation carries a summary — a path present but undescribed is not
+		// documentation.
+		for (const ops of Object.values(spec.paths)) {
+			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
+		}
 	})
 })

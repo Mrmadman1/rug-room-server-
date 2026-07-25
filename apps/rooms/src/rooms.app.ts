@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
@@ -38,8 +39,52 @@ import {
 	toggleRoomTag,
 	updateRoomFields,
 } from '@repo/domain'
-import { intVar, logger, withNotFound, withOnError } from '@repo/hono-helpers'
+import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
+
+import {
+	AccessibilityRequest,
+	AUTHED,
+	CloneRoomRequest,
+	CloningRequest,
+	CreateSubRoomRequest,
+	DescriptionRequest,
+	FeaturedRoomGroupDto,
+	FORBIDDEN_RESPONSE,
+	form,
+	ImageRequest,
+	InteractionDto,
+	json,
+	jsonBody,
+	LoadScreenRequest,
+	MissingLookupParam,
+	ModifySubRoomRequest,
+	NameRequest,
+	PagedRooms,
+	pageParams,
+	PhotonAccessTokenDto,
+	PlayerDataDto,
+	RestrictionsRequest,
+	RoleRequest,
+	RoomDto,
+	RoomEnvelope,
+	roomIdParam,
+	RoomLookup,
+	RoomResultEnvelope,
+	SaveSubRoomDataRequest,
+	ServiceStatus,
+	stringQuery,
+	SubRoomDto,
+	SubRoomEnvelope,
+	subRoomIdParam,
+	SubRoomSaveResult,
+	SubRoomSavesPage,
+	TagRequest,
+	UNAUTHORIZED_EMPTY,
+	UNAUTHORIZED_ENVELOPE,
+	UNAUTHORIZED_RESPONSE,
+	WarningRequest,
+} from './openapi'
 
 import type { Context } from 'hono'
 import type { App } from './context'
@@ -245,63 +290,152 @@ const app = new Hono<App>()
 	.onError(withOnError())
 	.notFound(withNotFound())
 
-	.get('/', (c) => c.json({ service: 'rooms', status: 'ok' }))
+	.get(
+		'/',
+		describeRoute({
+			tags: ['Service'],
+			summary: 'Service liveness',
+			description: 'A fixed `{ service, status }` body. No auth — a plain liveness probe.',
+			responses: { 200: json(ServiceStatus, 'Always `{ service: "rooms", status: "ok" }`') },
+		}),
+		(c) => c.json({ service: 'rooms', status: 'ok' })
+	)
 
 	// Room lookup by `id` (first match wins) or `name`. 400s when neither is
 	// supplied and returns `{}` when nothing matches.
-	.get('/rooms', async (c) => {
-		const idParam = c.req.query('id')
-		const nameParam = c.req.query('name')
-		if (!idParam && !nameParam) {
-			return c.json("Either 'id' or 'name' query parameter is required", 400)
-		}
-		if (idParam) {
-			const id = firstId(idParam)
-			const room = id === undefined ? null : await getRoomById(c.env.DB, id)
+	.get(
+		'/rooms',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Look up a room by id or name',
+			description: [
+				'A single room by `id` or `name`. `id` may be a comma-separated list — the first',
+				'valid integer wins. An unknown room is `{}`, not a 404: the client reads an empty',
+				'object as “no such room”.',
+			].join(' '),
+			parameters: [
+				stringQuery('id', 'Room id (comma-separated; the first valid one is used)'),
+				stringQuery('name', 'Room name (matched case-insensitively). Ignored when `id` is given'),
+			],
+			responses: {
+				200: json(RoomLookup, 'The room, or `{}` when there’s no match'),
+				400: json(MissingLookupParam, 'Neither `id` nor `name` was supplied'),
+			},
+		}),
+		async (c) => {
+			const idParam = c.req.query('id')
+			const nameParam = c.req.query('name')
+			if (!idParam && !nameParam) {
+				return c.json("Either 'id' or 'name' query parameter is required", 400)
+			}
+			if (idParam) {
+				const id = firstId(idParam)
+				const room = id === undefined ? null : await getRoomById(c.env.DB, id)
+				return c.json(room ?? {})
+			}
+			const room = await getRoomByName(c.env.DB, nameParam ?? '')
 			return c.json(room ?? {})
 		}
-		const room = await getRoomByName(c.env.DB, nameParam ?? '')
-		return c.json(room ?? {})
-	})
+	)
 
 	// Room search: `query` is space/`+`-separated terms — `#tag` matches room tags,
 	// plain terms match the name. Public, non-dorm rooms only. Paginated via
 	// skip/take. Returns `{ Results, TotalResults }`.
-	.get('/rooms/search', async (c) => {
-		const query = c.req.query('query') ?? ''
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '30', 10) || 30
-		return c.json(await searchRooms(c.env.DB, query, skip, take))
-	})
+	.get(
+		'/rooms/search',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Search rooms',
+			description: [
+				'Full room search. `query` is space- or `+`-separated terms: a `#tag` term matches the',
+				'room’s tags, a plain term matches its name. Public, non-dorm rooms only.',
+			].join(' '),
+			parameters: [
+				stringQuery('query', 'Search terms — `#tag` matches tags, plain terms match the name'),
+				...pageParams(30),
+			],
+			responses: { 200: json(PagedRooms, 'The matching rooms') },
+		}),
+		async (c) => {
+			const query = c.req.query('query') ?? ''
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '30', 10) || 30
+			return c.json(await searchRooms(c.env.DB, query, skip, take))
+		}
+	)
 
 	// "Hot" rooms feed — public, non-dorm rooms ordered by engagement, optionally
 	// filtered to a single `tag` (e.g. `rro`). Paginated via skip/take (take
 	// defaults to 100). Returns `{ Results, TotalResults }` like search.
-	.get('/rooms/hot', async (c) => {
-		const tag = c.req.query('tag') ?? ''
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(await getHotRooms(c.env.DB, tag, skip, take))
-	})
+	.get(
+		'/rooms/hot',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'The “hot” rooms feed',
+			description: [
+				'Public, non-dorm rooms ordered by engagement, optionally narrowed to a single `tag`',
+				'(the browse screen’s filter chips post one, e.g. `rro`).',
+			].join(' '),
+			parameters: [stringQuery('tag', 'Restrict to rooms carrying this tag'), ...pageParams(100)],
+			responses: { 200: json(PagedRooms, 'The feed page') },
+		}),
+		async (c) => {
+			const tag = c.req.query('tag') ?? ''
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getHotRooms(c.env.DB, tag, skip, take))
+		}
+	)
 
 	// "Base" rooms — template rooms (tagged `base`) the client offers when creating
 	// a room. Returned regardless of accessibility. Paginated via skip/take (take
 	// defaults to 100). Returns a bare array.
-	.get('/rooms/base', async (c) => {
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(await getBaseRooms(c.env.DB, skip, take))
-	})
+	.get(
+		'/rooms/base',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Base (template) rooms',
+			description: [
+				'The template rooms — those tagged `base` — the client offers when a player creates a',
+				'room. Served regardless of accessibility, and as a bare array rather than a page.',
+			].join(' '),
+			parameters: pageParams(100),
+			responses: { 200: json(RoomDto.array(), 'The template rooms') },
+		}),
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getBaseRooms(c.env.DB, skip, take))
+		}
+	)
 
 	// Recommended rooms feed — public, non-dorm rooms ranked by engagement, returned
 	// as a bare array (the client's recommendation room-source expects a plain list).
 	// The `splitTestId`/`splitTestValue` A/B params are accepted and ignored.
 	// Paginated via skip/take (take defaults to 100).
-	.get('/rooms/recommendations', async (c) => {
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(await getRecommendedRooms(c.env.DB, skip, take))
-	})
+	.get(
+		'/rooms/recommendations',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Recommended rooms',
+			description: [
+				'Public, non-dorm rooms ranked by engagement. Unlike search and hot this is a BARE',
+				'array — the client’s recommendation room-source expects a plain list. The',
+				'`splitTestId`/`splitTestValue` A/B params are accepted and ignored.',
+			].join(' '),
+			parameters: [
+				stringQuery('splitTestId', 'A/B test id — accepted and ignored'),
+				stringQuery('splitTestValue', 'A/B test bucket — accepted and ignored'),
+				...pageParams(100),
+			],
+			responses: { 200: json(RoomDto.array(), 'The recommended rooms') },
+		}),
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getRecommendedRooms(c.env.DB, skip, take))
+		}
+	)
 
 	// Featured rooms — a single always-active group whose `Rooms` are a randomly
 	// ordered set of public, non-dorm rooms. No real curation yet, so `current`
@@ -310,232 +444,496 @@ const app = new Hono<App>()
 	// completely with NREs. I think it is the featured room load that is somehow
 	// corrupting the room cache. I tried sending the normal room shape but that
 	// did not seem to work.
-	.get('/XXXfeaturedrooms/current', async (c) => {
-		return c.json(await getFeaturedRooms(c.env.DB))
-	})
+	.get(
+		'/XXXfeaturedrooms/current',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Featured rooms (parked — the path is deliberately broken)',
+			description: [
+				'A single always-active group of featured rooms: a random shuffle of eligible public',
+				'rooms, since there is no editorial curation yet.',
+				'',
+				'**Parked.** The path the client calls is `/featuredrooms/current`; this is registered',
+				'under an `XXX` prefix so the client never reaches it. Serving it made the OTHER room',
+				'listings fail with NREs in the client, apparently by corrupting its room cache —',
+				'sending the normal room shape instead did not help. It stays registered so the shape',
+				'is documented and the route is one rename away once the cause is found.',
+			].join('\n'),
+			responses: { 200: json(FeaturedRoomGroupDto, 'The featured-room group') },
+		}),
+		async (c) => {
+			return c.json(await getFeaturedRooms(c.env.DB))
+		}
+	)
 
 	// Bulk room lookup by `id` or `name` — returns an array of matched rooms (the
 	// client calls this bare on the rooms host). Rooms not in D1 are simply absent
 	// from the result; the client treats an empty result as NoSuchRoom.
-	.get('/rooms/bulk', async (c) => {
-		const idParam = c.req.query('id')
-		const nameParam = c.req.query('name')
-		if (!idParam && !nameParam) {
-			return c.json("Either 'id' or 'name' query parameter is required", 400)
+	.get(
+		'/rooms/bulk',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Look up several rooms at once',
+			description: [
+				'Rooms by a comma-separated `id` list, or a single `name`. Ids that aren’t in D1 are',
+				'simply absent from the result rather than an error — the client reads an empty result',
+				'as NoSuchRoom.',
+			].join(' '),
+			parameters: [
+				stringQuery('id', 'Comma-separated room ids'),
+				stringQuery('name', 'A single room name. Ignored when `id` is given'),
+			],
+			responses: {
+				200: json(RoomDto.array(), 'The rooms that matched (missing ids are omitted)'),
+				400: json(MissingLookupParam, 'Neither `id` nor `name` was supplied'),
+			},
+		}),
+		async (c) => {
+			const idParam = c.req.query('id')
+			const nameParam = c.req.query('name')
+			if (!idParam && !nameParam) {
+				return c.json("Either 'id' or 'name' query parameter is required", 400)
+			}
+			if (idParam) {
+				return c.json(await getRoomsByIds(c.env.DB, allIds(idParam)))
+			}
+			const room = await getRoomByName(c.env.DB, nameParam ?? '')
+			return c.json(room ? [room] : [])
 		}
-		if (idParam) {
-			return c.json(await getRoomsByIds(c.env.DB, allIds(idParam)))
-		}
-		const room = await getRoomByName(c.env.DB, nameParam ?? '')
-		return c.json(room ? [room] : [])
-	})
+	)
 
 	// Rooms created/owned by the caller. Auth-gated — no token is a 401, never
 	// account 1. `ownedby/me` drops the dorm (it's not a room the player made);
 	// the `createdby` variants return everything the account created.
-	.get('/roomserver/rooms/createdby/me', ownedRooms)
-	.get('/rooms/ownedby/me', ownedRoomsExcludingDorm)
-	.get('/rooms/createdby/me', ownedRooms)
+	.get(
+		'/roomserver/rooms/createdby/me',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Rooms the caller created (legacy path)',
+			description: [
+				'Every room the caller created, dorm included. Identical to',
+				'`GET /rooms/createdby/me` — the 2023 client calls this one under the `/roomserver`',
+				'prefix, so both forms are registered.',
+			].join(' '),
+			security: AUTHED,
+			responses: { 200: json(RoomDto.array(), 'The caller’s rooms'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		ownedRooms
+	)
+	.get(
+		'/rooms/ownedby/me',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Rooms the caller owns (excluding their dorm)',
+			description: [
+				'The caller’s own rooms with the dorm filtered out: a dorm is auto-provisioned, not a',
+				'room the player made, so it doesn’t belong in the “rooms you own” list. Use',
+				'`createdby/me` for everything the account created.',
+			].join(' '),
+			security: AUTHED,
+			responses: {
+				200: json(RoomDto.array(), 'The caller’s rooms, dorm excluded'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		ownedRoomsExcludingDorm
+	)
+	.get(
+		'/rooms/createdby/me',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Rooms the caller created',
+			description: 'Every room the caller created, dorm included.',
+			security: AUTHED,
+			responses: { 200: json(RoomDto.array(), 'The caller’s rooms'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		ownedRooms
+	)
 
 	// Public: the rooms a given account owns that are publicly viewable. No auth —
 	// returns a bare array (empty when the account owns no public rooms).
-	.get('/rooms/ownedby/:accountId{[0-9]+}', async (c) =>
-		c.json(await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10)))
+	.get(
+		'/rooms/ownedby/:accountId{[0-9]+}',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Another player’s public rooms',
+			description: [
+				'The rooms an account owns that are publicly viewable — what the client shows on a',
+				'player’s profile. No auth; empty when the account owns no public rooms.',
+			].join(' '),
+			parameters: [
+				{
+					name: 'accountId',
+					in: 'path',
+					required: true,
+					description: 'The account whose rooms to list',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			responses: { 200: json(RoomDto.array(), 'That account’s public rooms') },
+		}),
+		async (c) =>
+			c.json(await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10)))
 	)
 
 	// Rooms the caller has favorited (from the interaction table). Auth-gated.
 	// Paginated via skip/take (take defaults to 100). Returns a bare array, like the
 	// other room-source `*by/me` lists the client loads.
-	.get('/rooms/favoritedby/me', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(await getFavoritedRooms(c.env.DB, accountId, skip, take))
-	})
+	.get(
+		'/rooms/favoritedby/me',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Rooms the caller favorited',
+			description:
+				'The rooms the caller has favorited (from the interaction table), as a bare array.',
+			security: AUTHED,
+			parameters: pageParams(100),
+			responses: {
+				200: json(RoomDto.array(), 'The favorited rooms'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getFavoritedRooms(c.env.DB, accountId, skip, take))
+		}
+	)
 
 	// Rooms the caller has visited (interaction rows with a last-visited time).
 	// Auth-gated. Paginated via skip/take (take defaults to 100). Returns a bare array.
-	.get('/rooms/visitedby/me', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(await getVisitedRooms(c.env.DB, accountId, skip, take))
-	})
+	.get(
+		'/rooms/visitedby/me',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Rooms the caller visited',
+			description: [
+				'The rooms the caller has visited — interaction rows carrying a last-visited time —',
+				'as a bare array.',
+			].join(' '),
+			security: AUTHED,
+			parameters: pageParams(100),
+			responses: { 200: json(RoomDto.array(), 'The visited rooms'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getVisitedRooms(c.env.DB, accountId, skip, take))
+		}
+	)
 
 	// The current player's interaction state with a room (cheered/favorited/last
 	// visited), read from the `interaction` table. Auth-gated.
-	.get('/rooms/:roomId{[0-9]+}/interactionby/me', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const interaction = await getInteraction(
-			c.env.DB,
-			accountId,
-			Number.parseInt(c.req.param('roomId'), 10)
-		)
-		return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
-	})
+	.get(
+		'/rooms/:roomId{[0-9]+}/interactionby/me',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'The caller’s state on a room',
+			description: [
+				'Whether the caller has cheered/favorited the room. An unknown room (or one the caller',
+				'has never touched) reads as all-false rather than 404. `LastVisitedAt` is stamped',
+				'with “now” on every read, not served from storage.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: { 200: json(InteractionDto, 'The interaction'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const interaction = await getInteraction(
+				c.env.DB,
+				accountId,
+				Number.parseInt(c.req.param('roomId'), 10)
+			)
+			return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
+		}
+	)
 
 	// Toggle the player's cheer/favorite on a room. Both are auth-gated PUTs that
 	// flip the stored flag and return the updated interaction.
-	.put('/rooms/:roomId{[0-9]+}/interactionby/me/cheer', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const interaction = await toggleCheer(
-			c.env.DB,
-			accountId,
-			Number.parseInt(c.req.param('roomId'), 10)
-		)
-		return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
-	})
+	.put(
+		'/rooms/:roomId{[0-9]+}/interactionby/me/cheer',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'Toggle the caller’s cheer on a room',
+			description: 'Flips the stored cheer flag and answers the updated interaction.',
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: {
+				200: json(InteractionDto, 'The interaction after the toggle'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const interaction = await toggleCheer(
+				c.env.DB,
+				accountId,
+				Number.parseInt(c.req.param('roomId'), 10)
+			)
+			return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
+		}
+	)
 	// Explicitly un-cheer a room (DELETE clears the cheer, vs the PUT toggle).
 	// Auth-gated; idempotent — un-cheering when there's no cheer is a no-op.
-	.delete('/rooms/:roomId{[0-9]+}/interactionby/me/cheer', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const interaction = await removeCheer(
-			c.env.DB,
-			accountId,
-			Number.parseInt(c.req.param('roomId'), 10)
-		)
-		return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
-	})
-	.put('/rooms/:roomId{[0-9]+}/interactionby/me/favorite', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const interaction = await toggleFavorite(
-			c.env.DB,
-			accountId,
-			Number.parseInt(c.req.param('roomId'), 10)
-		)
-		return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
-	})
+	.delete(
+		'/rooms/:roomId{[0-9]+}/interactionby/me/cheer',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'Un-cheer a room',
+			description: [
+				'Clears the cheer outright, where the PUT toggles it. Idempotent — un-cheering a room',
+				'that isn’t cheered is a no-op.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: { 200: json(InteractionDto, 'The interaction'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const interaction = await removeCheer(
+				c.env.DB,
+				accountId,
+				Number.parseInt(c.req.param('roomId'), 10)
+			)
+			return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
+		}
+	)
+	.put(
+		'/rooms/:roomId{[0-9]+}/interactionby/me/favorite',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'Toggle the caller’s favorite on a room',
+			description: 'Flips the stored favorite flag and answers the updated interaction.',
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: {
+				200: json(InteractionDto, 'The interaction after the toggle'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const interaction = await toggleFavorite(
+				c.env.DB,
+				accountId,
+				Number.parseInt(c.req.param('roomId'), 10)
+			)
+			return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
+		}
+	)
 	// Explicitly un-favorite a room (DELETE clears the favorite, vs the PUT toggle).
 	// Auth-gated; idempotent — un-favoriting when there's no favorite is a no-op.
-	.delete('/rooms/:roomId{[0-9]+}/interactionby/me/favorite', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
-		const interaction = await removeFavorite(
-			c.env.DB,
-			accountId,
-			Number.parseInt(c.req.param('roomId'), 10)
-		)
-		return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
-	})
+	.delete(
+		'/rooms/:roomId{[0-9]+}/interactionby/me/favorite',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'Un-favorite a room',
+			description: [
+				'Clears the favorite outright, where the PUT toggles it. Idempotent — un-favoriting a',
+				'room that isn’t favorited is a no-op.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: { 200: json(InteractionDto, 'The interaction'), 401: UNAUTHORIZED_RESPONSE },
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const interaction = await removeFavorite(
+				c.env.DB,
+				accountId,
+				Number.parseInt(c.req.param('roomId'), 10)
+			)
+			return c.json({ ...interaction, LastVisitedAt: new Date().toISOString() })
+		}
+	)
 
 	// Clone a room into a new one owned by the caller, using the `name` form field
 	// (also accepted as a query param). Auth is required — no valid token is a 401,
 	// with no stub-account fallback. Returns the `{ success, error, value }` envelope
 	// the client expects; business failures are 200 with success:false.
-	.post('/rooms/:roomId{[0-9]+}/clone', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) {
-			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
-		}
+	.post(
+		'/rooms/:roomId{[0-9]+}/clone',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Clone a room',
+			description: [
+				'Copies a room’s content (scene, subrooms, settings) into a new room owned by the',
+				'caller. Cloning is the only way to make a room, so the per-account room cap is',
+				'enforced here — it counts the rooms the account created, minus their auto-provisioned',
+				'dorm (`MAX_ROOMS_PER_ACCOUNT`; 0 lifts the cap). The clone starts with no tags and',
+				'`IsRRO` cleared.',
+				'',
+				'Rejections — a blank or taken name, the cap, a source that disallows cloning — are',
+				'HTTP 200 with `success: false` and the message the client shows.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(CloneRoomRequest, 'The new room’s name (also read from `?name=`)'),
+			responses: {
+				200: json(RoomEnvelope, 'The new room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const raw = body.name ?? c.req.query('name') ?? ''
-		const name = typeof raw === 'string' ? raw.trim() : ''
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const raw = body.name ?? c.req.query('name') ?? ''
+			const name = typeof raw === 'string' ? raw.trim() : ''
 
-		if (name === '') return roomEnvelope(c, null, 'You must enter a name for your room.')
-		if (await getRoomByName(c.env.DB, name)) {
-			return roomEnvelope(c, null, 'A room with that name already exists!')
+			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your room.')
+			if (await getRoomByName(c.env.DB, name)) {
+				return roomEnvelope(c, null, 'A room with that name already exists!')
+			}
+			// Cloning is how a player makes a room, so the per-account cap belongs here.
+			// Checked after the cheap validations so a rejected name costs no extra D1 read.
+			const maxRooms = intVar(c.env.MAX_ROOMS_PER_ACCOUNT, DEFAULT_MAX_ROOMS_PER_ACCOUNT)
+			if (maxRooms > 0 && (await countRoomsByCreator(c.env.DB, accountId)) >= maxRooms) {
+				logger.info('room create rejected: per-account room limit', { accountId })
+				return roomEnvelope(c, null, `You can only have ${maxRooms} rooms.`)
+			}
+			const room = await cloneRoom(
+				c.env.DB,
+				Number.parseInt(c.req.param('roomId'), 10),
+				name,
+				accountId
+			)
+			if (!room) return roomEnvelope(c, null, "You can't clone this room!")
+			return roomEnvelope(c, room)
 		}
-		// Cloning is how a player makes a room, so the per-account cap belongs here.
-		// Checked after the cheap validations so a rejected name costs no extra D1 read.
-		const maxRooms = intVar(c.env.MAX_ROOMS_PER_ACCOUNT, DEFAULT_MAX_ROOMS_PER_ACCOUNT)
-		if (maxRooms > 0 && (await countRoomsByCreator(c.env.DB, accountId)) >= maxRooms) {
-			logger.info('room create rejected: per-account room limit', { accountId })
-			return roomEnvelope(c, null, `You can only have ${maxRooms} rooms.`)
-		}
-		const room = await cloneRoom(
-			c.env.DB,
-			Number.parseInt(c.req.param('roomId'), 10),
-			name,
-			accountId
-		)
-		if (!room) return roomEnvelope(c, null, "You can't clone this room!")
-		return roomEnvelope(c, room)
-	})
+	)
 
 	// Update a room's description. Auth-gated (401) and owner-only. Business results
 	// use the `{ Success, Value, ErrorId, Error }` envelope at HTTP 200.
-	.put('/rooms/:roomId{[0-9]+}/description', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/description',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s description',
+			description: [
+				'Owner-only (the room’s `CreatorAccountId` — co-owners cannot). An unknown room or a',
+				'non-owner is HTTP 200 with `Success: false` and an `ErrorId`; only a missing token is',
+				'a real 401. An absent `description` field clears the description.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(DescriptionRequest, 'The new description'),
+			responses: {
+				200: json(RoomResultEnvelope, 'Success, or a rejection carrying an `ErrorId`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
-		}
-		if (room.CreatorAccountId !== accountId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.NotOwner',
-				Error: 'You are not the owner of this room!',
-			})
-		}
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			if (room.CreatorAccountId !== accountId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.NotOwner',
+					Error: 'You are not the owner of this room!',
+				})
+			}
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const description = typeof body.description === 'string' ? body.description : ''
-		await setRoomDescription(c.env.DB, roomId, description)
-		return roomResult(c, { Success: true })
-	})
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const description = typeof body.description === 'string' ? body.description : ''
+			await setRoomDescription(c.env.DB, roomId, description)
+			return roomResult(c, { Success: true })
+		}
+	)
 
 	// Rename a room. Auth-gated (401) and owner-only; the new name must be non-empty
 	// and not already taken by another room. Business results use the
 	// `{ Success, Value, ErrorId, Error }` envelope at HTTP 200.
 	// NOTE: the ErrorId strings (besides Rooms.DoesntExist) are best guesses.
-	.put('/rooms/:roomId{[0-9]+}/name', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/name',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Rename a room',
+			description: [
+				'Owner-only. The new name must be non-empty and not already taken by another room',
+				'(names are compared case-insensitively). Rejections are HTTP 200 with',
+				'`Success: false`.',
+				'',
+				'NOTE: the `ErrorId` strings other than `Rooms.DoesntExist` are best guesses — the',
+				'client only renders `Error`, so they have never been confirmed against the real one.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(NameRequest, 'The new name'),
+			responses: {
+				200: json(RoomResultEnvelope, 'Success, or a rejection carrying an `ErrorId`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
-		}
-		if (room.CreatorAccountId !== accountId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.NotOwner',
-				Error: 'You are not the owner of this room!',
-			})
-		}
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			if (room.CreatorAccountId !== accountId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.NotOwner',
+					Error: 'You are not the owner of this room!',
+				})
+			}
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const name = typeof body.name === 'string' ? body.name.trim() : ''
-		if (name === '') {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.InvalidName',
-				Error: 'You must enter a name for your room!',
-			})
-		}
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const name = typeof body.name === 'string' ? body.name.trim() : ''
+			if (name === '') {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.InvalidName',
+					Error: 'You must enter a name for your room!',
+				})
+			}
 
-		// Reject if a different room already uses this name (case-insensitive).
-		const existing = await getRoomByName(c.env.DB, name)
-		if (existing && existing.RoomId !== roomId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.AlreadyExists',
-				Error: 'A room with that name already exists!',
-			})
-		}
+			// Reject if a different room already uses this name (case-insensitive).
+			const existing = await getRoomByName(c.env.DB, name)
+			if (existing && existing.RoomId !== roomId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.AlreadyExists',
+					Error: 'A room with that name already exists!',
+				})
+			}
 
-		await setRoomName(c.env.DB, roomId, name)
-		return roomResult(c, { Success: true })
-	})
+			await setRoomName(c.env.DB, roomId, name)
+			return roomResult(c, { Success: true })
+		}
+	)
 
 	// Toggle a tag on a room. Auth-gated (401) and owner-only. Body is the `tag`
 	// form field. There's no delete/patch endpoint, so this call toggles: it adds
@@ -543,103 +941,161 @@ const app = new Hono<App>()
 	// (#pvp/#quest/#game/#hangout/#art) are radio buttons — setting one clears the
 	// others. Returns the `{ success, error, value }` envelope with the updated
 	// room as `value`; business failures are 200 with success:false.
-	.put('/rooms/:roomId{[0-9]+}/tags', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/tags',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Toggle a tag on a room',
+			description: [
+				'Owner-only. There is no delete/patch counterpart, so this call TOGGLES: it adds the',
+				'tag (Type 0) when absent and removes it when present. The “main” tags',
+				'(`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio buttons — setting one clears',
+				'the others. Answers the lowercase envelope with the updated room, which the client',
+				're-renders from.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(TagRequest, 'The tag to toggle'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		if (room.CreatorAccountId !== accountId) {
-			return roomEnvelope(c, null, 'You are not the owner of this room!')
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const tag = typeof body.tag === 'string' ? body.tag.trim() : ''
+			if (tag === '') return roomEnvelope(c, null, 'You must provide a tag!')
+
+			const updated = await toggleRoomTag(c.env.DB, roomId, room, tag)
+			return roomEnvelope(c, updated)
 		}
-
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const tag = typeof body.tag === 'string' ? body.tag.trim() : ''
-		if (tag === '') return roomEnvelope(c, null, 'You must provide a tag!')
-
-		const updated = await toggleRoomTag(c.env.DB, roomId, room, tag)
-		return roomEnvelope(c, updated)
-	})
+	)
 
 	// Set a room's image. Auth-gated (401) and owner-only. Body is the `imageName`
 	// form field (a key from the storage/image upload). Business results use the
 	// `{ Success, Value, ErrorId, Error }` envelope at HTTP 200.
-	.put('/rooms/:roomId{[0-9]+}/image', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/image',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s image',
+			description: [
+				'Owner-only. `imageName` is a key from the storage upload, stored un-prefixed (the',
+				'`cdn` worker serves it back under `room/`). Pushes a `RoomUpdate` to the owner so',
+				'their client re-renders with the new image.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ImageRequest, 'The uploaded image key'),
+			responses: {
+				200: json(RoomResultEnvelope, 'Success, or a rejection carrying an `ErrorId`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
-		}
-		if (room.CreatorAccountId !== accountId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.NotOwner',
-				Error: 'You are not the owner of this room!',
-			})
-		}
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			if (room.CreatorAccountId !== accountId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.NotOwner',
+					Error: 'You are not the owner of this room!',
+				})
+			}
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const imageName = typeof body.imageName === 'string' ? body.imageName.trim() : ''
-		if (imageName === '') {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.InvalidImage',
-				Error: 'You must provide an image!',
-			})
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const imageName = typeof body.imageName === 'string' ? body.imageName.trim() : ''
+			if (imageName === '') {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.InvalidImage',
+					Error: 'You must provide an image!',
+				})
+			}
+			await setRoomImage(c.env.DB, roomId, imageName)
+			// Notify the owner so their client refreshes the room (RoomUpdate carries the
+			// updated room). The reference sends the post-update room, so merge the change.
+			await pushRoomUpdate(c, accountId, { ...room, ImageName: imageName })
+			return roomResult(c, { Success: true })
 		}
-		await setRoomImage(c.env.DB, roomId, imageName)
-		// Notify the owner so their client refreshes the room (RoomUpdate carries the
-		// updated room). The reference sends the post-update room, so merge the change.
-		await pushRoomUpdate(c, accountId, { ...room, ImageName: imageName })
-		return roomResult(c, { Success: true })
-	})
+	)
 
 	// Delete a room. Auth-gated (401) and owner-only (the room's CreatorAccountId).
 	// Removes the room record (and per-player interactions with it) and the room's
 	// image object from the shared CDN bucket. Images players *took* in the room are
 	// left alone — they live in the api/img world and outlast the room.
-	.delete('/rooms/:roomId{[0-9]+}', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.delete(
+		'/rooms/:roomId{[0-9]+}',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Delete a room',
+			description: [
+				'Owner-only. Removes the room record, the per-player interactions with it, and the',
+				'room’s image object from the shared CDN bucket. Photos players TOOK in the room are',
+				'left alone — those live in the api/img world and outlive the room.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: {
+				200: json(RoomResultEnvelope, 'Success, or a rejection carrying an `ErrorId`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			if (room.CreatorAccountId !== accountId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.NotOwner',
+					Error: 'You are not the owner of this room!',
+				})
+			}
+
+			await deleteRoom(c.env.DB, roomId)
+
+			// Remove the room image from the CDN bucket. The stored ImageName is the
+			// un-prefixed key the `cdn` worker serves back under `room/` (see storage
+			// upload + the `GET /room/:dataBlob` route), so the object key is `room/<name>`.
+			// R2 deletes are idempotent, so a canonical/static or already-gone image is fine.
+			const imageName = typeof room.ImageName === 'string' ? room.ImageName : ''
+			if (imageName !== '') {
+				await c.env.CDN_ASSETS.delete(`room/${imageName}`)
+			}
+
+			return roomResult(c, { Success: true })
 		}
-		if (room.CreatorAccountId !== accountId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.NotOwner',
-				Error: 'You are not the owner of this room!',
-			})
-		}
-
-		await deleteRoom(c.env.DB, roomId)
-
-		// Remove the room image from the CDN bucket. The stored ImageName is the
-		// un-prefixed key the `cdn` worker serves back under `room/` (see storage
-		// upload + the `GET /room/:dataBlob` route), so the object key is `room/<name>`.
-		// R2 deletes are idempotent, so a canonical/static or already-gone image is fine.
-		const imageName = typeof room.ImageName === 'string' ? room.ImageName : ''
-		if (imageName !== '') {
-			await c.env.CDN_ASSETS.delete(`room/${imageName}`)
-		}
-
-		return roomResult(c, { Success: true })
-	})
+	)
 
 	// Set a member's role in a room (`Roles[].Role`). Auth-gated (401) and gated to
 	// the room creator or a co-owner (403 otherwise) — the same owner/co-owner check
@@ -647,191 +1103,362 @@ const app = new Hono<App>()
 	// tier). Updates the target account's existing role entry or adds one, notifies the
 	// affected member so their client refreshes permissions, and returns the updated
 	// room in the lowercase `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/roles/:accountId{[0-9]+}', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/roles/:accountId{[0-9]+}',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a member’s role in a room',
+			description: [
+				'Updates the target account’s entry in the room’s `Roles` (or adds one). Gated to the',
+				'room’s creator or a co-owner — a valid token from anyone else is a 403. The affected',
+				'MEMBER gets the `RoomUpdate` push, not the caller, so their client refreshes the',
+				'permissions it just gained or lost.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				roomIdParam,
+				{
+					name: 'accountId',
+					in: 'path',
+					required: true,
+					description: 'The member whose role changes',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			requestBody: form(RoleRequest, 'The role tier to grant'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const targetAccountId = Number.parseInt(c.req.param('accountId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const targetAccountId = Number.parseInt(c.req.param('accountId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const role = typeof body.role === 'string' ? Number.parseInt(body.role, 10) : Number.NaN
-		if (Number.isNaN(role)) return roomEnvelope(c, null, 'You must provide a valid role!')
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const role = typeof body.role === 'string' ? Number.parseInt(body.role, 10) : Number.NaN
+			if (Number.isNaN(role)) return roomEnvelope(c, null, 'You must provide a valid role!')
 
-		const updated = await setRoomRole(c.env.DB, roomId, targetAccountId, role, accountId, room)
-		// Notify the member whose role changed so their client refreshes the room
-		// (and the permissions it grants them).
-		await pushRoomUpdate(c, targetAccountId, updated)
-		return roomEnvelope(c, updated)
-	})
+			const updated = await setRoomRole(c.env.DB, roomId, targetAccountId, role, accountId, room)
+			// Notify the member whose role changed so their client refreshes the room
+			// (and the permissions it grants them).
+			await pushRoomUpdate(c, targetAccountId, updated)
+			return roomEnvelope(c, updated)
+		}
+	)
 
 	// Set a room's content warning: the `WarningMask` bit flags plus an optional
 	// free-text `CustomWarning`. Auth-gated (401) and owner/co-owner-only (403). Body is
 	// the `warningMask` form field (an integer) and an optional `customWarning` string
 	// (set when present — an empty value clears it). Returns the updated room in the
 	// `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/warning', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/warning',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s content warning',
+			description: [
+				'The `WarningMask` bit flags plus an optional free-text `CustomWarning`. Owner or',
+				'co-owner only (403 otherwise). `CustomWarning` is only touched when the field is',
+				'present — sending it empty clears it, omitting it leaves it alone.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(WarningRequest, 'The warning flags and optional custom text'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const warningMask =
-			typeof body.warningMask === 'string' ? Number.parseInt(body.warningMask, 10) : Number.NaN
-		if (Number.isNaN(warningMask))
-			return roomEnvelope(c, null, 'You must provide a valid warning mask!')
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const warningMask =
+				typeof body.warningMask === 'string' ? Number.parseInt(body.warningMask, 10) : Number.NaN
+			if (Number.isNaN(warningMask))
+				return roomEnvelope(c, null, 'You must provide a valid warning mask!')
 
-		const patch: Record<string, unknown> = { WarningMask: warningMask }
-		// Only touch CustomWarning when the field is present (an empty string clears it).
-		if (typeof body.customWarning === 'string') patch.CustomWarning = body.customWarning
+			const patch: Record<string, unknown> = { WarningMask: warningMask }
+			// Only touch CustomWarning when the field is present (an empty string clears it).
+			if (typeof body.customWarning === 'string') patch.CustomWarning = body.customWarning
 
-		const updated = await updateRoomFields(c.env.DB, roomId, room, patch)
-		// Notify the owner so their client refreshes the room with the updated warning.
-		await pushRoomUpdate(c, accountId, updated)
-		return roomEnvelope(c, updated)
-	})
+			const updated = await updateRoomFields(c.env.DB, roomId, room, patch)
+			// Notify the owner so their client refreshes the room with the updated warning.
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
+		}
+	)
 
 	// Toggle whether a room may be cloned (`CloningAllowed`). Auth-gated (401) and
 	// owner/co-owner-only (403). Body is the `cloningAllowed` form field (`True`/`False`).
 	// Returns the updated room in the `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/cloning', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/cloning',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Allow or block cloning of a room',
+			description: [
+				'Sets `CloningAllowed` — false makes `POST /rooms/{roomId}/clone` refuse. Owner or',
+				'co-owner only (403 otherwise).',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(CloningRequest, 'Whether cloning is allowed'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		if (typeof body.cloningAllowed !== 'string') {
-			return roomEnvelope(c, null, 'You must provide cloningAllowed.')
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			if (typeof body.cloningAllowed !== 'string') {
+				return roomEnvelope(c, null, 'You must provide cloningAllowed.')
+			}
+			const cloningAllowed = body.cloningAllowed.toLowerCase() === 'true'
+
+			const updated = await updateRoomFields(c.env.DB, roomId, room, {
+				CloningAllowed: cloningAllowed,
+			})
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
 		}
-		const cloningAllowed = body.cloningAllowed.toLowerCase() === 'true'
-
-		const updated = await updateRoomFields(c.env.DB, roomId, room, {
-			CloningAllowed: cloningAllowed,
-		})
-		await pushRoomUpdate(c, accountId, updated)
-		return roomEnvelope(c, updated)
-	})
+	)
 
 	// Set a room's platform/movement support flags (its `Supports*` restrictions).
 	// Auth-gated (401) and owner/co-owner-only (403). Body is a form of
 	// `supports*=True|False` fields (see RESTRICTION_FIELDS); only the fields present
 	// are changed. Returns the updated room in the `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/restrictions', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/restrictions',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s platform/movement support flags',
+			description: [
+				'The room’s `Supports*` restrictions — which platforms and movement modes may enter.',
+				'Owner or co-owner only (403 otherwise). Only the fields actually posted are changed,',
+				'and field names are matched case-insensitively.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(RestrictionsRequest, 'The flags to change'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const patch: Record<string, boolean> = {}
-		for (const [key, value] of Object.entries(body)) {
-			const field = RESTRICTION_FIELDS[key.toLowerCase()]
-			if (field !== undefined && typeof value === 'string') {
-				patch[field] = value.toLowerCase() === 'true'
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const patch: Record<string, boolean> = {}
+			for (const [key, value] of Object.entries(body)) {
+				const field = RESTRICTION_FIELDS[key.toLowerCase()]
+				if (field !== undefined && typeof value === 'string') {
+					patch[field] = value.toLowerCase() === 'true'
+				}
 			}
-		}
 
-		const updated = await updateRoomFields(c.env.DB, roomId, room, patch)
-		await pushRoomUpdate(c, accountId, updated)
-		return roomEnvelope(c, updated)
-	})
+			const updated = await updateRoomFields(c.env.DB, roomId, room, patch)
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
+		}
+	)
 
 	// Add a load screen to a room (`LoadScreens[]` — the images shown while the room
 	// loads). Auth-gated (401) and owner/co-owner-only (403). Body is the `imageName`
 	// form field plus optional `title`/`subtitle`. Appends one
 	// `{ ImageName, Title, Subtitle }` to the existing list and returns the updated
 	// room in the `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/loadscreen', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/loadscreen',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Add a load screen to a room',
+			description: [
+				'APPENDS one `{ ImageName, Title, Subtitle }` to the room’s `LoadScreens` — the images',
+				'shown while the room loads. There is no remove or replace counterpart. Owner or',
+				'co-owner only (403 otherwise).',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(LoadScreenRequest, 'The load screen to append'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const imageName = typeof body.imageName === 'string' ? body.imageName.trim() : ''
-		if (imageName === '') return roomEnvelope(c, null, 'You must provide an image!')
-		const title = typeof body.title === 'string' ? body.title : ''
-		const subtitle = typeof body.subtitle === 'string' ? body.subtitle : ''
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const imageName = typeof body.imageName === 'string' ? body.imageName.trim() : ''
+			if (imageName === '') return roomEnvelope(c, null, 'You must provide an image!')
+			const title = typeof body.title === 'string' ? body.title : ''
+			const subtitle = typeof body.subtitle === 'string' ? body.subtitle : ''
 
-		const existing = Array.isArray(room.LoadScreens) ? (room.LoadScreens as unknown[]) : []
-		const loadScreens = [...existing, { ImageName: imageName, Title: title, Subtitle: subtitle }]
-		const updated = await updateRoomFields(c.env.DB, roomId, room, { LoadScreens: loadScreens })
-		await pushRoomUpdate(c, accountId, updated)
-		return roomEnvelope(c, updated)
-	})
+			const existing = Array.isArray(room.LoadScreens) ? (room.LoadScreens as unknown[]) : []
+			const loadScreens = [...existing, { ImageName: imageName, Title: title, Subtitle: subtitle }]
+			const updated = await updateRoomFields(c.env.DB, roomId, room, { LoadScreens: loadScreens })
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
+		}
+	)
 
 	// Set a room's top-level `Accessibility` (the visibility the public-room/search
 	// filters key on — see the RoomAccessibility enum). Auth-gated (401) and
 	// owner/co-owner-only (403). Body is the `accessibility` form field (an integer).
 	// Returns the updated room in the `{ success, error, value }` envelope.
-	.put('/rooms/:roomId{[0-9]+}/accessibility', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/accessibility',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s accessibility',
+			description: [
+				'The room’s top-level visibility — the field the public-room and search filters key',
+				'on (0 Private, 1 Public, 2 Unlisted). Owner or co-owner only (403 otherwise).',
+				'Subrooms carry their own `Accessibility`, set through the subroom `modify` call.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(AccessibilityRequest, 'The new accessibility'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const accessibility =
-			typeof body.accessibility === 'string' ? Number.parseInt(body.accessibility, 10) : Number.NaN
-		if (Number.isNaN(accessibility)) {
-			return roomEnvelope(c, null, 'You must provide a valid accessibility!')
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const accessibility =
+				typeof body.accessibility === 'string'
+					? Number.parseInt(body.accessibility, 10)
+					: Number.NaN
+			if (Number.isNaN(accessibility)) {
+				return roomEnvelope(c, null, 'You must provide a valid accessibility!')
+			}
+
+			const updated = await updateRoomFields(c.env.DB, roomId, room, {
+				Accessibility: accessibility,
+			})
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
 		}
-
-		const updated = await updateRoomFields(c.env.DB, roomId, room, { Accessibility: accessibility })
-		await pushRoomUpdate(c, accountId, updated)
-		return roomEnvelope(c, updated)
-	})
+	)
 
 	// A subroom's data descriptor (the SubRoom object from the room's SubRooms
 	// array). Public — the client fetches it while loading the room. 404 when the
 	// room or subroom is unknown.
-	.get('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data', async (c) => {
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		const sub = room ? findSubRoom(room, subRoomId) : undefined
-		return sub ? c.json(sub) : c.notFound()
-	})
+	.get(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'A subroom’s data descriptor',
+			description: [
+				'The `SubRoom` object from the room’s `SubRooms` array — the descriptor the client',
+				'fetches while loading the room, carrying the scene id and the saved-data blob keys.',
+				'Public; an unknown room or subroom is a 404.',
+			].join(' '),
+			parameters: [roomIdParam, subRoomIdParam],
+			responses: {
+				200: json(SubRoomDto, 'The subroom'),
+				404: { description: 'No such room or subroom' },
+			},
+		}),
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			const sub = room ? findSubRoom(room, subRoomId) : undefined
+			return sub ? c.json(sub) : c.notFound()
+		}
+	)
 
 	// A subroom's saved-data versions — the room-history / "restore a save" list, paged as
 	// PagedResultsDTO<SubRoomDataSaveDTO> (`{ Results, TotalResults }`). We don't keep a save
 	// history yet: a save (POST …/data) overwrites the current blob inline on the subroom, so
 	// there are no distinct versions to list — this returns an empty page. The
 	// unityAssetTarget/unityAssetVersion/skip/take query params are accepted and ignored.
-	.get('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves', (c) =>
-		c.json({ Results: [], TotalResults: 0 })
+	.get(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'A subroom’s saved-data versions',
+			description: [
+				'The room-history / “restore a save” list, paged as',
+				'`PagedResultsDTO<SubRoomDataSaveDTO>`. We keep no save history — a save (`POST',
+				'…/data`) overwrites the subroom’s current blob inline, so there are no distinct',
+				'versions to list — and this is always an empty page. The',
+				'`unityAssetTarget`/`unityAssetVersion`/`skip`/`take` params are accepted and ignored.',
+			].join(' '),
+			parameters: [
+				roomIdParam,
+				subRoomIdParam,
+				stringQuery('unityAssetTarget', 'Accepted and ignored'),
+				stringQuery('unityAssetVersion', 'Accepted and ignored'),
+				stringQuery('skip', 'Accepted and ignored — the page is always empty'),
+				stringQuery('take', 'Accepted and ignored — the page is always empty'),
+			],
+			responses: { 200: json(SubRoomSavesPage, 'Always an empty page') },
+		}),
+		(c) => c.json({ Results: [], TotalResults: 0 })
 	)
 
 	// Save a subroom's data (room save). Auth-gated (401 with empty body). Editable
@@ -839,234 +1466,476 @@ const app = new Hono<App>()
 	// the uploaded data blobs and records the room-level save fields, notifies the
 	// owner, and returns the updated ROOM in the lowercase `{ success, error, value }`
 	// envelope the reference's SetRoomData uses.
-	.post('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return c.body(null, 401)
+	.post(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Save a subroom’s data (room save)',
+			description: [
+				'Points the subroom at the blobs the client has already uploaded through the `storage`',
+				'worker and stamps the save; the room-level fields the save carries (`Description`,',
+				'`PersistenceVersion`, `InventionUsage`) are written to the room. Editable by the',
+				'room’s creator or a co-owner (403 otherwise); a missing token is an EMPTY-body 401,',
+				'unlike the other room writes.',
+				'',
+				'The push notification carries the whole room, but the RESPONSE is the saved SUBROOM',
+				'itself with no envelope — the client deserializes the body directly as the subroom.',
+				'A subroom with no `CreatorAccountId` yet (the seeded rooms start null) gets the',
+				'saver’s id here, because the client NREs on a null one.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: jsonBody(SaveSubRoomDataRequest, 'The uploaded blob keys and save fields'),
+			responses: {
+				200: json(
+					SubRoomSaveResult,
+					'The saved subroom, or the result envelope when the room/subroom is unknown'
+				),
+				401: UNAUTHORIZED_EMPTY,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return c.body(null, 401)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
+
+			const body = (await c.req.json().catch(() => ({}))) as {
+				RoomData?: { Filename?: string }
+				SubRoomData?: { Filename?: string }
+				Description?: string
+				PersistenceVersion?: number
+				InventionUsage?: string
+			}
+
+			const updated = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
+				subRoomDataFilename: body.SubRoomData?.Filename,
+				roomDataFilename: body.RoomData?.Filename,
+				description: typeof body.Description === 'string' ? body.Description : undefined,
+				persistenceVersion:
+					typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
+				inventionUsage: typeof body.InventionUsage === 'string' ? body.InventionUsage : undefined,
 			})
-		}
-		// A valid token but not the room's owner/co-owner → 403 (the auth gate above
-		// already returned 401 for a missing/invalid token).
-		if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			if (!updated) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
 
-		const body = (await c.req.json().catch(() => ({}))) as {
-			RoomData?: { Filename?: string }
-			SubRoomData?: { Filename?: string }
-			Description?: string
-			PersistenceVersion?: number
-			InventionUsage?: string
+			// RoomUpdate carries the full room, but the HTTP response is the saved SUBROOM
+			// itself — no envelope. The client deserializes the body directly as the subroom.
+			await pushRoomUpdate(c, accountId, updated)
+			return c.json(findSubRoom(updated, subRoomId) ?? {})
 		}
-
-		const updated = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
-			subRoomDataFilename: body.SubRoomData?.Filename,
-			roomDataFilename: body.RoomData?.Filename,
-			description: typeof body.Description === 'string' ? body.Description : undefined,
-			persistenceVersion:
-				typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
-			inventionUsage: typeof body.InventionUsage === 'string' ? body.InventionUsage : undefined,
-		})
-		if (!updated) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
-		}
-
-		// RoomUpdate carries the full room, but the HTTP response is the saved SUBROOM
-		// itself — no envelope. The client deserializes the body directly as the subroom.
-		await pushRoomUpdate(c, accountId, updated)
-		return c.json(findSubRoom(updated, subRoomId) ?? {})
-	})
+	)
 
 	// Modify a subroom's settings (Name/Accessibility/MaxPlayers) from the form body.
 	// Auth-gated (401) and owner-only — only the room creator may change its subrooms.
 	// Notifies the owner (RoomUpdate) and returns the `{ Success, Value, ErrorId, Error }`
 	// envelope at HTTP 200, matching the other owner-gated room mutations.
-	.put('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/modify', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) return unauthorized(c)
+	.put(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/modify',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Modify a subroom’s settings',
+			description: [
+				'Sets a subroom’s `Name`, `Accessibility` and `MaxPlayers`. Owner-only — only the',
+				'room’s creator may change its subrooms, not co-owners. `name` is required;',
+				'`accessibility` and `maxPlayers` are applied only when supplied, and a non-positive',
+				'`maxPlayers` is ignored rather than rejected.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: form(ModifySubRoomRequest, 'The settings to change'),
+			responses: {
+				200: json(RoomResultEnvelope, 'Success, or a rejection carrying an `ErrorId`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
 
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This room does not exist!',
-			})
-		}
-		if (room.CreatorAccountId !== accountId) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.NotOwner',
-				Error: 'You are not the owner of this room!',
-			})
-		}
-		if (!findSubRoom(room, subRoomId)) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This subroom does not exist!',
-			})
-		}
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This room does not exist!',
+				})
+			}
+			if (room.CreatorAccountId !== accountId) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.NotOwner',
+					Error: 'You are not the owner of this room!',
+				})
+			}
+			if (!findSubRoom(room, subRoomId)) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This subroom does not exist!',
+				})
+			}
 
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const name = typeof body.name === 'string' ? body.name.trim() : ''
-		if (name === '') {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.InvalidName',
-				Error: 'You must enter a name for your room!',
-			})
-		}
-		const accessibility =
-			typeof body.accessibility === 'string' ? Number.parseInt(body.accessibility, 10) : Number.NaN
-		const maxPlayers =
-			typeof body.maxPlayers === 'string' ? Number.parseInt(body.maxPlayers, 10) : Number.NaN
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const name = typeof body.name === 'string' ? body.name.trim() : ''
+			if (name === '') {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.InvalidName',
+					Error: 'You must enter a name for your room!',
+				})
+			}
+			const accessibility =
+				typeof body.accessibility === 'string'
+					? Number.parseInt(body.accessibility, 10)
+					: Number.NaN
+			const maxPlayers =
+				typeof body.maxPlayers === 'string' ? Number.parseInt(body.maxPlayers, 10) : Number.NaN
 
-		const updated = await modifySubRoom(c.env.DB, roomId, subRoomId, {
-			name,
-			accessibility: Number.isNaN(accessibility) ? undefined : accessibility,
-			maxPlayers: Number.isNaN(maxPlayers) || maxPlayers <= 0 ? undefined : maxPlayers,
-		})
-		if (!updated) {
-			return roomResult(c, {
-				Success: false,
-				ErrorId: 'Rooms.DoesntExist',
-				Error: 'This subroom does not exist!',
+			const updated = await modifySubRoom(c.env.DB, roomId, subRoomId, {
+				name,
+				accessibility: Number.isNaN(accessibility) ? undefined : accessibility,
+				maxPlayers: Number.isNaN(maxPlayers) || maxPlayers <= 0 ? undefined : maxPlayers,
 			})
-		}
+			if (!updated) {
+				return roomResult(c, {
+					Success: false,
+					ErrorId: 'Rooms.DoesntExist',
+					Error: 'This subroom does not exist!',
+				})
+			}
 
-		await pushRoomUpdate(c, accountId, updated)
-		return roomResult(c, { Success: true })
-	})
+			await pushRoomUpdate(c, accountId, updated)
+			return roomResult(c, { Success: true })
+		}
+	)
 
 	// Clone a subroom into a new subroom of the same room (fresh SubRoomId, same
 	// scene/settings/data). Auth-gated (401) and owner-only. Notifies the owner and
 	// returns the `{ success, error, value }` envelope with the new subroom as `value`,
 	// mirroring the room-level `/clone`. Response shape is a best guess (the real
 	// client's expected body is unknown).
-	.post('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/clone', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) {
-			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+	.post(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/clone',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Clone a subroom',
+			description: [
+				'Copies a subroom into a new subroom of the SAME room — same scene, settings and saved',
+				'data blobs, so it loads identical content — with a fresh globally-unique `SubRoomId`.',
+				'Owner-only.',
+				'',
+				'The response shape is a best guess: it mirrors the room-level `/clone` envelope, but',
+				'the real client’s expected body for this call is unknown.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			responses: {
+				200: json(SubRoomEnvelope, 'The new subroom, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+
+			const result = await cloneSubRoom(c.env.DB, roomId, subRoomId, accountId)
+			if (!result) return roomEnvelope(c, null, 'This subroom does not exist!')
+
+			await pushRoomUpdate(c, accountId, result.room)
+			return roomEnvelope(c, result.subRoom)
 		}
-
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
-
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		if (room.CreatorAccountId !== accountId) {
-			return roomEnvelope(c, null, 'You are not the owner of this room!')
-		}
-
-		const result = await cloneSubRoom(c.env.DB, roomId, subRoomId, accountId)
-		if (!result) return roomEnvelope(c, null, 'This subroom does not exist!')
-
-		await pushRoomUpdate(c, accountId, result.room)
-		return roomEnvelope(c, result.subRoom)
-	})
+	)
 
 	// Create a new (empty) subroom in a room (form body `name`). Auth-gated (401) and
 	// owner-only. Mints a fresh globally-unique SubRoomId, bases the scene/capacity on the
 	// room's first subroom, notifies the owner (RoomUpdate), and returns the updated ROOM
 	// in the `{ success, error, value }` envelope (the client re-renders the room's subroom
 	// list from `value`, so it's the whole room, not the bare subroom).
-	.post('/rooms/:roomId{[0-9]+}/subrooms', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) {
-			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+	.post(
+		'/rooms/:roomId{[0-9]+}/subrooms',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Create a subroom',
+			description: [
+				'Adds an empty subroom to a room. Owner-only. It mints a fresh globally-unique',
+				'`SubRoomId` (the game numbers subrooms from one sequence, not per room) and inherits',
+				'the scene and capacity of the room’s first existing subroom.',
+				'',
+				'Answers the updated ROOM, not the bare subroom — the client re-renders the room’s',
+				'subroom list from `value`. Delete answers the same shape.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(CreateSubRoomRequest, 'The new subroom’s name'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const name = typeof body.name === 'string' ? body.name.trim() : ''
+			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
+
+			const result = await createSubRoom(c.env.DB, roomId, accountId, name)
+			if (!result) return roomEnvelope(c, null, 'This room does not exist!')
+
+			await pushRoomUpdate(c, accountId, result.room)
+			return roomEnvelope(c, result.room)
 		}
-
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		if (room.CreatorAccountId !== accountId) {
-			return roomEnvelope(c, null, 'You are not the owner of this room!')
-		}
-
-		const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-		const name = typeof body.name === 'string' ? body.name.trim() : ''
-		if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
-
-		const result = await createSubRoom(c.env.DB, roomId, accountId, name)
-		if (!result) return roomEnvelope(c, null, 'This room does not exist!')
-
-		await pushRoomUpdate(c, accountId, result.room)
-		return roomEnvelope(c, result.room)
-	})
+	)
 
 	// Delete a subroom from a room. Auth-gated (401) and owner-only. Refuses to remove a
 	// room's only subroom. Notifies the owner (RoomUpdate) and returns the updated ROOM in
 	// the `{ success, error, value }` envelope (same shape as create, so the client
 	// re-renders the subroom list from `value`).
-	.delete('/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}', async (c) => {
-		const accountId = await authedAccountId(c)
-		if (accountId === null) {
-			return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+	.delete(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Delete a subroom',
+			description: [
+				'Removes a subroom from a room. Owner-only, and it refuses to remove a room’s only',
+				'subroom — that would leave the room with no scene to load. Any saved-data blob the',
+				'subroom pointed at is left in R2, the same way deleting a room leaves the photos',
+				'taken in it. Answers the updated ROOM, like create.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+
+			const result = await deleteSubRoom(c.env.DB, roomId, subRoomId)
+			if (!result.ok) {
+				return roomEnvelope(
+					c,
+					null,
+					result.reason === 'last_subroom'
+						? "You can't delete a room's only subroom!"
+						: 'This subroom does not exist!'
+				)
+			}
+
+			await pushRoomUpdate(c, accountId, result.room)
+			return roomEnvelope(c, result.room)
 		}
-
-		const roomId = Number.parseInt(c.req.param('roomId'), 10)
-		const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
-
-		const room = await getRoomById(c.env.DB, roomId)
-		if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-		if (room.CreatorAccountId !== accountId) {
-			return roomEnvelope(c, null, 'You are not the owner of this room!')
-		}
-
-		const result = await deleteSubRoom(c.env.DB, roomId, subRoomId)
-		if (!result.ok) {
-			return roomEnvelope(
-				c,
-				null,
-				result.reason === 'last_subroom'
-					? "You can't delete a room's only subroom!"
-					: 'This subroom does not exist!'
-			)
-		}
-
-		await pushRoomUpdate(c, accountId, result.room)
-		return roomEnvelope(c, result.room)
-	})
+	)
 
 	// Rooms similar to the given room (sharing tags). Paginated via skip/take (take
 	// defaults to 100). Returns `{ Results, TotalResults }`; empty when the room is
 	// unknown/untagged.
-	.get('/rooms/:roomId{[0-9]+}/similar', async (c) => {
-		const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
-		const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-		return c.json(
-			await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
-		)
-	})
+	.get(
+		'/rooms/:roomId{[0-9]+}/similar',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Rooms similar to a room',
+			description: [
+				'Rooms sharing tags with the given one — the “more like this” rail. Empty when the',
+				'room is unknown or carries no tags.',
+			].join(' '),
+			parameters: [roomIdParam, ...pageParams(100)],
+			responses: { 200: json(PagedRooms, 'The similar rooms') },
+		}),
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(
+				await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
+			)
+		}
+	)
 
 	// The caller's per-room player data. Stub → empty blob (client reads `Data`).
-	.get('/rooms/:roomId{[0-9]+}/playerdata/me', (c) => c.json({ Data: '' }))
+	.get(
+		'/rooms/:roomId{[0-9]+}/playerdata/me',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'The caller’s per-room player data',
+			description: [
+				'Per-room save data for the calling player. Nothing stores any yet, so this is a stub',
+				'serving an empty blob — which the client reads as “no saved data”. No auth: there’s',
+				'no caller-specific state to protect until something writes here.',
+			].join(' '),
+			parameters: [roomIdParam],
+			responses: { 200: json(PlayerDataDto, 'An empty data blob') },
+		}),
+		(c) => c.json({ Data: '' })
+	)
 
 	// Single room by id. 404 when the room isn't in D1. Ignores the
 	// include/unityAsset* query params.
-	.get('/rooms/:roomId{[0-9]+}', async (c) => {
-		const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
-		return room ? c.json(room) : c.notFound()
-	})
+	.get(
+		'/rooms/:roomId{[0-9]+}',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'A room by id',
+			description: [
+				'The room as stored, with its `SubRooms` re-attached. Unlike `GET /rooms?id=`, an',
+				'unknown room here is a 404, not `{}`. The `include`/`unityAsset*` query params the',
+				'client sends are accepted and ignored.',
+			].join(' '),
+			parameters: [
+				roomIdParam,
+				stringQuery('include', 'Accepted and ignored'),
+				stringQuery('unityAssetTarget', 'Accepted and ignored'),
+				stringQuery('unityAssetVersion', 'Accepted and ignored'),
+			],
+			responses: { 200: json(RoomDto, 'The room'), 404: { description: 'No such room' } },
+		}),
+		async (c) => {
+			const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
+			return room ? c.json(room) : c.notFound()
+		}
+	)
 
 	// Photon access token + room permissions the client needs to spawn into a
 	// room. The client calls it on the rooms host both bare and under `/roomserver`.
-	.get('/photon_access_token', handlePhotonAccessToken)
-	.get('/roomserver/photon_access_token', handlePhotonAccessToken)
+	.get(
+		'/photon_access_token',
+		describeRoute({
+			tags: ['Session'],
+			summary: 'Photon token + room permissions',
+			description: [
+				'The permission table and Photon credentials the client needs to spawn into a room.',
+				'`RoomInstanceId` is the caller’s current instance, read from the shared `presence`',
+				'table (null when they’re in none).',
+				'',
+				'`PhotonAccessToken` is always empty: the reference server signs it with a',
+				'secret/algorithm we don’t have, and our Photon setup accepts an empty token. The',
+				'global (Role 0) maker pen is granted only to the hardcoded dev accounts.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(PhotonAccessTokenDto, 'The permissions and (empty) token'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		handlePhotonAccessToken
+	)
+	.get(
+		'/roomserver/photon_access_token',
+		describeRoute({
+			tags: ['Session'],
+			summary: 'Photon token + room permissions (legacy path)',
+			description: [
+				'Identical to `GET /photon_access_token` — the client calls it both bare and under the',
+				'`/roomserver` prefix, so both forms are registered.',
+			].join(' '),
+			security: AUTHED,
+			responses: {
+				200: json(PhotonAccessTokenDto, 'The permissions and (empty) token'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		handlePhotonAccessToken
+	)
+
+// The generated spec. Documentation only — no request is validated against it (see
+// openapi.ts). `hide: true` keeps this route out of its own output.
+app.get(
+	'/openapi.json',
+	describeRoute({ hide: true }),
+	withCleanSpec(
+		openAPIRouteHandler(app, {
+			documentation: {
+				info: {
+					title: 'recflare rooms',
+					version: '1.0.0',
+					description: [
+						'The room server for recflare, a private-server reimplementation of the Rec Room',
+						'backend: room storage, the browse/search feeds, per-player cheers and favorites,',
+						'the owner’s room settings, and subrooms.',
+						'',
+						'A room is a single JSON blob in the shared `recflare` D1, with generated columns',
+						'for the queryable fields; reads serve that blob verbatim, which is why the shapes',
+						'here are the client’s PascalCase ones. Subrooms live in their own table (their ids',
+						'come from one global sequence, not per room) and are re-attached to each room on',
+						'read. The seed rooms — including the dorm — come from `static/ImportRooms.json`.',
+						'',
+						'Two response envelopes appear side by side: a PascalCase',
+						'`{ Success, Value, ErrorId, Error }` and a lowercase `{ success, error, value }`.',
+						'Which one a route uses is dictated by the client’s deserializer for that call, so',
+						'the inconsistency is deliberate. Both answer HTTP 200 even for a rejection — the',
+						'client reads the flag, not the status.',
+					].join('\n'),
+				},
+				servers: [{ url: 'https://rooms.recflare.net', description: 'Production' }],
+				components: {
+					securitySchemes: {
+						bearerAuth: {
+							type: 'http',
+							scheme: 'bearer',
+							bearerFormat: 'JWT',
+							description: 'An `access_token` from the auth worker’s `POST /connect/token`.',
+						},
+					},
+				},
+			},
+		})
+	)
+)
 
 export default app

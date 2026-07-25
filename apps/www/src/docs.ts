@@ -19,6 +19,7 @@ import type { Env } from './context'
 export const DOCUMENTED_SERVICES: ReadonlyArray<{ slug: string; title: string }> = [
 	{ slug: 'auth', title: 'auth — authentication & tokens' },
 	{ slug: 'accounts', title: 'accounts — profiles & lookups' },
+	{ slug: 'rooms', title: 'rooms — rooms, subrooms & browse feeds' },
 	{ slug: 'match', title: 'match — matchmaking & presence' },
 	{ slug: 'econ', title: 'econ — avatar & economy' },
 	{ slug: 'clubs', title: 'clubs — clubs & clubhouses' },
