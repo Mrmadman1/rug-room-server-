@@ -73,6 +73,16 @@ inconsistency here without checking the client first.
 - Endpoints the client re-renders from must return the updated entity, not
   `{ error, success, value: null }` — e.g. `clubs` `PUT /club/:id/clubhouse` left the old
   clubhouse on screen until it answered the full details envelope.
+- Every subroom mutation (`rooms`: create, delete, `/subrooms/:sid/clone`,
+  `/subrooms/:sid/accessibility`) answers `{ success, error, value }` with the whole
+  updated ROOM — the client re-renders the room's subroom list from `value`. Notably
+  `value` is the room even for `clone`, whose product is a new SUBROOM; only the
+  room-level `POST /rooms/:id/clone` returns the thing it created.
+- Accessibility is sent as the `RoomAccessibility` enum NAME on
+  `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
+  ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members
+  (Private, Public, Unlisted, Dev_only, Dev_Unlisted); parse via `parseAccessibility`,
+  which accepts either form.
 </client-contract-notes>
 
 <critical-notes>

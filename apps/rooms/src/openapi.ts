@@ -156,7 +156,9 @@ export const SubRoomDto = z.object({
 	LastModeratedSaveModerationState: z.int(),
 	IsSandbox: z.boolean(),
 	MaxPlayers: z.int(),
-	Accessibility: z.int().describe('0 = Private, 1 = Public, 2 = Unlisted'),
+	Accessibility: z
+		.int()
+		.describe('0 Private, 1 Public, 2 Unlisted, 3 Dev_only, 4 Dev_Unlisted — set independently'),
 	ShouldAutoStageSaves: z.boolean(),
 	StagedSubRoomDataSaveId: z.int().nullable(),
 	DataBlob: z.string().optional().describe('Uploaded scene-data key; absent until first save'),
@@ -324,13 +326,6 @@ export const RoomEnvelope = z.object({
  */
 export const SubRoomSaveResult = z.union([SubRoomDto, RoomResultEnvelope])
 
-/** The same envelope carrying a subroom (`POST …/subrooms/{subRoomId}/clone`). */
-export const SubRoomEnvelope = z.object({
-	success: z.boolean(),
-	error: z.string().describe('Empty on success'),
-	value: SubRoomDto.nullable(),
-})
-
 /** The 401 the envelope-returning routes answer with — the only one that isn’t HTTP 200. */
 export const UNAUTHORIZED_ENVELOPE = json(
 	z.object({ success: z.literal(false), error: z.literal('Unauthorized'), value: z.null() }),
@@ -406,6 +401,20 @@ export const AccessibilityRequest = z.object({
 	accessibility: z.string().describe('0 = Private, 1 = Public, 2 = Unlisted'),
 })
 
+/**
+ * `PUT /rooms/{roomId}/subrooms/{subRoomId}/accessibility`. Unlike the room-level route
+ * above, the client sends the enum NAME here (`accessibility=Private`), so both the name
+ * and the number are accepted.
+ */
+export const SubRoomAccessibilityRequest = z.object({
+	accessibility: z
+		.string()
+		.describe(
+			'A `RoomAccessibility` name — `Private`, `Public`, `Unlisted`, `Dev_only`, ' +
+				'`Dev_Unlisted` (case-insensitive) — or its ordinal 0–4'
+		),
+})
+
 /** `POST /rooms/{roomId}/subrooms`. */
 export const CreateSubRoomRequest = z.object({
 	name: z.string().describe('The new subroom’s name'),
@@ -414,7 +423,10 @@ export const CreateSubRoomRequest = z.object({
 /** `PUT /rooms/{roomId}/subrooms/{subRoomId}/modify`. */
 export const ModifySubRoomRequest = z.object({
 	name: z.string().describe('Required — an empty name is rejected'),
-	accessibility: z.string().optional().describe('0 = Private, 1 = Public, 2 = Unlisted'),
+	accessibility: z
+		.string()
+		.optional()
+		.describe('A `RoomAccessibility` name (case-insensitive) or its ordinal 0–4'),
 	maxPlayers: z.string().optional().describe('Ignored when not a positive integer'),
 })
 

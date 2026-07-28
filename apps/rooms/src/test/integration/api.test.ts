@@ -1334,17 +1334,69 @@ describe('rooms endpoints', () => {
 		expect(sub).toMatchObject({ Name: 'My Cool Subroom', Accessibility: 1, MaxPlayers: 20 })
 	})
 
+	it('PUT /rooms/:id/subrooms/:sid/accessibility takes the enum name the client sends', async () => {
+		const path = '/rooms/2/subrooms/2/accessibility'
+		const accessibilityOf = async () =>
+			(
+				(await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
+					Accessibility: number
+				}
+			).Accessibility
+
+		// No token → 401.
+		expect((await putForm(path, { accessibility: 'Private' })).status).toBe(401)
+		// Not the owner (room 2 is owned by account 1) → failure envelope.
+		expect(await envOf(await putForm(path, { accessibility: 'Private' }, '999'))).toMatchObject({
+			success: false,
+			error: 'You are not the owner of this room!',
+		})
+		// Unknown room / unknown subroom → failure envelope.
+		expect(
+			await envOf(
+				await putForm('/rooms/99999/subrooms/2/accessibility', { accessibility: '0' }, '1')
+			)
+		).toMatchObject({ success: false })
+		expect(
+			await envOf(
+				await putForm('/rooms/2/subrooms/9999/accessibility', { accessibility: '0' }, '1')
+			)
+		).toMatchObject({ success: false })
+		// A value that names nothing in the enum → rejected, not silently stored.
+		expect(await envOf(await putForm(path, { accessibility: 'Nonsense' }, '1'))).toMatchObject({
+			success: false,
+			error: 'You must provide a valid accessibility!',
+		})
+
+		// The name form is what the live client sends.
+		const priv = await envOf(await putForm(path, { accessibility: 'Private' }, '1'))
+		expect(priv.success).toBe(true)
+		// The envelope carries the updated ROOM, so the client can re-render the subroom list.
+		expect(priv.value).toMatchObject({ RoomId: 2 })
+		expect(await accessibilityOf()).toBe(0)
+
+		// Case-insensitive, and the later enum members resolve too.
+		expect((await envOf(await putForm(path, { accessibility: 'dev_unlisted' }, '1'))).success).toBe(
+			true
+		)
+		expect(await accessibilityOf()).toBe(4)
+
+		// The ordinal still works.
+		expect((await envOf(await putForm(path, { accessibility: '1' }, '1'))).success).toBe(true)
+		expect(await accessibilityOf()).toBe(1)
+	})
+
 	it('POST /rooms/:id/subrooms/:sid/clone is auth-gated, owner-only, and copies the subroom', async () => {
 		const clone = async (roomId: number, subRoomId: number, sub?: string) =>
 			SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/clone`, {
 				method: 'POST',
 				headers: sub ? await bearer(sub) : {},
 			})
+		type SubRoom = { SubRoomId: number; CreatorAccountId: number }
 		const envelope = async (res: Response) =>
 			(await res.json()) as {
 				success: boolean
 				error: string
-				value: { SubRoomId: number; CreatorAccountId: number } | null
+				value: { RoomId: number; SubRooms: SubRoom[] } | null
 			}
 
 		// No token → 401.
@@ -1354,17 +1406,28 @@ describe('rooms endpoints', () => {
 		// Unknown subroom → success:false envelope.
 		expect((await envelope(await clone(2, 9999, '1'))).success).toBe(false)
 
-		// Owner clones → success, a fresh SubRoomId owned by the caller, fetchable on the room.
+		const before = new Set(
+			(
+				(await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { SubRooms: SubRoom[] }
+			).SubRooms.map((s) => s.SubRoomId)
+		)
+
+		// Owner clones → success. `value` is the updated ROOM, not the new subroom, so the
+		// clone shows up as one extra entry in its re-attached SubRooms list.
 		const res = await clone(2, 2, '1')
 		expect(res.status).toBe(200)
 		const body = await envelope(res)
 		expect(body.success).toBe(true)
-		expect(body.value?.SubRoomId).not.toBe(2)
-		expect(body.value?.CreatorAccountId).toBe(1)
+		expect(body.value?.RoomId).toBe(2)
+		const added = body.value!.SubRooms.filter((s) => !before.has(s.SubRoomId))
+		expect(added).toHaveLength(1)
+		expect(added[0]!.CreatorAccountId).toBe(1)
+		// A fresh id, and fetchable as a subroom of the room.
+		expect(added[0]!.SubRoomId).not.toBe(2)
 		const fetched = (await (
-			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${body.value?.SubRoomId}/data`)
+			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${added[0]!.SubRoomId}/data`)
 		).json()) as { SubRoomId: number }
-		expect(fetched.SubRoomId).toBe(body.value?.SubRoomId)
+		expect(fetched.SubRoomId).toBe(added[0]!.SubRoomId)
 	})
 
 	it('subroom clone mints a globally-unique SubRoomId (no cross-room clash)', async () => {
@@ -1379,14 +1442,18 @@ describe('rooms endpoints', () => {
 			method: 'POST',
 			headers: await bearer('1'),
 		})
-		const body = (await res.json()) as { value: { SubRoomId: number; RoomId: number } }
+		// `value` is the updated room; the clone is its highest-numbered subroom.
+		const body = (await res.json()) as {
+			value: { RoomId: number; SubRooms: Array<{ SubRoomId: number }> }
+		}
+		const cloned = Math.max(...body.value.SubRooms.map((s) => s.SubRoomId))
 		// Above every prior subroom id — a fresh global id, not a per-room collision.
-		expect(body.value.SubRoomId).toBeGreaterThan(maxBefore)
+		expect(cloned).toBeGreaterThan(maxBefore)
 		expect(body.value.RoomId).toBe(2)
 
 		// The id is unique across the whole table (exactly one row owns it).
 		const dupes = (await env.DB.prepare('SELECT COUNT(*) AS n FROM subroom WHERE sub_room_id = ?1')
-			.bind(body.value.SubRoomId)
+			.bind(cloned)
 			.first<{ n: number }>())!.n
 		expect(dupes).toBe(1)
 	})
@@ -1560,6 +1627,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/name',
 			'PUT /rooms/{roomId}/restrictions',
 			'PUT /rooms/{roomId}/roles/{accountId}',
+			'PUT /rooms/{roomId}/subrooms/{subRoomId}/accessibility',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/modify',
 			'PUT /rooms/{roomId}/tags',
 			'PUT /rooms/{roomId}/warning',

@@ -3,6 +3,7 @@ import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
+	Accessibility,
 	canManageRoom,
 	cloneRoom,
 	cloneSubRoom,
@@ -74,8 +75,8 @@ import {
 	SaveSubRoomDataRequest,
 	ServiceStatus,
 	stringQuery,
+	SubRoomAccessibilityRequest,
 	SubRoomDto,
-	SubRoomEnvelope,
 	subRoomIdParam,
 	SubRoomSaveResult,
 	SubRoomSavesPage,
@@ -193,6 +194,22 @@ async function authedAccountId(c: Context<App>): Promise<number | null> {
 /** 401 for the auth-gated `*by/me` endpoints — no stub-account fallback. */
 function unauthorized(c: Context<App>) {
 	return c.json({ error: 'Unauthorized' }, 401)
+}
+
+/**
+ * Parse an `accessibility` form field into a `RoomAccessibility` value. The client
+ * sends the enum NAME on the subroom route (`accessibility=Private`), not the number
+ * the room-level route takes, so both forms are accepted. Returns undefined when the
+ * field is missing or names nothing in the enum.
+ */
+function parseAccessibility(value: unknown): number | undefined {
+	if (typeof value !== 'string') return undefined
+	const raw = value.trim()
+	if (/^-?\d+$/.test(raw)) return Number.parseInt(raw, 10)
+	const named = Object.entries(Accessibility).find(
+		([name, ordinal]) => typeof ordinal === 'number' && name.toLowerCase() === raw.toLowerCase()
+	)
+	return named ? (named[1] as number) : undefined
 }
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
@@ -1607,16 +1624,14 @@ const app = new Hono<App>()
 					Error: 'You must enter a name for your room!',
 				})
 			}
-			const accessibility =
-				typeof body.accessibility === 'string'
-					? Number.parseInt(body.accessibility, 10)
-					: Number.NaN
 			const maxPlayers =
 				typeof body.maxPlayers === 'string' ? Number.parseInt(body.maxPlayers, 10) : Number.NaN
 
 			const updated = await modifySubRoom(c.env.DB, roomId, subRoomId, {
 				name,
-				accessibility: Number.isNaN(accessibility) ? undefined : accessibility,
+				// Accepts the enum name as well as the ordinal — the dedicated
+				// `/accessibility` route below is sent names, so this may be too.
+				accessibility: parseAccessibility(body.accessibility),
 				maxPlayers: Number.isNaN(maxPlayers) || maxPlayers <= 0 ? undefined : maxPlayers,
 			})
 			if (!updated) {
@@ -1632,11 +1647,74 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Set a single subroom's `Accessibility`. Same effect as the `accessibility` field of
+	// the subroom `modify` call, but this is what the client actually calls when the
+	// player flips one subroom's visibility, and the body carries the enum NAME
+	// (`accessibility=Private`), not the number the room-level `/accessibility` takes.
+	// Auth-gated (401) and owner-only, like the other subroom mutations. Answers the
+	// updated ROOM in the `{ success, error, value }` envelope — the client re-renders
+	// the room's subroom list from `value`, the same as subroom create/delete.
+	.put(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/accessibility',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Set a subroom’s accessibility',
+			description: [
+				'A subroom’s own visibility, independent of the room’s top-level `Accessibility`.',
+				'The client sends the `RoomAccessibility` NAME here (`accessibility=Private`) rather',
+				'than the ordinal the room-level route takes, so both forms are accepted; an',
+				'unrecognised value is rejected. Owner-only — only the room’s creator may change',
+				'its subrooms, not co-owners.',
+				'',
+				'Answers the updated ROOM, not the bare subroom, so the client can re-render the',
+				'room’s subroom list from `value`.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: form(SubRoomAccessibilityRequest, 'The new accessibility'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+			if (!findSubRoom(room, subRoomId)) {
+				return roomEnvelope(c, null, 'This subroom does not exist!')
+			}
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const accessibility = parseAccessibility(body.accessibility)
+			if (accessibility === undefined) {
+				return roomEnvelope(c, null, 'You must provide a valid accessibility!')
+			}
+
+			const updated = await modifySubRoom(c.env.DB, roomId, subRoomId, { accessibility })
+			if (!updated) return roomEnvelope(c, null, 'This subroom does not exist!')
+
+			await pushRoomUpdate(c, accountId, updated)
+			return roomEnvelope(c, updated)
+		}
+	)
+
 	// Clone a subroom into a new subroom of the same room (fresh SubRoomId, same
 	// scene/settings/data). Auth-gated (401) and owner-only. Notifies the owner and
-	// returns the `{ success, error, value }` envelope with the new subroom as `value`,
-	// mirroring the room-level `/clone`. Response shape is a best guess (the real
-	// client's expected body is unknown).
+	// returns the updated ROOM in the `{ success, error, value }` envelope — NOT the new
+	// subroom, even though the new subroom is what the call produces. The client
+	// re-renders the room's subroom list from `value`, the same as subroom
+	// create/delete/accessibility.
 	.post(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/clone',
 		describeRoute({
@@ -1647,13 +1725,14 @@ const app = new Hono<App>()
 				'data blobs, so it loads identical content — with a fresh globally-unique `SubRoomId`.',
 				'Owner-only.',
 				'',
-				'The response shape is a best guess: it mirrors the room-level `/clone` envelope, but',
-				'the real client’s expected body for this call is unknown.',
+				'Answers the updated ROOM, not the new subroom — the client re-renders the room’s',
+				'subroom list from `value`. Unlike the room-level `/clone`, whose `value` IS the new',
+				'room, the thing this call creates is not what comes back.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, subRoomIdParam],
 			responses: {
-				200: json(SubRoomEnvelope, 'The new subroom, or a rejection with `success: false`'),
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_ENVELOPE,
 			},
 		}),
@@ -1676,7 +1755,7 @@ const app = new Hono<App>()
 			if (!result) return roomEnvelope(c, null, 'This subroom does not exist!')
 
 			await pushRoomUpdate(c, accountId, result.room)
-			return roomEnvelope(c, result.subRoom)
+			return roomEnvelope(c, result.room)
 		}
 	)
 
