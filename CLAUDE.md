@@ -92,7 +92,9 @@ inconsistency here without checking the client first.
   publish: no publish step exists in the client for them. Saves live in the
   `subroom_save` table with globally-unique ids (a bare id has to resolve —
   `StagedSubRoomDataSaveId` carries no subroom context), and nothing is overwritten, so
-  `…/saves` is real history and `publish_save` doubles as restore-a-save.
+  `…/saves` is real history and `publish_save` doubles as restore-a-save. `…/saves` is
+  auth-gated and CREATOR-only (not co-owners) — it lists unpublished staged saves. There
+  is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
 - Matchmaking (`match`: `/matchmake/room/:roomId/:subRoomId`) always serves the PUBLISHED
   `CurrentSave` blob, creator included. Joining a private instance, the client itself asks
   the owner whether to load the latest or the published version and resolves it from the

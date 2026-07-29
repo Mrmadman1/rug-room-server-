@@ -583,6 +583,18 @@ describe('rooms endpoints', () => {
 	type RoomEnv = { success: boolean; error: string; value: Record<string, unknown> | null }
 	const envOf = async (res: Response) => (await res.json()) as RoomEnv
 
+	// A subroom as the client sees it. There is no GET for a single subroom — the client
+	// reads them off the room — so tests do the same.
+	const subRoomOf = async (
+		roomId: number,
+		subRoomId: number
+	): Promise<Record<string, unknown> | undefined> => {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/${roomId}`)
+		if (res.status !== 200) return undefined
+		const room = (await res.json()) as { SubRooms?: Array<Record<string, unknown>> }
+		return (room.SubRooms ?? []).find((s) => s.SubRoomId === subRoomId)
+	}
+
 	it('PUT /rooms/:id/description is auth-gated, owner-only, and persists', async () => {
 		// No token → 401 (auth gate).
 		expect((await putForm('/rooms/2/description', { description: 'x' })).status).toBe(401)
@@ -929,16 +941,11 @@ describe('rooms endpoints', () => {
 		expect(pub.value?.Accessibility).toBe(1)
 	})
 
-	it('GET /rooms/:id/subrooms/:sid/data returns the subroom descriptor (404 when unknown)', async () => {
-		// Room 2 has SubRoomId 2 in the seed.
-		const res = await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)
-		expect(res.status).toBe(200)
-		expect((await res.json()) as { SubRoomId: number }).toMatchObject({ SubRoomId: 2 })
-
-		// Unknown subroom → 404.
-		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/9999/data`)).status).toBe(404)
-		// Unknown room → 404.
-		expect((await SELF.fetch(`${ORIGIN}/rooms/99999/subrooms/2/data`)).status).toBe(404)
+	it('there is no GET for a single subroom — only the room carries them', async () => {
+		// The real API has no `GET …/subrooms/{id}/data`; the client reads subrooms off the
+		// room. Only the POST (the room save) exists on that path, and it is auth-gated.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).status).toBe(404)
+		expect(await subRoomOf(2, 2)).toMatchObject({ SubRoomId: 2 })
 	})
 
 	it('POST /rooms/:id/subrooms/:sid/data is auth-gated, owner-only, and saves the blobs', async () => {
@@ -1003,8 +1010,8 @@ describe('rooms endpoints', () => {
 			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
 		})
 
-		// It also persists — the GET returns the subroom with the save live.
-		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
+		// It also persists — reading the room back shows the save live.
+		const sub = (await subRoomOf(2, 2)) as unknown as {
 			SubRoomId: number
 			CreatorAccountId: number
 			CurrentSave: {
@@ -1073,8 +1080,7 @@ describe('rooms endpoints', () => {
 			CurrentSave: Record<string, unknown> | null
 			StagedSubRoomDataSaveId: number | null
 		}
-		const subOf = async () =>
-			(await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`)).json()) as Sub
+		const subOf = async () => (await subRoomOf(5, 5)) as unknown as Sub
 		const publish = async (saveId: number, sub = '1') =>
 			SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/publish_save`, {
 				method: 'POST',
@@ -1140,7 +1146,9 @@ describe('rooms endpoints', () => {
 		expect(afterSecond.CurrentSave).toMatchObject({ SubRoomDataSaveId: firstId })
 
 		// Both saves are in the history, newest first — the first one is not lost.
-		const history = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`)).json()) as {
+		const history = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`, { headers: await bearer('1') })
+		).json()) as {
 			Results: Array<{ DataBlob: string; Description: string }>
 			TotalResults: number
 		}
@@ -1162,8 +1170,7 @@ describe('rooms endpoints', () => {
 		// A save id from a different subroom is rejected, even though ids are global.
 		const foreign = (await (
 			await publish(
-				((await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as Sub).CurrentSave!
-					.SubRoomDataSaveId as number
+				((await subRoomOf(2, 2)) as unknown as Sub).CurrentSave!.SubRoomDataSaveId as number
 			)
 		).json()) as { success: boolean; error: string }
 		expect(foreign.success).toBe(false)
@@ -1199,7 +1206,7 @@ describe('rooms endpoints', () => {
 			],
 		})
 
-		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/820/subrooms/830/data`)).json()) as {
+		const sub = (await subRoomOf(820, 830)) as unknown as {
 			CurrentSave: Record<string, unknown>
 		}
 		expect(sub.CurrentSave).toMatchObject({
@@ -1212,7 +1219,7 @@ describe('rooms endpoints', () => {
 			Tags: [],
 		})
 		// Stable across reads — it's a stored row now, not something rebuilt per request.
-		const again = (await (await SELF.fetch(`${ORIGIN}/rooms/820/subrooms/830/data`)).json()) as {
+		const again = (await subRoomOf(820, 830)) as unknown as {
 			CurrentSave: { SubRoomDataSaveId: number }
 		}
 		expect(again.CurrentSave.SubRoomDataSaveId).toBe(sub.CurrentSave.SubRoomDataSaveId)
@@ -1229,7 +1236,7 @@ describe('rooms endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 
-		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/1/subrooms/1/data`)).json()) as {
+		const sub = (await subRoomOf(1, 1)) as unknown as {
 			CurrentSave: { DataBlob: string } | null
 			StagedSubRoomDataSaveId: number | null
 		}
@@ -1247,10 +1254,9 @@ describe('rooms endpoints', () => {
 				body: JSON.stringify({ SubRoomData: { Filename: `blob-${subRoomId}.room` } }),
 			})
 		// Non-dorm saves stage, so the fresh id lands on StagedSubRoomDataSaveId.
-		const idOf = async (roomId: number, subRoomId: number) => {
-			const res = await SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/data`)
-			return ((await res.json()) as { StagedSubRoomDataSaveId: number }).StagedSubRoomDataSaveId
-		}
+		const idOf = async (roomId: number, subRoomId: number) =>
+			((await subRoomOf(roomId, subRoomId)) as unknown as { StagedSubRoomDataSaveId: number })
+				.StagedSubRoomDataSaveId
 
 		// Two different subrooms, each getting their FIRST save.
 		await save(6, 6)
@@ -1586,7 +1592,7 @@ describe('rooms endpoints', () => {
 		const ok = await putForm('/rooms/2/subrooms/2/modify', fields, '1')
 		expect(ok.status).toBe(200)
 		expect(await bodyOf(ok)).toMatchObject({ Success: true })
-		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
+		const sub = (await subRoomOf(2, 2)) as unknown as {
 			Name: string
 			Accessibility: number
 			MaxPlayers: number
@@ -1597,11 +1603,7 @@ describe('rooms endpoints', () => {
 	it('PUT /rooms/:id/subrooms/:sid/accessibility takes the enum name the client sends', async () => {
 		const path = '/rooms/2/subrooms/2/accessibility'
 		const accessibilityOf = async () =>
-			(
-				(await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
-					Accessibility: number
-				}
-			).Accessibility
+			((await subRoomOf(2, 2)) as unknown as { Accessibility: number }).Accessibility
 
 		// No token → 401.
 		expect((await putForm(path, { accessibility: 'Private' })).status).toBe(401)
@@ -1684,10 +1686,9 @@ describe('rooms endpoints', () => {
 		expect(added[0]!.CreatorAccountId).toBe(1)
 		// A fresh id, and fetchable as a subroom of the room.
 		expect(added[0]!.SubRoomId).not.toBe(2)
-		const fetched = (await (
-			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${added[0]!.SubRoomId}/data`)
-		).json()) as { SubRoomId: number }
-		expect(fetched.SubRoomId).toBe(added[0]!.SubRoomId)
+		expect(await subRoomOf(2, added[0]!.SubRoomId)).toMatchObject({
+			SubRoomId: added[0]!.SubRoomId,
+		})
 	})
 
 	it('subroom clone mints a globally-unique SubRoomId (no cross-room clash)', async () => {
@@ -1758,9 +1759,11 @@ describe('rooms endpoints', () => {
 		expect(created).toMatchObject({ RoomId: 2, Name: 'ffff', CreatorAccountId: 1 })
 		expect(created!.SubRoomId).toBeGreaterThan(maxBefore)
 
-		const fetched = (await (
-			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${created?.SubRoomId}/data`)
-		).json()) as { SubRoomId: number; Name: string; UnitySceneId: string }
+		const fetched = (await subRoomOf(2, created!.SubRoomId)) as unknown as {
+			SubRoomId: number
+			Name: string
+			UnitySceneId: string
+		}
 		expect(fetched).toMatchObject({ SubRoomId: created?.SubRoomId, Name: 'ffff' })
 
 		// It inherits room 2's own existing (first) subroom scene.
@@ -1803,7 +1806,7 @@ describe('rooms endpoints', () => {
 		const body = await envelope(await del(2, newId, '1'))
 		expect(body.success).toBe(true)
 		expect(body.value?.SubRooms.some((s) => s.SubRoomId === newId)).toBe(false)
-		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/${newId}/data`)).status).toBe(404)
+		expect(await subRoomOf(2, newId)).toBeUndefined()
 
 		// A room's only subroom can't be deleted (would leave it with no scene). Seed a
 		// dedicated single-subroom room owned by account 1 to exercise the guard.
@@ -1815,7 +1818,7 @@ describe('rooms endpoints', () => {
 		})
 		expect((await envelope(await del(700, 900, '1'))).success).toBe(false)
 		// The lone subroom survives the refused delete.
-		expect((await SELF.fetch(`${ORIGIN}/rooms/700/subrooms/900/data`)).status).toBe(200)
+		expect(await subRoomOf(700, 900)).toBeDefined()
 	})
 
 	it('GET /rooms/:id/subrooms/:sid/saves pages the save history, newest first', async () => {
@@ -1825,7 +1828,11 @@ describe('rooms endpoints', () => {
 			TotalCount: number
 		}
 		const page = async (query: string) =>
-			(await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves${query}`)).json()) as Page
+			(await (
+				await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves${query}`, {
+					headers: await bearer('1'),
+				})
+			).json()) as Page
 
 		// Room 2's subroom is saved several times by the tests above — each save appended.
 		const all = await page('?unityAssetTarget=0&unityAssetVersion=1')
@@ -1845,8 +1852,23 @@ describe('rooms endpoints', () => {
 		expect(paged.TotalResults).toBe(all.TotalResults)
 
 		// A never-saved subroom pages empty rather than 404ing.
-		const empty = await SELF.fetch(`${ORIGIN}/rooms/3/subrooms/3/saves`)
+		const empty = await SELF.fetch(`${ORIGIN}/rooms/3/subrooms/3/saves`, {
+			headers: await bearer('1'),
+		})
 		expect(await empty.json()).toEqual({ Results: [], TotalResults: 0, TotalCount: 0 })
+
+		// The list exposes unpublished saves, so it is owner-only: no token → 401, and a
+		// valid token that isn't the room's creator → 403.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`)).status).toBe(401)
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
+				.status
+		).toBe(403)
+		// Even a co-owner (account 2 holds Role 30 on the seeded rooms) is refused.
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('2') }))
+				.status
+		).toBe(403)
 	})
 
 	it('GET /openapi.json documents every route', async () => {
@@ -1892,7 +1914,6 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/interactionby/me',
 			'GET /rooms/{roomId}/playerdata/me',
 			'GET /rooms/{roomId}/similar',
-			'GET /rooms/{roomId}/subrooms/{subRoomId}/data',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
 			'GET /roomserver/photon_access_token',
 			'GET /roomserver/rooms/createdby/me',

@@ -79,7 +79,6 @@ import {
 	ServiceStatus,
 	stringQuery,
 	SubRoomAccessibilityRequest,
-	SubRoomDto,
 	subRoomIdParam,
 	SubRoomSavesPage,
 	TagRequest,
@@ -1422,37 +1421,10 @@ const app = new Hono<App>()
 		}
 	)
 
-	// A subroom's data descriptor (the SubRoom object from the room's SubRooms
-	// array). Public — the client fetches it while loading the room. 404 when the
-	// room or subroom is unknown.
-	.get(
-		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data',
-		describeRoute({
-			tags: ['Subrooms'],
-			summary: 'A subroom’s data descriptor',
-			description: [
-				'The `SubRoom` object from the room’s `SubRooms` array — the descriptor the client',
-				'fetches while loading the room, carrying the scene id and the saved-data blob keys.',
-				'Public; an unknown room or subroom is a 404.',
-			].join(' '),
-			parameters: [roomIdParam, subRoomIdParam],
-			responses: {
-				200: json(SubRoomDto, 'The subroom'),
-				404: { description: 'No such room or subroom' },
-			},
-		}),
-		async (c) => {
-			const roomId = Number.parseInt(c.req.param('roomId'), 10)
-			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
-			const room = await getRoomById(c.env.DB, roomId)
-			const sub = room ? findSubRoom(room, subRoomId) : undefined
-			return sub ? c.json(sub) : c.notFound()
-		}
-	)
-
 	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
 	// save is its own `subroom_save` row (nothing is overwritten), so this is real
-	// history, newest first, paged by skip/take.
+	// history, newest first, paged by skip/take. Auth-gated (401) and creator-only (403):
+	// the list exposes unpublished saves, which only the owner is entitled to see.
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
 		describeRoute({
@@ -1464,9 +1436,14 @@ const app = new Hono<App>()
 				'only when the subroom has never been saved.',
 				'`unityAssetTarget`/`unityAssetVersion` are accepted and ignored.',
 				'',
+				'Owner-only (403 otherwise) — the list includes STAGED saves that were never',
+				'published, so it is not public. It is what the client reads to offer the owner',
+				'“load the latest or the published version?” when they enter a private instance.',
+				'',
 				'`TotalResults` and `TotalCount` carry the same number: the client’s paged DTO and',
 				'the reference disagree on the name, so both are emitted.',
 			].join(' '),
+			security: AUTHED,
 			parameters: [
 				roomIdParam,
 				subRoomIdParam,
@@ -1475,9 +1452,16 @@ const app = new Hono<App>()
 				stringQuery('skip', 'How many saves to skip (default 0)'),
 				stringQuery('take', 'How many saves to return (default all)'),
 			],
-			responses: { 200: json(SubRoomSavesPage, 'The subroom’s saves, newest first') },
+			responses: {
+				200: json(SubRoomSavesPage, 'The subroom’s saves, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
 		}),
 		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 			// Scoped through the room so a subroom id from another room can't read its saves.
@@ -1485,6 +1469,7 @@ const app = new Hono<App>()
 			if (!room || !findSubRoom(room, subRoomId)) {
 				return c.json({ Results: [], TotalResults: 0, TotalCount: 0 })
 			}
+			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
 			const saves = await getSubRoomSaves(c.env.DB, subRoomId)
 
 			const skip = Number.parseInt(c.req.query('skip') ?? '', 10)
