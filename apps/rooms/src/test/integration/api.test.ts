@@ -975,47 +975,60 @@ describe('rooms endpoints', () => {
 
 		// A valid token but no role on the room → 403.
 		expect((await authed(2, 2, '999')).status).toBe(403)
-		// The response uses the PascalCase `{ Success, Value, ErrorId, Error }` envelope.
-		// Unknown room → DoesntExist.
-		expect(await bodyOf(await authed(99999, 2, '1'))).toMatchObject({
-			Success: false,
-			ErrorId: 'Rooms.DoesntExist',
+		// Rejections use the same lowercase envelope as the success case.
+		expect(await envOf(await authed(99999, 2, '1'))).toMatchObject({
+			success: false,
+			error: 'This room does not exist!',
 		})
+		expect(await envOf(await authed(2, 9999, '1'))).toMatchObject({ success: false })
 
-		// Owner saves → 200 with the saved SUBROOM as the bare body (no envelope),
-		// carrying the new blobs and populated creator.
+		// Owner saves → 200 with the whole updated ROOM in the envelope. A bare subroom
+		// here leaves the client showing the old scene even though the save landed. This
+		// fixture sends `AutoPublish: true`, so the save goes live immediately.
 		const ok = await authed(2, 2, '1')
 		expect(ok.status).toBe(200)
-		expect(await bodyOf(ok)).toMatchObject({
-			SubRoomId: 2,
+		const saved = await envOf(ok)
+		expect(saved.success).toBe(true)
+		expect(saved.value).toMatchObject({ RoomId: 2, Description: 'mydescription here' })
+		// The saved subroom rides along inside the room's SubRooms, carrying the new save.
+		const savedSub = (saved.value!.SubRooms as Array<Record<string, unknown>>).find(
+			(s) => s.SubRoomId === 2
+		)!
+		expect(savedSub).toMatchObject({
 			RoomDataBlob: '5c618c920f6247efb8327e327d0b4417',
 			CreatorAccountId: 1,
 			PersistenceVersion: 41,
-			// The blob the client actually loads from lives on CurrentSave.
-			CurrentSave: {
-				SubRoomId: 2,
-				DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
-				SavedByAccountId: 1,
-				PersistenceVersion: 41,
-				UnitySubAssets: [],
-				ReferencedUnityAssets: [],
-				ReferencedUnityAssetIds: [],
-				Tags: [],
-			},
+		})
+		expect(savedSub.CurrentSave).toMatchObject({
+			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
 		})
 
-		// It also persists — the GET returns the subroom with the new save + creator.
+		// It also persists — the GET returns the subroom with the save live.
 		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
 			SubRoomId: number
 			CreatorAccountId: number
-			CurrentSave: { DataBlob: string; SubRoomDataSaveId: number }
+			CurrentSave: {
+				DataBlob: string
+				SubRoomDataSaveId: number
+				SavedByAccountId: number
+				PersistenceVersion: number
+				UnitySubAssets: unknown[]
+				Tags: unknown[]
+			}
+			StagedSubRoomDataSaveId: number | null
 		}
-		expect(sub).toMatchObject({
-			SubRoomId: 2,
-			CreatorAccountId: 1,
-			CurrentSave: { DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f' },
+		expect(sub).toMatchObject({ SubRoomId: 2, CreatorAccountId: 1 })
+		expect(sub.CurrentSave).toMatchObject({
+			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
+			SavedByAccountId: 1,
+			PersistenceVersion: 41,
+			UnitySubAssets: [],
+			Tags: [],
 		})
 		expect(sub.CurrentSave.SubRoomDataSaveId).toBeGreaterThan(0)
+		expect(sub.StagedSubRoomDataSaveId).toBeNull()
+
+		// Room-level fields land on the room too.
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
 			Description: string
 			PersistenceVersion: number
@@ -1024,10 +1037,14 @@ describe('rooms endpoints', () => {
 		expect(room.PersistenceVersion).toBe(41)
 
 		// A CoOwner (account 2 holds Role 30 in the seeded rooms) may also save — 200
-		// with the subroom body. The creator stays account 1 (not clobbered).
+		// with the room envelope. The creator stays account 1 (not clobbered).
 		const coOwner = await authed(2, 2, '2')
 		expect(coOwner.status).toBe(200)
-		expect(await bodyOf(coOwner)).toMatchObject({ SubRoomId: 2, CreatorAccountId: 1 })
+		const coOwnerEnv = await envOf(coOwner)
+		expect(coOwnerEnv.success).toBe(true)
+		expect(
+			(coOwnerEnv.value!.SubRooms as Array<Record<string, unknown>>).find((s) => s.SubRoomId === 2)
+		).toMatchObject({ CreatorAccountId: 1 })
 	})
 
 	it('GET /rooms/:id gives every subroom a CurrentSave key (null before the first save)', async () => {
@@ -1045,31 +1062,55 @@ describe('rooms endpoints', () => {
 		}
 	})
 
-	it('a real client room-save body populates CurrentSave and comes back on GET /rooms/:id', async () => {
+	it('a real client room-save body stages, and publish_save makes it live', async () => {
+		const save = async (body: unknown) =>
+			SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+				body: JSON.stringify(body),
+			})
+		type Sub = {
+			CurrentSave: Record<string, unknown> | null
+			StagedSubRoomDataSaveId: number | null
+		}
+		const subOf = async () =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`)).json()) as Sub
+		const publish = async (saveId: number, sub = '1') =>
+			SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/publish_save`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ subRoomDataSaveId: String(saveId) }).toString(),
+			})
+
 		// The exact body the live client posts after uploading both blobs to `storage`:
 		// SubRoomData is the scene blob, RoomData the metadata blob.
-		const res = await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
-			body: JSON.stringify({
-				UnityAssetId: null,
-				RoomData: { Filename: '2026-07-28/b266ccd5-metadata', Hash: null, OwnershipProof: null },
-				SubRoomData: { Filename: '2026-07-28/f176fc3b-scene', Hash: null, OwnershipProof: null },
-				InventionUsage: 'CAE=',
-				PersistenceVersion: 51,
-				Description: 'TEST',
-				AutoPublish: false,
-			}),
+		const res = await save({
+			UnityAssetId: null,
+			RoomData: { Filename: '2026-07-28/b266ccd5-metadata', Hash: null, OwnershipProof: null },
+			SubRoomData: { Filename: '2026-07-28/f176fc3b-scene', Hash: null, OwnershipProof: null },
+			InventionUsage: 'CAE=',
+			PersistenceVersion: 51,
+			Description: 'TEST',
+			AutoPublish: false,
 		})
 		expect(res.status).toBe(200)
 
-		// It must be visible on the room read — that's what the loader fetches.
-		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/5`)).json()) as {
-			SubRooms: Array<{ SubRoomId: number; CurrentSave: Record<string, unknown> | null }>
-		}
-		const sub = room.SubRooms.find((s) => s.SubRoomId === 5)!
-		expect(sub.CurrentSave).toMatchObject({
+		// Room 5 is not a dorm → staged, nothing live yet.
+		const stagedSub = await subOf()
+		expect(stagedSub.CurrentSave).toBeNull()
+		const firstId = stagedSub.StagedSubRoomDataSaveId!
+		expect(firstId).toBeGreaterThan(0)
+
+		// Publishing makes it what the loader fetches, and clears the staging slot.
+		expect((await publish(firstId)).status).toBe(200)
+		const live = await subOf()
+		expect(live.StagedSubRoomDataSaveId).toBeNull()
+		expect(live.CurrentSave).toMatchObject({
 			SubRoomId: 5,
+			SubRoomDataSaveId: firstId,
 			DataBlob: '2026-07-28/f176fc3b-scene',
 			PersistenceVersion: 51,
 			SavedByAccountId: 1,
@@ -1080,34 +1121,27 @@ describe('rooms endpoints', () => {
 		})
 		// No DataBlobHash — it is commented out of the reference DTO — and no UnityAssetId
 		// key at all, since the client sent null.
-		expect('DataBlobHash' in sub.CurrentSave!).toBe(false)
-		expect('UnityAssetId' in sub.CurrentSave!).toBe(false)
+		expect('DataBlobHash' in live.CurrentSave!).toBe(false)
+		expect('UnityAssetId' in live.CurrentSave!).toBe(false)
 
-		// The save list serves that save rather than an empty page.
-		const firstId = sub.CurrentSave!.SubRoomDataSaveId as number
-		expect(firstId).toBeGreaterThan(0)
-		const saves = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`)).json()) as {
-			Results: Array<{ DataBlob: string }>
-			TotalResults: number
+		// It's on the room read too — that's what the loader actually fetches.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/5`)).json()) as {
+			SubRooms: Array<{ SubRoomId: number; CurrentSave: { SubRoomDataSaveId: number } | null }>
 		}
-		expect(saves.TotalResults).toBe(1)
-		expect(saves.Results[0]!.DataBlob).toBe('2026-07-28/f176fc3b-scene')
+		expect(room.SubRooms.find((s) => s.SubRoomId === 5)!.CurrentSave!.SubRoomDataSaveId).toBe(
+			firstId
+		)
 
-		// A second save appends rather than overwriting, and takes a fresh higher id.
-		await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
-			body: JSON.stringify({ SubRoomData: { Filename: 'second.room' } }),
-		})
-		const after = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`)).json()) as {
-			CurrentSave: { SubRoomDataSaveId: number; DataBlob: string; Description: string }
-		}
-		expect(after.CurrentSave.SubRoomDataSaveId).toBeGreaterThan(firstId)
-		expect(after.CurrentSave.DataBlob).toBe('second.room')
+		// A second save appends and stages — what players load does NOT change.
+		await save({ SubRoomData: { Filename: 'second.room' } })
+		const afterSecond = await subOf()
+		const secondId = afterSecond.StagedSubRoomDataSaveId!
+		expect(secondId).toBeGreaterThan(firstId)
+		expect(afterSecond.CurrentSave).toMatchObject({ SubRoomDataSaveId: firstId })
 
 		// Both saves are in the history, newest first — the first one is not lost.
 		const history = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`)).json()) as {
-			Results: Array<{ DataBlob: string }>
+			Results: Array<{ DataBlob: string; Description: string }>
 			TotalResults: number
 		}
 		expect(history.TotalResults).toBe(2)
@@ -1116,7 +1150,29 @@ describe('rooms endpoints', () => {
 			'2026-07-28/f176fc3b-scene',
 		])
 		// A save with no Description records an empty string, not null.
-		expect(after.CurrentSave.Description).toBe('')
+		expect(history.Results[0]!.Description).toBe('')
+
+		// Publishing an OLDER save is a restore — and keeps the newer staged work.
+		expect((await publish(secondId)).status).toBe(200)
+		expect((await subOf()).StagedSubRoomDataSaveId).toBeNull()
+		expect((await publish(firstId)).status).toBe(200)
+		const restored = await subOf()
+		expect(restored.CurrentSave).toMatchObject({ SubRoomDataSaveId: firstId })
+
+		// A save id from a different subroom is rejected, even though ids are global.
+		const foreign = (await (
+			await publish(
+				((await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as Sub).CurrentSave!
+					.SubRoomDataSaveId as number
+			)
+		).json()) as { success: boolean; error: string }
+		expect(foreign.success).toBe(false)
+		expect(foreign.error).toBe('That save does not exist!')
+
+		// Co-owners may save but not publish.
+		expect(((await (await publish(firstId, '2')).json()) as { success: boolean }).success).toBe(
+			false
+		)
 	})
 
 	it('migrates a pre-CurrentSave subroom into a real save row (0008 backfill 2)', async () => {
@@ -1162,6 +1218,25 @@ describe('rooms endpoints', () => {
 		expect(again.CurrentSave.SubRoomDataSaveId).toBe(sub.CurrentSave.SubRoomDataSaveId)
 	})
 
+	it('a dorm save publishes immediately instead of staging', async () => {
+		// Room 1 is the seeded DormRoom (IsDorm). A dorm is the player's own space with no
+		// publish step in the client, so staging one would make their edits permanently
+		// invisible — dorm saves go straight live.
+		const res = await SELF.fetch(`${ORIGIN}/rooms/1/subrooms/1/data`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+			body: JSON.stringify({ SubRoomData: { Filename: 'dorm.room' } }),
+		})
+		expect(res.status).toBe(200)
+
+		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/1/subrooms/1/data`)).json()) as {
+			CurrentSave: { DataBlob: string } | null
+			StagedSubRoomDataSaveId: number | null
+		}
+		expect(sub.CurrentSave).toMatchObject({ DataBlob: 'dorm.room' })
+		expect(sub.StagedSubRoomDataSaveId).toBeNull()
+	})
+
 	it('save ids are globally unique across subrooms, so a bare id resolves', async () => {
 		// StagedSubRoomDataSaveId points at a save by bare id with no subroom context, so
 		// per-subroom numbering (every subroom's first save being 1) would be ambiguous.
@@ -1171,10 +1246,10 @@ describe('rooms endpoints', () => {
 				headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
 				body: JSON.stringify({ SubRoomData: { Filename: `blob-${subRoomId}.room` } }),
 			})
+		// Non-dorm saves stage, so the fresh id lands on StagedSubRoomDataSaveId.
 		const idOf = async (roomId: number, subRoomId: number) => {
 			const res = await SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/data`)
-			return ((await res.json()) as { CurrentSave: { SubRoomDataSaveId: number } }).CurrentSave
-				.SubRoomDataSaveId
+			return ((await res.json()) as { StagedSubRoomDataSaveId: number }).StagedSubRoomDataSaveId
 		}
 
 		// Two different subrooms, each getting their FIRST save.
@@ -1825,6 +1900,7 @@ describe('rooms endpoints', () => {
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',
+			'POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save',
 			'PUT /rooms/{roomId}/accessibility',
 			'PUT /rooms/{roomId}/cloning',
 			'PUT /rooms/{roomId}/description',

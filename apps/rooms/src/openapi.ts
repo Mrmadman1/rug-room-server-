@@ -351,13 +351,6 @@ export const RoomEnvelope = z.object({
 	value: RoomDto.nullable(),
 })
 
-/**
- * What a room save answers: the saved subroom on success (no envelope — the client
- * deserializes the body directly as the subroom), or the PascalCase result envelope when
- * the room or subroom doesn't exist. Both at HTTP 200.
- */
-export const SubRoomSaveResult = z.union([SubRoomDto, RoomResultEnvelope])
-
 /** The 401 the envelope-returning routes answer with — the only one that isn’t HTTP 200. */
 export const UNAUTHORIZED_ENVELOPE = json(
 	z.object({ success: z.literal(false), error: z.literal('Unauthorized'), value: z.null() }),
@@ -447,6 +440,14 @@ export const SubRoomAccessibilityRequest = z.object({
 		),
 })
 
+/**
+ * `POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save` — promotes one save to live.
+ * Any id from the subroom's history works, so this is both publish and restore.
+ */
+export const PublishSaveRequest = z.object({
+	subRoomDataSaveId: z.string().describe('The `SubRoomDataSaveId` to make live'),
+})
+
 /** `POST /rooms/{roomId}/subrooms`. */
 export const CreateSubRoomRequest = z.object({
 	name: z.string().describe('The new subroom’s name'),
@@ -477,9 +478,14 @@ export const SaveSubRoomDataRequest = z.object({
 		.object({ Filename: z.string() })
 		.optional()
 		.describe('The uploaded room-level data blob — becomes `RoomDataBlob`'),
-	Description: z.string().optional().describe('Written to the ROOM, not the subroom'),
+	Description: z.string().optional().describe('The save comment; also written to the ROOM'),
 	PersistenceVersion: z.int().optional(),
 	InventionUsage: z.string().optional().describe('Written to the room'),
+	UnityAssetId: z.string().nullable().optional().describe('Recorded on the save when set'),
+	AutoPublish: z
+		.boolean()
+		.optional()
+		.describe('True publishes the save immediately; otherwise it is staged'),
 })
 
 /**

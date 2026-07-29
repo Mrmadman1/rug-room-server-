@@ -363,6 +363,10 @@ function instanceFieldsFromRoom(room: Room, subRoomId?: number) {
 		roomId: num(room.RoomId, 1),
 		subRoomId: num(sub?.SubRoomId, 1),
 		location: str(sub?.UnitySceneId),
+		// Always the PUBLISHED save. A creator who wants their unpublished work is offered
+		// the choice client-side from the `/subrooms/{id}/saves` list — matchmaking is not
+		// involved, and serving a staged blob here would put two people in one instance on
+		// different versions.
 		dataBlob: subRoomDataBlob(sub),
 		name,
 		maxCapacity: num(sub?.MaxPlayers, 4),

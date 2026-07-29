@@ -319,6 +319,12 @@ export interface SaveSubRoomDataInput {
 	inventionUsage?: string
 	/** Optional baked-asset id; emitted on the save only when present. */
 	unityAssetId?: string
+	/**
+	 * The client's `AutoPublish`. True publishes the save outright (the author wants it
+	 * live now); false/absent stages it for a manual `publish_save`. Dorms ignore this and
+	 * always publish.
+	 */
+	autoPublish?: boolean
 }
 
 /**
@@ -416,11 +422,15 @@ function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
 }
 
 /**
- * Persist a room-save against a specific subroom: point the subroom at its newly
- * uploaded data blob (what the loader later downloads) and record the room-level
- * fields from the save. Returns the updated (hydrated) room, or null when the room or
- * subroom doesn't exist. The subroom row is updated in the `subroom` table; the
- * room-level fields are written to the room blob.
+ * Persist a room-save against a specific subroom and record the room-level fields the
+ * save carries. Returns the updated (hydrated) room, or null when the room or subroom
+ * doesn't exist.
+ *
+ * Whether the save goes live is the client's call: `AutoPublish: true` publishes it
+ * outright, otherwise it becomes the subroom's `staged_save_id` with the live
+ * `current_save_id` untouched, so what players load doesn't change until the room's
+ * creator publishes (see {@link publishSubRoomSave}). Dorms always publish — they have
+ * no publish flow in the client.
  */
 export async function saveSubRoomData(
 	db: D1Database,
@@ -431,20 +441,30 @@ export async function saveSubRoomData(
 ): Promise<Room | null> {
 	const room = await getRoomById(db, roomId)
 	if (!room) return null
-	const sub = await getSubRoom(db, roomId, subRoomId)
+	// Read off the already-hydrated room rather than re-querying the subroom and its
+	// save — getRoomById has both, and this path is write-heavy enough already.
+	const sub = findSubRoom(room, subRoomId)
 	if (!sub) return null
 
 	// Populate the subroom's creator on first save — it starts null, and the
 	// client NREs on a null CreatorAccountId. Only the owner reaches this path.
 	if (sub.CreatorAccountId == null) sub.CreatorAccountId = accountId
 
-	// Append a new save row and publish it. The blob the loader downloads lives on the
-	// save — a subroom whose current_save_id resolves to nothing loads nothing — so this
-	// never touches the flat DataBlob field. Previous saves stay in the table as history.
+	// Append a new save row. The blob the loader downloads lives on the save — a subroom
+	// whose current_save_id resolves to nothing loads nothing — so this never touches the
+	// flat DataBlob field. Previous saves stay in the table as history.
+	//
+	// A staged save carries forward from the previous STAGED one when there is one, so a
+	// creator's second edit builds on their first rather than on what's live.
+	const staged =
+		typeof sub.StagedSubRoomDataSaveId === 'number'
+			? await getSubRoomSaveById(db, subRoomId, sub.StagedSubRoomDataSaveId)
+			: null
 	const previous =
-		sub.CurrentSave && typeof sub.CurrentSave === 'object'
+		staged ??
+		(sub.CurrentSave && typeof sub.CurrentSave === 'object'
 			? (sub.CurrentSave as SubRoomDataSave)
-			: undefined
+			: undefined)
 	const priorVersion = previous?.PersistenceVersion
 	const priorBlob = previous?.DataBlob
 	const save = await insertSubRoomSave(
@@ -465,26 +485,80 @@ export async function saveSubRoomData(
 			unityAssetId: input.unityAssetId,
 		})
 	)
-	// Publish it. Staging (AutoPublish:false → staged_save_id) is deliberately not wired
-	// up yet: always publishing is what makes a save actually load.
-	await setCurrentSave(db, subRoomId, Number(save.SubRoomDataSaveId))
-
+	const saveId = Number(save.SubRoomDataSaveId)
 	if (input.roomDataFilename) sub.RoomDataBlob = input.roomDataFilename
 	sub.DataSavedAt = new Date().toISOString()
 	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
-	await updateSubRoom(db, sub)
 
 	// Room-level fields carried by the save.
 	if (typeof input.description === 'string') room.Description = input.description
 	if (input.persistenceVersion !== undefined) room.PersistenceVersion = input.persistenceVersion
 	if (input.inventionUsage !== undefined) room.InventionUsage = input.inventionUsage
-	await db
-		.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1')
-		.bind(roomId, serializeRoom(room))
-		.run()
+
+	// Publish outright when the client asked to (`AutoPublish`), or for a dorm — a dorm is
+	// the player's own private space with no publish step in the client, so staging one
+	// would leave their edits permanently invisible. Otherwise stage it and wait for
+	// `publish_save`. One round trip for the rest of the save.
+	const publishNow = input.autoPublish === true || room.IsDorm === true
+	await db.batch([
+		publishNow
+			? db
+					.prepare(
+						'UPDATE subroom SET current_save_id = ?2, staged_save_id = NULL WHERE sub_room_id = ?1'
+					)
+					.bind(subRoomId, saveId)
+			: db
+					.prepare('UPDATE subroom SET staged_save_id = ?2 WHERE sub_room_id = ?1')
+					.bind(subRoomId, saveId),
+		db
+			.prepare('UPDATE subroom SET data = ?2 WHERE sub_room_id = ?1')
+			.bind(subRoomId, serializeSubRoom(sub, roomId)),
+		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(room)),
+	])
 
 	// Re-hydrate so the returned room reflects the just-saved subroom.
 	return hydrateRoom(db, room)
+}
+
+/**
+ * Publish one of a subroom's saves by id: make it the `current_save_id` players load.
+ * This is the manual step every non-dorm room save waits on ({@link saveSubRoomData}
+ * only stages). Because it takes an explicit id it doubles as restore-a-save — the id
+ * can be any save in the subroom's history, not just the staged one.
+ *
+ * The staging slot is cleared only when the save being published IS the staged one, so
+ * restoring an older version doesn't silently discard newer unpublished work.
+ *
+ * The id is looked up scoped to the subroom, so one subroom can't publish another's save
+ * (ids are globally unique, so an unscoped lookup would happily resolve).
+ *
+ * Returns the updated (hydrated) room, or a reason: `not_found` (no such room/subroom) /
+ * `unknown_save` (no such save on this subroom).
+ */
+export async function publishSubRoomSave(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	saveId: number
+): Promise<{ ok: true; room: Room } | { ok: false; reason: 'not_found' | 'unknown_save' }> {
+	const sub = await getSubRoom(db, roomId, subRoomId)
+	if (!sub) return { ok: false, reason: 'not_found' }
+	if (!(await getSubRoomSaveById(db, subRoomId, saveId))) {
+		return { ok: false, reason: 'unknown_save' }
+	}
+
+	await db
+		.prepare(
+			`UPDATE subroom SET current_save_id = ?2,
+			   staged_save_id = CASE WHEN staged_save_id = ?2 THEN NULL ELSE staged_save_id END
+			 WHERE sub_room_id = ?1`
+		)
+		.bind(subRoomId, saveId)
+		.run()
+
+	const room = await getRoomById(db, roomId)
+	if (!room) return { ok: false, reason: 'not_found' }
+	return { ok: true, room }
 }
 
 /** Fields from the client's subroom `modify` form (each applied only when supplied). */
@@ -898,10 +972,12 @@ async function updateSubRoom(db: D1Database, sub: SubRoom): Promise<void> {
 		.run()
 }
 
-/** Point a subroom at its live/published save. */
+/** Point a subroom at its live/published save, clearing any staged one. */
 async function setCurrentSave(db: D1Database, subRoomId: number, saveId: number): Promise<void> {
 	await db
-		.prepare('UPDATE subroom SET current_save_id = ?2 WHERE sub_room_id = ?1')
+		.prepare(
+			'UPDATE subroom SET current_save_id = ?2, staged_save_id = NULL WHERE sub_room_id = ?1'
+		)
 		.bind(subRoomId, saveId)
 		.run()
 }

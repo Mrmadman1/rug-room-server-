@@ -28,6 +28,7 @@ import {
 	getSubRoomSaves,
 	getVisitedRooms,
 	modifySubRoom,
+	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
 	saveSubRoomData,
@@ -66,6 +67,7 @@ import {
 	pageParams,
 	PhotonAccessTokenDto,
 	PlayerDataDto,
+	PublishSaveRequest,
 	RestrictionsRequest,
 	RoleRequest,
 	RoomDto,
@@ -79,7 +81,6 @@ import {
 	SubRoomAccessibilityRequest,
 	SubRoomDto,
 	subRoomIdParam,
-	SubRoomSaveResult,
 	SubRoomSavesPage,
 	TagRequest,
 	UNAUTHORIZED_EMPTY,
@@ -1506,14 +1507,21 @@ const app = new Hono<App>()
 			tags: ['Subrooms'],
 			summary: 'Save a subroom’s data (room save)',
 			description: [
-				'Points the subroom at the blobs the client has already uploaded through the `storage`',
-				'worker and stamps the save; the room-level fields the save carries (`Description`,',
+				'Records a save against the subroom from the blobs the client has already uploaded',
+				'through the `storage` worker; the room-level fields it carries (`Description`,',
 				'`PersistenceVersion`, `InventionUsage`) are written to the room. Editable by the',
 				'room’s creator or a co-owner (403 otherwise); a missing token is an EMPTY-body 401,',
 				'unlike the other room writes.',
 				'',
-				'The push notification carries the whole room, but the RESPONSE is the saved SUBROOM',
-				'itself with no envelope — the client deserializes the body directly as the subroom.',
+				'`AutoPublish: true` makes the save live immediately. Otherwise it is STAGED: it',
+				'lands on `StagedSubRoomDataSaveId` with the live `CurrentSave` untouched, so',
+				'players keep loading the last published version until the owner calls',
+				'`POST …/subrooms/{subRoomId}/publish_save`. DORMS always publish — they have no',
+				'publish step in the client, so staging one would hide the player’s own edits.',
+				'',
+				'Answers the whole updated ROOM in the `{ success, error, value }` envelope, like',
+				'every other subroom mutation — the client re-renders from `value`, and a bare',
+				'subroom leaves the old scene on screen even though the save landed.',
 				'A subroom with no `CreatorAccountId` yet (the seeded rooms start null) gets the',
 				'saver’s id here, because the client NREs on a null one.',
 			].join('\n'),
@@ -1521,10 +1529,7 @@ const app = new Hono<App>()
 			parameters: [roomIdParam, subRoomIdParam],
 			requestBody: jsonBody(SaveSubRoomDataRequest, 'The uploaded blob keys and save fields'),
 			responses: {
-				200: json(
-					SubRoomSaveResult,
-					'The saved subroom, or the result envelope when the room/subroom is unknown'
-				),
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_EMPTY,
 				403: FORBIDDEN_RESPONSE,
 			},
@@ -1537,21 +1542,14 @@ const app = new Hono<App>()
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) {
-				return roomResult(c, {
-					Success: false,
-					ErrorId: 'Rooms.DoesntExist',
-					Error: 'This room does not exist!',
-				})
-			}
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
 			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			// The client uploads BOTH blobs to `storage` first and sends their keys here:
 			// `SubRoomData` is the scene blob (what the loader downloads), `RoomData` the
-			// metadata blob. `UnityAssetId`/`AutoPublish`/`OwnershipProof` are accepted
-			// and ignored.
+			// metadata blob. `OwnershipProof` is accepted and ignored.
 			const body = (await c.req.json().catch(() => ({}))) as {
 				RoomData?: { Filename?: string }
 				SubRoomData?: { Filename?: string }
@@ -1559,29 +1557,27 @@ const app = new Hono<App>()
 				Description?: string
 				PersistenceVersion?: number
 				InventionUsage?: string
+				AutoPublish?: boolean
 			}
 
 			const updated = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
 				subRoomDataFilename: body.SubRoomData?.Filename,
 				roomDataFilename: body.RoomData?.Filename,
 				unityAssetId: typeof body.UnityAssetId === 'string' ? body.UnityAssetId : undefined,
+				autoPublish: body.AutoPublish === true,
 				description: typeof body.Description === 'string' ? body.Description : undefined,
 				persistenceVersion:
 					typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
 				inventionUsage: typeof body.InventionUsage === 'string' ? body.InventionUsage : undefined,
 			})
-			if (!updated) {
-				return roomResult(c, {
-					Success: false,
-					ErrorId: 'Rooms.DoesntExist',
-					Error: 'This room does not exist!',
-				})
-			}
+			if (!updated) return roomEnvelope(c, null, 'This subroom does not exist!')
 
-			// RoomUpdate carries the full room, but the HTTP response is the saved SUBROOM
-			// itself — no envelope. The client deserializes the body directly as the subroom.
+			// The whole updated ROOM, like every other subroom mutation — the client
+			// re-renders the room from `value` and does NOT pick up a bare subroom, so
+			// answering with just the saved subroom leaves the old scene on screen even
+			// though the save landed.
 			await pushRoomUpdate(c, accountId, updated)
-			return c.json(findSubRoom(updated, subRoomId) ?? {})
+			return roomEnvelope(c, updated)
 		}
 	)
 
@@ -1667,6 +1663,76 @@ const app = new Hono<App>()
 
 			await pushRoomUpdate(c, accountId, updated)
 			return roomResult(c, { Success: true })
+		}
+	)
+
+	// Publish a subroom's staged save — promote it to the live one players load. Every
+	// non-dorm room save only STAGES (see the save route), so this is the manual step that
+	// makes edits visible. Auth-gated (401) and creator-only: co-owners may save, but
+	// only the room's owner decides what goes live. Answers the updated ROOM in the
+	// `{ success, error, value }` envelope, like the other subroom mutations.
+	.post(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/publish_save',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Publish one of a subroom’s saves',
+			description: [
+				'Makes the save named by the `subRoomDataSaveId` form field the one players load —',
+				'it becomes the subroom’s `CurrentSave`. A room save only STAGES (dorms excepted),',
+				'so nothing a creator saves reaches players until this is called.',
+				'',
+				'The id may be any save in the subroom’s history, so this doubles as restore-a-save.',
+				'`StagedSubRoomDataSaveId` is cleared only when the published save IS the staged',
+				'one — restoring an older version keeps newer unpublished work staged.',
+				'',
+				'Owner-only: co-owners may save but not decide what goes live. A save id belonging',
+				'to another subroom is rejected.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: form(PublishSaveRequest, 'The save to publish'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_ENVELOPE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) {
+				return c.json({ success: false, error: 'Unauthorized', value: null }, 401)
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (room.CreatorAccountId !== accountId) {
+				return roomEnvelope(c, null, 'You are not the owner of this room!')
+			}
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const saveId =
+				typeof body.subRoomDataSaveId === 'string'
+					? Number.parseInt(body.subRoomDataSaveId, 10)
+					: Number.NaN
+			if (Number.isNaN(saveId)) {
+				return roomEnvelope(c, null, 'You must provide a valid save!')
+			}
+
+			const result = await publishSubRoomSave(c.env.DB, roomId, subRoomId, saveId)
+			if (!result.ok) {
+				return roomEnvelope(
+					c,
+					null,
+					result.reason === 'unknown_save'
+						? 'That save does not exist!'
+						: 'This subroom does not exist!'
+				)
+			}
+
+			await pushRoomUpdate(c, accountId, result.room)
+			return roomEnvelope(c, result.room)
 		}
 	)
 
