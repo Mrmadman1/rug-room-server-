@@ -74,13 +74,15 @@ inconsistency here without checking the client first.
   `{ error, success, value: null }` — e.g. `clubs` `PUT /club/:id/clubhouse` left the old
   clubhouse on screen until it answered the full details envelope.
 - Every subroom mutation (`rooms`: create, delete, `/subrooms/:sid/clone`,
-  `/subrooms/:sid/accessibility`, `/subrooms/:sid/data`, `/subrooms/:sid/publish_save`)
-  answers `{ success, error, value }` with the whole updated ROOM — the client re-renders
-  the room from `value`. Notably `value` is the room even for `clone`, whose product is a
-  new SUBROOM, and even for `data`, whose product is a SAVE; only the room-level
-  `POST /rooms/:id/clone` returns the thing it created. A bare subroom from `data` leaves
-  the old scene on screen even though the save landed — the symptom is "saved fine in the
-  DB, didn't update visually".
+  `/subrooms/:sid/accessibility`, `/subrooms/:sid/publish_save`) answers
+  `{ success, error, value }` with the whole updated ROOM — the client re-renders the room
+  from `value`. Notably `value` is the room even for `clone`, whose product is a new
+  SUBROOM; only the room-level `POST /rooms/:id/clone` returns the thing it created.
+- The room save (`rooms`: `POST /subrooms/:sid/data`) is the ONE exception to that shape:
+  `value` is `{ room, subRoomDataSave }`, and `error` is NULL rather than `""`. The
+  `subRoomDataSave` is camelCase with a different field set from the PascalCase
+  `CurrentSave` embedded in the room (no persistence/OM/UGC versions, no moderation state,
+  no asset arrays; but `unityAsset`/`unityAssetHash`). Don't unify the two projections.
 - A subroom's saved scene loads from `CurrentSave.DataBlob` (`rooms`: `GET /rooms/:id`),
   NOT the flat `DataBlob` on the subroom — a subroom with no `CurrentSave` silently loads
   nothing. The key must be present (null before the first publish); read it via

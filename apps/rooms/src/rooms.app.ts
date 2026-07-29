@@ -75,6 +75,7 @@ import {
 	roomIdParam,
 	RoomLookup,
 	RoomResultEnvelope,
+	RoomSaveEnvelope,
 	SaveSubRoomDataRequest,
 	ServiceStatus,
 	stringQuery,
@@ -269,6 +270,33 @@ function roomResult(
 		ErrorId: fields.ErrorId ?? null,
 		Error: fields.Error ?? null,
 	})
+}
+
+/**
+ * The room save's `value.subRoomDataSave` — a camelCase projection with a DIFFERENT
+ * field set from the PascalCase `CurrentSave` embedded in a room (no persistence/OM/UGC
+ * versions, no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`
+ * that `CurrentSave` never shows). Don't unify the two without checking the client.
+ *
+ * `unityAsset`/`unityAssetHash` are always null: we resolve no baked Unity assets.
+ */
+function toSaveResponse(save: Record<string, unknown>) {
+	const str = (v: unknown) => (typeof v === 'string' ? v : null)
+	const num = (v: unknown) => (typeof v === 'number' ? v : null)
+	return {
+		subRoomDataSaveId: num(save.SubRoomDataSaveId),
+		subRoomId: num(save.SubRoomId),
+		unityAssetId: str(save.UnityAssetId),
+		unityAsset: null,
+		unityAssetHash: null,
+		dataBlob: str(save.DataBlob) ?? '',
+		dataBlobHash: str(save.DataBlobHash),
+		savedByAccountId: num(save.SavedByAccountId),
+		savedOnPlatform: num(save.SavedOnPlatform) ?? 0,
+		savedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
+		description: str(save.Description),
+		createdAt: str(save.CreatedAt) ?? '',
+	}
 }
 
 /** Client envelope for room mutations: `{ success, error, value }` (lowercase). */
@@ -1504,9 +1532,10 @@ const app = new Hono<App>()
 				'`POST …/subrooms/{subRoomId}/publish_save`. DORMS always publish — they have no',
 				'publish step in the client, so staging one would hide the player’s own edits.',
 				'',
-				'Answers the whole updated ROOM in the `{ success, error, value }` envelope, like',
-				'every other subroom mutation — the client re-renders from `value`, and a bare',
-				'subroom leaves the old scene on screen even though the save landed.',
+				'`value` carries BOTH the updated `room` and the `subRoomDataSave` just created,',
+				'and `error` is NULL here rather than the empty string the other room envelopes',
+				'use. The save is projected in camelCase with a different field set from the',
+				'PascalCase `CurrentSave` embedded in the room — the two are not the same shape.',
 				'A subroom with no `CreatorAccountId` yet (the seeded rooms start null) gets the',
 				'saver’s id here, because the client NREs on a null one.',
 			].join('\n'),
@@ -1514,7 +1543,7 @@ const app = new Hono<App>()
 			parameters: [roomIdParam, subRoomIdParam],
 			requestBody: jsonBody(SaveSubRoomDataRequest, 'The uploaded blob keys and save fields'),
 			responses: {
-				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				200: json(RoomSaveEnvelope, 'The updated room + the new save, or a rejection'),
 				401: UNAUTHORIZED_EMPTY,
 				403: FORBIDDEN_RESPONSE,
 			},
@@ -1527,7 +1556,9 @@ const app = new Hono<App>()
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+			if (!room) {
+				return c.json({ success: false, error: 'This room does not exist!', value: null })
+			}
 			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
@@ -1537,7 +1568,7 @@ const app = new Hono<App>()
 			// metadata blob. `OwnershipProof` is accepted and ignored.
 			const body = (await c.req.json().catch(() => ({}))) as {
 				RoomData?: { Filename?: string }
-				SubRoomData?: { Filename?: string }
+				SubRoomData?: { Filename?: string; Hash?: string | null }
 				UnityAssetId?: string | null
 				Description?: string
 				PersistenceVersion?: number
@@ -1545,8 +1576,10 @@ const app = new Hono<App>()
 				AutoPublish?: boolean
 			}
 
-			const updated = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
+			const result = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
 				subRoomDataFilename: body.SubRoomData?.Filename,
+				subRoomDataHash:
+					typeof body.SubRoomData?.Hash === 'string' ? body.SubRoomData.Hash : undefined,
 				roomDataFilename: body.RoomData?.Filename,
 				unityAssetId: typeof body.UnityAssetId === 'string' ? body.UnityAssetId : undefined,
 				autoPublish: body.AutoPublish === true,
@@ -1555,14 +1588,18 @@ const app = new Hono<App>()
 					typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
 				inventionUsage: typeof body.InventionUsage === 'string' ? body.InventionUsage : undefined,
 			})
-			if (!updated) return roomEnvelope(c, null, 'This subroom does not exist!')
+			if (!result) {
+				return c.json({ success: false, error: 'This subroom does not exist!', value: null })
+			}
 
-			// The whole updated ROOM, like every other subroom mutation — the client
-			// re-renders the room from `value` and does NOT pick up a bare subroom, so
-			// answering with just the saved subroom leaves the old scene on screen even
-			// though the save landed.
-			await pushRoomUpdate(c, accountId, updated)
-			return roomEnvelope(c, updated)
+			// `value` carries BOTH the updated room and the save just created — and `error`
+			// is null here, not the empty string the other room envelopes use.
+			await pushRoomUpdate(c, accountId, result.room)
+			return c.json({
+				success: true,
+				error: null,
+				value: { room: result.room, subRoomDataSave: toSaveResponse(result.save) },
+			})
 		}
 	)
 

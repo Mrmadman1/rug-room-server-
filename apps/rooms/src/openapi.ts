@@ -139,6 +139,31 @@ export const LoadScreenDto = z.object({
 })
 
 /**
+ * The save as the room-save RESPONSE renders it — camelCase, and a different field set
+ * from the PascalCase `CurrentSave` embedded in a room (no persistence/OM/UGC versions,
+ * no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`/`dataBlobHash`
+ * that `CurrentSave` doesn't show). The two are deliberately not unified.
+ */
+export const SubRoomDataSaveResponseDto = z.object({
+	subRoomDataSaveId: z.int(),
+	subRoomId: z.int(),
+	unityAssetId: z.string().nullable().describe('Null unless the save carried one'),
+	unityAsset: z.string().nullable().describe('Always null — we resolve no baked assets'),
+	unityAssetHash: z.string().nullable().describe('Always null — we resolve no baked assets'),
+	dataBlob: z.string(),
+	dataBlobHash: z.string().nullable().describe('Echoed from the request’s `SubRoomData.Hash`'),
+	savedByAccountId: z.int().nullable(),
+	savedOnPlatform: z
+		.int()
+		.describe(
+			'Steam=0 Oculus=1 PlayStation=2 Xbox=3 RecNet=4 IOS=5 GooglePlay=6 Standalone=7 Pico=8'
+		),
+	savedOnDeviceClass: z.int().describe('Unknown=0 VR=1 Screen=2 Mobile=3 VRLow=4 Quest2=5'),
+	description: z.string().nullable(),
+	createdAt: z.string(),
+})
+
+/**
  * A subroom's most recent room save — the `SubRoomDataSave` the client reads to find the
  * scene-data blob to download. This is the ONLY place the loader looks for it, so a
  * subroom whose `CurrentSave` is missing loads no saved content at all.
@@ -349,6 +374,20 @@ export const RoomEnvelope = z.object({
 	success: z.boolean(),
 	error: z.string().describe('Empty on success'),
 	value: RoomDto.nullable(),
+})
+
+/**
+ * What `POST /rooms/{roomId}/subrooms/{subRoomId}/data` answers: `value` carries BOTH the
+ * updated room and the save that was just created. Note `error` is NULL here, not the
+ * empty string the other room envelopes use.
+ */
+export const RoomSaveEnvelope = z.object({
+	success: z.boolean(),
+	error: z.string().nullable().describe('Null on success'),
+	value: z
+		.object({ room: RoomDto, subRoomDataSave: SubRoomDataSaveResponseDto })
+		.nullable()
+		.describe('Null on a rejection'),
 })
 
 /** The 401 the envelope-returning routes answer with — the only one that isn’t HTTP 200. */

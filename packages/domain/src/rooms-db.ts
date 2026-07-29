@@ -312,6 +312,8 @@ export function findSubRoom(room: Room, subRoomId: number): SubRoom | undefined 
 export interface SaveSubRoomDataInput {
 	/** Uploaded blob key for this subroom's scene data (becomes `CurrentSave.DataBlob`). */
 	subRoomDataFilename?: string
+	/** `SubRoomData.Hash` — echoed back as the save response's `dataBlobHash`. */
+	subRoomDataHash?: string
 	/** Uploaded blob key for the room-level METADATA blob (a separate upload). */
 	roomDataFilename?: string
 	description?: string
@@ -354,6 +356,7 @@ export function subRoomDataBlob(sub: SubRoom | undefined | null): string {
 interface BuildSaveInput {
 	subRoomId: unknown
 	dataBlob: string
+	dataBlobHash: string | null
 	persistenceVersion: number
 	savedByAccountId: unknown
 	description: string
@@ -379,6 +382,10 @@ function buildSubRoomSave(input: BuildSaveInput): SubRoomDataSave {
 		ReferencedUnityAssets: [],
 		SubRoomId: input.subRoomId,
 		DataBlob: input.dataBlob,
+		// The client sends `SubRoomData.Hash` (usually null); the room-save response echoes
+		// it as `dataBlobHash`. One observed room payload carries it on `CurrentSave` and
+		// another omits it, so storing it and letting it ride along is the safe reading.
+		DataBlobHash: input.dataBlobHash,
 		ReferencedUnityAssetIds: [],
 		PersistenceVersion: input.persistenceVersion,
 		OMVersion: 0,
@@ -412,6 +419,7 @@ function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
 	return buildSubRoomSave({
 		subRoomId: sub.SubRoomId,
 		dataBlob: blob,
+		dataBlobHash: null,
 		persistenceVersion: typeof sub.PersistenceVersion === 'number' ? sub.PersistenceVersion : 0,
 		// The legacy shape never recorded who saved; the subroom's creator is the best
 		// available answer (the save path is owner/co-owner gated).
@@ -423,8 +431,8 @@ function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
 
 /**
  * Persist a room-save against a specific subroom and record the room-level fields the
- * save carries. Returns the updated (hydrated) room, or null when the room or subroom
- * doesn't exist.
+ * save carries. Returns the updated (hydrated) room AND the save that was just created —
+ * the route answers with both — or null when the room or subroom doesn't exist.
  *
  * Whether the save goes live is the client's call: `AutoPublish: true` publishes it
  * outright, otherwise it becomes the subroom's `staged_save_id` with the live
@@ -438,7 +446,7 @@ export async function saveSubRoomData(
 	subRoomId: number,
 	accountId: number,
 	input: SaveSubRoomDataInput
-): Promise<Room | null> {
+): Promise<{ room: Room; save: SubRoomDataSave } | null> {
 	const room = await getRoomById(db, roomId)
 	if (!room) return null
 	// Read off the already-hydrated room rather than re-querying the subroom and its
@@ -475,6 +483,7 @@ export async function saveSubRoomData(
 			// A save that carries no new blob (e.g. a description-only save) keeps the one
 			// the subroom already loads from.
 			dataBlob: input.subRoomDataFilename ?? (typeof priorBlob === 'string' ? priorBlob : ''),
+			dataBlobHash: input.subRoomDataHash ?? null,
 			persistenceVersion:
 				input.persistenceVersion ?? (typeof priorVersion === 'number' ? priorVersion : 0),
 			savedByAccountId: accountId,
@@ -517,7 +526,8 @@ export async function saveSubRoomData(
 	])
 
 	// Re-hydrate so the returned room reflects the just-saved subroom.
-	return hydrateRoom(db, room)
+	await attachSubRooms(db, [room])
+	return { room, save }
 }
 
 /**

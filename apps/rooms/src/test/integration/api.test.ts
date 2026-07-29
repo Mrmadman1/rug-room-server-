@@ -989,16 +989,40 @@ describe('rooms endpoints', () => {
 		})
 		expect(await envOf(await authed(2, 9999, '1'))).toMatchObject({ success: false })
 
-		// Owner saves → 200 with the whole updated ROOM in the envelope. A bare subroom
-		// here leaves the client showing the old scene even though the save landed. This
-		// fixture sends `AutoPublish: true`, so the save goes live immediately.
+		// Owner saves → 200. `value` carries BOTH the updated room and the new save, and
+		// `error` is null (not ''). This fixture sends `AutoPublish: true`, so it goes live.
 		const ok = await authed(2, 2, '1')
 		expect(ok.status).toBe(200)
-		const saved = await envOf(ok)
+		const saved = (await ok.json()) as {
+			success: boolean
+			error: string | null
+			value: {
+				room: Record<string, unknown>
+				subRoomDataSave: Record<string, unknown>
+			}
+		}
 		expect(saved.success).toBe(true)
-		expect(saved.value).toMatchObject({ RoomId: 2, Description: 'mydescription here' })
+		expect(saved.error).toBeNull()
+		expect(saved.value.room).toMatchObject({ RoomId: 2, Description: 'mydescription here' })
+
+		// The save is a camelCase projection, NOT the PascalCase CurrentSave shape.
+		expect(saved.value.subRoomDataSave).toEqual({
+			subRoomDataSaveId: expect.any(Number),
+			subRoomId: 2,
+			unityAssetId: null,
+			unityAsset: null,
+			unityAssetHash: null,
+			dataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
+			dataBlobHash: null,
+			savedByAccountId: 1,
+			savedOnPlatform: 0,
+			savedOnDeviceClass: 0,
+			description: 'mydescription here',
+			createdAt: expect.any(String),
+		})
+
 		// The saved subroom rides along inside the room's SubRooms, carrying the new save.
-		const savedSub = (saved.value!.SubRooms as Array<Record<string, unknown>>).find(
+		const savedSub = (saved.value.room.SubRooms as Array<Record<string, unknown>>).find(
 			(s) => s.SubRoomId === 2
 		)!
 		expect(savedSub).toMatchObject({
@@ -1047,11 +1071,16 @@ describe('rooms endpoints', () => {
 		// with the room envelope. The creator stays account 1 (not clobbered).
 		const coOwner = await authed(2, 2, '2')
 		expect(coOwner.status).toBe(200)
-		const coOwnerEnv = await envOf(coOwner)
+		const coOwnerEnv = (await coOwner.json()) as {
+			success: boolean
+			value: { room: { SubRooms: Array<Record<string, unknown>> }; subRoomDataSave: unknown }
+		}
 		expect(coOwnerEnv.success).toBe(true)
-		expect(
-			(coOwnerEnv.value!.SubRooms as Array<Record<string, unknown>>).find((s) => s.SubRoomId === 2)
-		).toMatchObject({ CreatorAccountId: 1 })
+		expect(coOwnerEnv.value.room.SubRooms.find((s) => s.SubRoomId === 2)).toMatchObject({
+			CreatorAccountId: 1,
+		})
+		// The save records who actually saved it, not the room's creator.
+		expect(coOwnerEnv.value.subRoomDataSave).toMatchObject({ savedByAccountId: 2 })
 	})
 
 	it('GET /rooms/:id gives every subroom a CurrentSave key (null before the first save)', async () => {
@@ -1125,9 +1154,9 @@ describe('rooms endpoints', () => {
 			UgcSubVersion: 0,
 			ModerationState: 0,
 		})
-		// No DataBlobHash — it is commented out of the reference DTO — and no UnityAssetId
-		// key at all, since the client sent null.
-		expect('DataBlobHash' in live.CurrentSave!).toBe(false)
+		// DataBlobHash rides along (null — the client sent `Hash: null`); UnityAssetId is
+		// omitted entirely rather than nulled, since the save carried none.
+		expect(live.CurrentSave!.DataBlobHash).toBeNull()
 		expect('UnityAssetId' in live.CurrentSave!).toBe(false)
 
 		// It's on the room read too — that's what the loader actually fetches.
