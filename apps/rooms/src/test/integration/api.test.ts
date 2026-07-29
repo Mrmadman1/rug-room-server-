@@ -988,23 +988,34 @@ describe('rooms endpoints', () => {
 		expect(ok.status).toBe(200)
 		expect(await bodyOf(ok)).toMatchObject({
 			SubRoomId: 2,
-			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
 			RoomDataBlob: '5c618c920f6247efb8327e327d0b4417',
 			CreatorAccountId: 1,
 			PersistenceVersion: 41,
+			// The blob the client actually loads from lives on CurrentSave.
+			CurrentSave: {
+				SubRoomId: 2,
+				DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
+				SavedByAccountId: 1,
+				PersistenceVersion: 41,
+				UnitySubAssets: [],
+				ReferencedUnityAssets: [],
+				ReferencedUnityAssetIds: [],
+				Tags: [],
+			},
 		})
 
-		// It also persists — the GET returns the subroom with the new blob + creator.
+		// It also persists — the GET returns the subroom with the new save + creator.
 		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`)).json()) as {
 			SubRoomId: number
-			DataBlob: string
 			CreatorAccountId: number
+			CurrentSave: { DataBlob: string; SubRoomDataSaveId: number }
 		}
 		expect(sub).toMatchObject({
 			SubRoomId: 2,
-			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
 			CreatorAccountId: 1,
+			CurrentSave: { DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f' },
 		})
+		expect(sub.CurrentSave.SubRoomDataSaveId).toBeGreaterThan(0)
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
 			Description: string
 			PersistenceVersion: number
@@ -1017,6 +1028,180 @@ describe('rooms endpoints', () => {
 		const coOwner = await authed(2, 2, '2')
 		expect(coOwner.status).toBe(200)
 		expect(await bodyOf(coOwner)).toMatchObject({ SubRoomId: 2, CreatorAccountId: 1 })
+	})
+
+	it('GET /rooms/:id gives every subroom a CurrentSave key (null before the first save)', async () => {
+		// The client loads a subroom's scene data from CurrentSave and nothing else, so
+		// the key must be PRESENT — the seeded rooms predate it and have no such field in
+		// their stored blob. `in` rather than a value check: absent and null differ here.
+		// Room 3 is seeded and never saved by another test (room 2 is the save fixture).
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/3`)).json()) as {
+			SubRooms: Array<Record<string, unknown>>
+		}
+		expect(room.SubRooms.length).toBeGreaterThan(0)
+		for (const sub of room.SubRooms) {
+			expect('CurrentSave' in sub).toBe(true)
+			expect(sub.CurrentSave).toBeNull()
+		}
+	})
+
+	it('a real client room-save body populates CurrentSave and comes back on GET /rooms/:id', async () => {
+		// The exact body the live client posts after uploading both blobs to `storage`:
+		// SubRoomData is the scene blob, RoomData the metadata blob.
+		const res = await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+			body: JSON.stringify({
+				UnityAssetId: null,
+				RoomData: { Filename: '2026-07-28/b266ccd5-metadata', Hash: null, OwnershipProof: null },
+				SubRoomData: { Filename: '2026-07-28/f176fc3b-scene', Hash: null, OwnershipProof: null },
+				InventionUsage: 'CAE=',
+				PersistenceVersion: 51,
+				Description: 'TEST',
+				AutoPublish: false,
+			}),
+		})
+		expect(res.status).toBe(200)
+
+		// It must be visible on the room read — that's what the loader fetches.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/5`)).json()) as {
+			SubRooms: Array<{ SubRoomId: number; CurrentSave: Record<string, unknown> | null }>
+		}
+		const sub = room.SubRooms.find((s) => s.SubRoomId === 5)!
+		expect(sub.CurrentSave).toMatchObject({
+			SubRoomId: 5,
+			DataBlob: '2026-07-28/f176fc3b-scene',
+			PersistenceVersion: 51,
+			SavedByAccountId: 1,
+			Description: 'TEST',
+			OMVersion: 0,
+			UgcSubVersion: 0,
+			ModerationState: 0,
+		})
+		// No DataBlobHash — it is commented out of the reference DTO — and no UnityAssetId
+		// key at all, since the client sent null.
+		expect('DataBlobHash' in sub.CurrentSave!).toBe(false)
+		expect('UnityAssetId' in sub.CurrentSave!).toBe(false)
+
+		// The save list serves that save rather than an empty page.
+		const firstId = sub.CurrentSave!.SubRoomDataSaveId as number
+		expect(firstId).toBeGreaterThan(0)
+		const saves = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`)).json()) as {
+			Results: Array<{ DataBlob: string }>
+			TotalResults: number
+		}
+		expect(saves.TotalResults).toBe(1)
+		expect(saves.Results[0]!.DataBlob).toBe('2026-07-28/f176fc3b-scene')
+
+		// A second save appends rather than overwriting, and takes a fresh higher id.
+		await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+			body: JSON.stringify({ SubRoomData: { Filename: 'second.room' } }),
+		})
+		const after = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/data`)).json()) as {
+			CurrentSave: { SubRoomDataSaveId: number; DataBlob: string; Description: string }
+		}
+		expect(after.CurrentSave.SubRoomDataSaveId).toBeGreaterThan(firstId)
+		expect(after.CurrentSave.DataBlob).toBe('second.room')
+
+		// Both saves are in the history, newest first — the first one is not lost.
+		const history = (await (await SELF.fetch(`${ORIGIN}/rooms/5/subrooms/5/saves`)).json()) as {
+			Results: Array<{ DataBlob: string }>
+			TotalResults: number
+		}
+		expect(history.TotalResults).toBe(2)
+		expect(history.Results.map((s) => s.DataBlob)).toEqual([
+			'second.room',
+			'2026-07-28/f176fc3b-scene',
+		])
+		// A save with no Description records an empty string, not null.
+		expect(after.CurrentSave.Description).toBe('')
+	})
+
+	it('migrates a pre-CurrentSave subroom into a real save row (0008 backfill 2)', async () => {
+		// A subroom saved by the older code has its blob in the flat DataBlob field and no
+		// CurrentSave at all. seedRoomWithSubRooms mirrors the migration, so this covers
+		// the backfill: the flat fields become a save row the subroom points at, rather
+		// than reading as never-saved and hiding real content from the loader.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 820,
+			Name: 'LegacyShaped',
+			CreatorAccountId: 1,
+			SubRooms: [
+				{
+					SubRoomId: 830,
+					Name: 'Legacy',
+					CreatorAccountId: 7,
+					UnitySceneId: '76d98498-60a1-430c-ab76-b54a29b7a163',
+					MaxPlayers: 4,
+					Accessibility: 2,
+					DataBlob: 'legacy-blob.room',
+					DataSavedAt: '2024-03-04T05:06:07.000Z',
+					PersistenceVersion: 12,
+				},
+			],
+		})
+
+		const sub = (await (await SELF.fetch(`${ORIGIN}/rooms/820/subrooms/830/data`)).json()) as {
+			CurrentSave: Record<string, unknown>
+		}
+		expect(sub.CurrentSave).toMatchObject({
+			SubRoomId: 830,
+			DataBlob: 'legacy-blob.room',
+			PersistenceVersion: 12,
+			SavedByAccountId: 7,
+			CreatedAt: '2024-03-04T05:06:07.000Z',
+			UnitySubAssets: [],
+			Tags: [],
+		})
+		// Stable across reads — it's a stored row now, not something rebuilt per request.
+		const again = (await (await SELF.fetch(`${ORIGIN}/rooms/820/subrooms/830/data`)).json()) as {
+			CurrentSave: { SubRoomDataSaveId: number }
+		}
+		expect(again.CurrentSave.SubRoomDataSaveId).toBe(sub.CurrentSave.SubRoomDataSaveId)
+	})
+
+	it('save ids are globally unique across subrooms, so a bare id resolves', async () => {
+		// StagedSubRoomDataSaveId points at a save by bare id with no subroom context, so
+		// per-subroom numbering (every subroom's first save being 1) would be ambiguous.
+		const save = async (roomId: number, subRoomId: number) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/data`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+				body: JSON.stringify({ SubRoomData: { Filename: `blob-${subRoomId}.room` } }),
+			})
+		const idOf = async (roomId: number, subRoomId: number) => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/${roomId}/subrooms/${subRoomId}/data`)
+			return ((await res.json()) as { CurrentSave: { SubRoomDataSaveId: number } }).CurrentSave
+				.SubRoomDataSaveId
+		}
+
+		// Two different subrooms, each getting their FIRST save.
+		await save(6, 6)
+		await save(7, 7)
+		expect(await idOf(6, 6)).not.toBe(await idOf(7, 7))
+	})
+
+	it('a cloned subroom re-points CurrentSave at the copy, not the source', async () => {
+		// Save room 2's subroom so there is a CurrentSave to copy.
+		await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`, {
+			method: 'POST',
+			headers: { ...(await bearer('1')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ SubRoomData: { Filename: 'cloned-source.room' } }),
+		})
+
+		const res = await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/clone`, {
+			method: 'POST',
+			headers: await bearer('1'),
+		})
+		const body = (await res.json()) as {
+			value: { SubRooms: Array<{ SubRoomId: number; CurrentSave: { SubRoomId: number } | null }> }
+		}
+		const clone = body.value.SubRooms.find((s) => s.SubRoomId !== 2 && s.CurrentSave !== null)!
+		expect(clone).toBeDefined()
+		// The copy's save must claim the COPY, or the client resolves it against the source.
+		expect(clone.CurrentSave!.SubRoomId).toBe(clone.SubRoomId)
 	})
 
 	it('PUT /rooms/:id/tags is auth-gated, owner-only, and toggles (add/remove)', async () => {
@@ -1558,12 +1743,35 @@ describe('rooms endpoints', () => {
 		expect((await SELF.fetch(`${ORIGIN}/rooms/700/subrooms/900/data`)).status).toBe(200)
 	})
 
-	it('GET /rooms/:id/subrooms/:sid/saves returns an empty paged result', async () => {
-		const res = await SELF.fetch(
-			`${ORIGIN}/rooms/2/subrooms/2/saves?unityAssetTarget=0&unityAssetVersion=1&skip=0&take=20`
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ Results: [], TotalResults: 0 })
+	it('GET /rooms/:id/subrooms/:sid/saves pages the save history, newest first', async () => {
+		type Page = {
+			Results: Array<{ SubRoomId: number; SubRoomDataSaveId: number }>
+			TotalResults: number
+			TotalCount: number
+		}
+		const page = async (query: string) =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves${query}`)).json()) as Page
+
+		// Room 2's subroom is saved several times by the tests above — each save appended.
+		const all = await page('?unityAssetTarget=0&unityAssetVersion=1')
+		expect(all.Results.length).toBeGreaterThan(1)
+		expect(all.Results.every((s) => s.SubRoomId === 2)).toBe(true)
+		// Newest first: ids descend.
+		const ids = all.Results.map((s) => s.SubRoomDataSaveId)
+		expect([...ids].sort((a, b) => b - a)).toEqual(ids)
+		// Both spellings of the count, and they agree with the list.
+		expect(all.TotalResults).toBe(all.Results.length)
+		expect(all.TotalCount).toBe(all.TotalResults)
+
+		// skip/take actually page rather than being ignored.
+		const paged = await page('?skip=1&take=1')
+		expect(paged.Results).toHaveLength(1)
+		expect(paged.Results[0]!.SubRoomDataSaveId).toBe(ids[1])
+		expect(paged.TotalResults).toBe(all.TotalResults)
+
+		// A never-saved subroom pages empty rather than 404ing.
+		const empty = await SELF.fetch(`${ORIGIN}/rooms/3/subrooms/3/saves`)
+		expect(await empty.json()).toEqual({ Results: [], TotalResults: 0, TotalCount: 0 })
 	})
 
 	it('GET /openapi.json documents every route', async () => {

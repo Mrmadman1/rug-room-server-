@@ -139,13 +139,42 @@ export const LoadScreenDto = z.object({
 })
 
 /**
+ * A subroom's most recent room save — the `SubRoomDataSave` the client reads to find the
+ * scene-data blob to download. This is the ONLY place the loader looks for it, so a
+ * subroom whose `CurrentSave` is missing loads no saved content at all.
+ *
+ * The array fields are always empty here: we neither resolve nor record referenced Unity
+ * assets. They are still emitted because the client's parser expects them present.
+ */
+export const SubRoomDataSaveDto = z.object({
+	UnitySubAssets: z.array(z.unknown()).describe('Always empty'),
+	ReferencedUnityAssets: z.array(z.unknown()).describe('Always empty'),
+	SubRoomDataSaveId: z.int().describe('Numbered from 1, incremented on every save'),
+	SubRoomId: z.int().describe('The owning subroom — re-pointed when a subroom is cloned'),
+	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty'),
+	PersistenceVersion: z.int(),
+	OMVersion: z.int(),
+	UgcSubVersion: z.int(),
+	SavedByAccountId: z.int().nullable(),
+	SavedOnPlatform: z.int().describe('0 — the save request carries no platform'),
+	SavedOnDeviceClass: z.int().describe('0 — the save request carries no device class'),
+	Description: z.string().describe('The save comment; empty string when none'),
+	Tags: z.array(z.unknown()).describe('Always empty'),
+	ModerationState: z.int(),
+	CreatedAt: z.string(),
+	UnityAssetId: z.string().optional().describe('Emitted only when the save carried one'),
+})
+
+/**
  * A subroom — a room's individual scene. Subrooms are their own table with a globally
  * unique, autoincrementing `SubRoomId` (the original game mints them from a single
  * sequence, not per-room); a room's `SubRooms` array is reconstructed on read.
  *
  * `CreatorAccountId` starts null on the seeded rooms and is filled in on the first save —
- * the client NREs on a null one. The `DataBlob`/`RoomDataBlob`/`DataSavedAt` fields only
- * appear once the subroom has been saved at least once.
+ * the client NREs on a null one. `CurrentSave` is null until the first save; the flat
+ * `DataBlob`/`RoomDataBlob`/`DataSavedAt` fields are legacy and are NOT what the client
+ * loads from.
  */
 export const SubRoomDto = z.object({
 	SubRoomId: z.int(),
@@ -161,7 +190,10 @@ export const SubRoomDto = z.object({
 		.describe('0 Private, 1 Public, 2 Unlisted, 3 Dev_only, 4 Dev_Unlisted — set independently'),
 	ShouldAutoStageSaves: z.boolean(),
 	StagedSubRoomDataSaveId: z.int().nullable(),
-	DataBlob: z.string().optional().describe('Uploaded scene-data key; absent until first save'),
+	CurrentSave: SubRoomDataSaveDto.nullable().describe(
+		'The latest room save — where the client finds the scene blob. Null until first save'
+	),
+	DataBlob: z.string().optional().describe('Legacy flat key; the client reads `CurrentSave`'),
 	RoomDataBlob: z.string().optional().describe('Uploaded room-data key; absent until first save'),
 	DataSavedAt: z.string().optional().describe('ISO timestamp of the last save'),
 	PersistenceVersion: z.int().optional(),
@@ -440,7 +472,7 @@ export const SaveSubRoomDataRequest = z.object({
 	SubRoomData: z
 		.object({ Filename: z.string() })
 		.optional()
-		.describe('The uploaded scene-data blob — becomes the subroom’s `DataBlob`'),
+		.describe('The uploaded scene-data blob — becomes the subroom’s `CurrentSave.DataBlob`'),
 	RoomData: z
 		.object({ Filename: z.string() })
 		.optional()
@@ -455,8 +487,11 @@ export const SaveSubRoomDataRequest = z.object({
  * save history (a save overwrites the subroom's blob inline), so it's always empty.
  */
 export const SubRoomSavesPage = z.object({
-	Results: z.array(z.unknown()).describe('Always empty — no save history is kept'),
+	Results: z
+		.array(SubRoomDataSaveDto)
+		.describe('At most one — the current save; we keep no history'),
 	TotalResults: z.int(),
+	TotalCount: z.int().describe('Same value as `TotalResults` — the two references disagree'),
 })
 
 // ---- Session ---------------------------------------------------------------

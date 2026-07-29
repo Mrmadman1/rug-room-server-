@@ -27,6 +27,7 @@ import {
 	RoomInstanceType,
 	setPresence,
 	setRoomInstanceInProgress,
+	subRoomDataBlob,
 } from '@repo/domain'
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
@@ -34,7 +35,6 @@ import { validateAndGetAccountId } from '@repo/jwt'
 // Value import of the notify worker's NotificationType enum (its bundle has no runtime
 // deps), so /invite sends a typed MessageReceived frame instead of a magic number.
 import { NotificationType } from '../../notify/src/notification-types'
-
 import {
 	AUTHED,
 	EMPTY_OK,
@@ -363,7 +363,7 @@ function instanceFieldsFromRoom(room: Room, subRoomId?: number) {
 		roomId: num(room.RoomId, 1),
 		subRoomId: num(sub?.SubRoomId, 1),
 		location: str(sub?.UnitySceneId),
-		dataBlob: str(sub?.DataBlob),
+		dataBlob: subRoomDataBlob(sub),
 		name,
 		maxCapacity: num(sub?.MaxPlayers, 4),
 		roomInstanceType: room.IsDorm === true ? RoomInstanceType.Dormroom : RoomInstanceType.Public,
@@ -693,7 +693,10 @@ const app = new Hono<App>()
 				'`PlayerId`/`RoomInstanceId`). Currently just logged and acked — presence is cleared',
 				'by logout and otherwise expires on its TTL — but the hook is here for a future check.',
 			].join(' '),
-			requestBody: form(NotifyDisconnectRequest, 'The disconnecting player and the instance they left'),
+			requestBody: form(
+				NotifyDisconnectRequest,
+				'The disconnecting player and the instance they left'
+			),
 			responses: { 200: EMPTY_OK },
 		}),
 		async (c) => {

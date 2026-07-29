@@ -78,6 +78,10 @@ inconsistency here without checking the client first.
   updated ROOM — the client re-renders the room's subroom list from `value`. Notably
   `value` is the room even for `clone`, whose product is a new SUBROOM; only the
   room-level `POST /rooms/:id/clone` returns the thing it created.
+- A subroom's saved scene loads from `CurrentSave.DataBlob` (`rooms`: `GET /rooms/:id`),
+  NOT the flat `DataBlob` on the subroom — a subroom with no `CurrentSave` silently loads
+  nothing. The key must be present (null before the first save); read it via
+  `subRoomDataBlob()` so `match`/`auth` instance payloads resolve it the same way.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

@@ -57,9 +57,31 @@ export const SUBROOM_SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS subroom (
 		sub_room_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		room_id INTEGER NOT NULL,
-		data TEXT NOT NULL
+		data TEXT NOT NULL,
+		current_save_id INTEGER,
+		staged_save_id INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_subroom_room ON subroom (room_id)`,
+	// Room saves (migrations/0008_subroom_saves.sql). A save is its own entity with a
+	// globally-unique, autoincrementing `SubRoomDataSaveId` — the same reason subrooms got
+	// their own table in 0007. It HAS to be global because a subroom points at saves by
+	// bare id: `current_save_id` is the live/published save the loader downloads,
+	// `staged_save_id` the creator's unpublished one. Per-subroom numbering would make
+	// every subroom's first save id 1 and those pointers ambiguous.
+	//
+	// `data` holds the save's client shape minus its two id fields; the columns are
+	// authoritative and are re-injected on read, exactly how `subroom` treats its own ids.
+	// A subroom's `CurrentSave` is inlined from `current_save_id` on every read and is
+	// never stored in the subroom blob.
+	//
+	// Part of this DDL rather than its own export: reading a subroom joins this table, so
+	// applying one without the other yields a schema that can't serve a room.
+	`CREATE TABLE IF NOT EXISTS subroom_save (
+		sub_room_data_save_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		sub_room_id INTEGER NOT NULL,
+		data TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_subroom_save_sub ON subroom_save (sub_room_id)`,
 ]
 
 /** A stored room — the parsed JSON blob (full client-facing room response). */
@@ -288,13 +310,109 @@ export function findSubRoom(room: Room, subRoomId: number): SubRoom | undefined 
 
 /** Fields from the client's room-save POST body. */
 export interface SaveSubRoomDataInput {
-	/** Uploaded blob key for this subroom's scene data (becomes the subroom's DataBlob). */
+	/** Uploaded blob key for this subroom's scene data (becomes `CurrentSave.DataBlob`). */
 	subRoomDataFilename?: string
-	/** Uploaded blob key for the room-level data. */
+	/** Uploaded blob key for the room-level METADATA blob (a separate upload). */
 	roomDataFilename?: string
 	description?: string
 	persistenceVersion?: number
 	inventionUsage?: string
+	/** Optional baked-asset id; emitted on the save only when present. */
+	unityAssetId?: string
+}
+
+/**
+ * A subroom's `CurrentSave` — the `SubRoomDataSave` the client reads to find the scene
+ * data blob to download. The loader looks ONLY here: a subroom with no `CurrentSave`
+ * loads nothing, no matter what the (legacy, flat) `DataBlob` field says.
+ */
+export type SubRoomDataSave = Record<string, unknown>
+
+/**
+ * The scene-data blob key the client should download for a subroom. Prefers the
+ * authoritative `CurrentSave.DataBlob` and falls back to the flat `DataBlob` that
+ * subrooms written before `CurrentSave` existed (and the `0001_init.sql` dorm seed)
+ * still carry. Shared so the `match` and `auth` room-instance payloads resolve the
+ * blob the same way the client's own loader does.
+ */
+export function subRoomDataBlob(sub: SubRoom | undefined | null): string {
+	const save = sub?.CurrentSave
+	if (save && typeof save === 'object') {
+		const blob = (save as SubRoomDataSave).DataBlob
+		if (typeof blob === 'string' && blob !== '') return blob
+	}
+	return typeof sub?.DataBlob === 'string' ? sub.DataBlob : ''
+}
+
+/** Fields that vary between a real save and one reconstructed from the legacy shape. */
+interface BuildSaveInput {
+	subRoomId: unknown
+	dataBlob: string
+	persistenceVersion: number
+	savedByAccountId: unknown
+	description: string
+	createdAt: string
+	unityAssetId?: string
+}
+
+/**
+ * Build a `SubRoomDataSave` in the shape the client parses — the reference's `MapSave`
+ * projection. The four array fields are always empty (we neither resolve nor record
+ * referenced Unity assets) but must be PRESENT, and `UnityAssetId` is emitted only when
+ * the save actually carried one, exactly as the reference does. There is deliberately no
+ * `DataBlobHash`: it is commented out of the reference DTO and absent from its output.
+ *
+ * `SavedOnPlatform`/`SavedOnDeviceClass` are 0 — the reference fills them from the saving
+ * player's live platform/device, which the save request doesn't carry and we don't track.
+ *
+ * Shared by the save path and the legacy-shape reconstruction so the two can't drift.
+ */
+function buildSubRoomSave(input: BuildSaveInput): SubRoomDataSave {
+	const save: SubRoomDataSave = {
+		UnitySubAssets: [],
+		ReferencedUnityAssets: [],
+		SubRoomId: input.subRoomId,
+		DataBlob: input.dataBlob,
+		ReferencedUnityAssetIds: [],
+		PersistenceVersion: input.persistenceVersion,
+		OMVersion: 0,
+		UgcSubVersion: 0,
+		SavedByAccountId: input.savedByAccountId,
+		SavedOnPlatform: 0,
+		SavedOnDeviceClass: 0,
+		Description: input.description,
+		Tags: [],
+		ModerationState: 0,
+		CreatedAt: input.createdAt,
+	}
+	if (input.unityAssetId) save.UnityAssetId = input.unityAssetId
+	return save
+}
+
+/**
+ * Build a save row from a subroom stored in the pre-`CurrentSave` shape, where the blob
+ * key sat in the flat `DataBlob`/`DataSavedAt`/`PersistenceVersion` fields. Those
+ * subrooms hold real saved content the client cannot see (it reads `CurrentSave` only),
+ * so they get a save of their own rather than reading as never-saved. Mirrors backfill 2
+ * of migration 0008 — keep the two in sync.
+ *
+ * Returns null when there is genuinely nothing saved, the honest answer for a fresh
+ * subroom.
+ */
+function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
+	const blob = sub.DataBlob
+	if (typeof blob !== 'string' || blob === '') return null
+	const savedAt = typeof sub.DataSavedAt === 'string' ? sub.DataSavedAt : new Date(0).toISOString()
+	return buildSubRoomSave({
+		subRoomId: sub.SubRoomId,
+		dataBlob: blob,
+		persistenceVersion: typeof sub.PersistenceVersion === 'number' ? sub.PersistenceVersion : 0,
+		// The legacy shape never recorded who saved; the subroom's creator is the best
+		// available answer (the save path is owner/co-owner gated).
+		savedByAccountId: sub.CreatorAccountId ?? null,
+		description: '',
+		createdAt: savedAt,
+	})
 }
 
 /**
@@ -320,8 +438,37 @@ export async function saveSubRoomData(
 	// client NREs on a null CreatorAccountId. Only the owner reaches this path.
 	if (sub.CreatorAccountId == null) sub.CreatorAccountId = accountId
 
-	// Point the subroom at the newly-uploaded data blobs and stamp the save.
-	if (input.subRoomDataFilename) sub.DataBlob = input.subRoomDataFilename
+	// Append a new save row and publish it. The blob the loader downloads lives on the
+	// save — a subroom whose current_save_id resolves to nothing loads nothing — so this
+	// never touches the flat DataBlob field. Previous saves stay in the table as history.
+	const previous =
+		sub.CurrentSave && typeof sub.CurrentSave === 'object'
+			? (sub.CurrentSave as SubRoomDataSave)
+			: undefined
+	const priorVersion = previous?.PersistenceVersion
+	const priorBlob = previous?.DataBlob
+	const save = await insertSubRoomSave(
+		db,
+		subRoomId,
+		buildSubRoomSave({
+			subRoomId,
+			// A save that carries no new blob (e.g. a description-only save) keeps the one
+			// the subroom already loads from.
+			dataBlob: input.subRoomDataFilename ?? (typeof priorBlob === 'string' ? priorBlob : ''),
+			persistenceVersion:
+				input.persistenceVersion ?? (typeof priorVersion === 'number' ? priorVersion : 0),
+			savedByAccountId: accountId,
+			// The save comment — empty string, not null, when the save carries none (the
+			// reference's `roomDesc ?? ""`). Also written to the room below.
+			description: input.description ?? '',
+			createdAt: new Date().toISOString(),
+			unityAssetId: input.unityAssetId,
+		})
+	)
+	// Publish it. Staging (AutoPublish:false → staged_save_id) is deliberately not wired
+	// up yet: always publishing is what makes a save actually load.
+	await setCurrentSave(db, subRoomId, Number(save.SubRoomDataSaveId))
+
 	if (input.roomDataFilename) sub.RoomDataBlob = input.roomDataFilename
 	sub.DataSavedAt = new Date().toISOString()
 	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
@@ -434,7 +581,8 @@ export async function createSubRoom(
 		IsSandbox: true,
 		LastModeratedSaveModerationState: 0,
 		ShouldAutoStageSaves: true,
-		StagedSubRoomDataSaveId: null,
+		// Nothing saved yet — the first room save mints one and points current_save_id
+		// at it. Until then the subroom reads with `CurrentSave: null`.
 	})
 	// Refresh the hydrated SubRooms so the returned room includes the one just inserted.
 	await attachSubRooms(db, [room])
@@ -456,10 +604,14 @@ export async function deleteSubRoom(
 	if (!subRooms.some((s) => s.SubRoomId === subRoomId)) return { ok: false, reason: 'not_found' }
 	if (subRooms.length <= 1) return { ok: false, reason: 'last_subroom' }
 
-	await db
-		.prepare('DELETE FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2')
-		.bind(roomId, subRoomId)
-		.run()
+	await db.batch([
+		db
+			.prepare('DELETE FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2')
+			.bind(roomId, subRoomId),
+		// The saves go with it — nothing can reference them once the subroom is gone.
+		// The blobs they point at are left in R2, like a deleted room's images.
+		db.prepare('DELETE FROM subroom_save WHERE sub_room_id = ?1').bind(subRoomId),
+	])
 
 	const room = await getRoomById(db, roomId)
 	if (!room) return { ok: false, reason: 'not_found' }
@@ -484,18 +636,41 @@ interface SubRoomRow {
 	sub_room_id: number
 	room_id: number
 	data: string
+	current_save_id: number | null
+	staged_save_id: number | null
 }
 
-/** Materialize a subroom row into its client shape, with the columns authoritative. */
+/** The columns every subroom read needs — the blob plus its two save pointers. */
+const SUBROOM_COLUMNS = 'sub_room_id, room_id, data, current_save_id, staged_save_id'
+
+/**
+ * Materialize a subroom row into its client shape, with the columns authoritative.
+ * `CurrentSave` is left undefined here and filled in by {@link attachCurrentSaves} — it
+ * lives in `subroom_save`, and resolving it per row would be a query each. Callers must
+ * go through the helpers below so the key is never missing: the client reads the scene
+ * blob from `CurrentSave` and nowhere else, so a subroom without one loads nothing.
+ */
 const parseSubRoomRow = (row: SubRoomRow): SubRoom => ({
 	...(JSON.parse(row.data) as SubRoom),
 	SubRoomId: row.sub_room_id,
 	RoomId: row.room_id,
+	// Served from the column, not the blob — the creator's unpublished save (unused for
+	// now, but the client expects the key present).
+	StagedSubRoomDataSaveId: row.staged_save_id,
 })
 
-/** Serialize a subroom for storage — drop the id/room columns from the JSON blob. */
+/**
+ * Serialize a subroom for storage — drop the id/room columns and the save fields that
+ * are columns or their own table, so the blob never holds a stale copy of either.
+ */
 const serializeSubRoom = (sub: SubRoom, roomId: number): string => {
-	const { SubRoomId: _id, RoomId: _room, ...rest } = sub
+	const {
+		SubRoomId: _id,
+		RoomId: _room,
+		CurrentSave: _save,
+		StagedSubRoomDataSaveId: _staged,
+		...rest
+	} = sub
 	return JSON.stringify({ ...rest, RoomId: roomId })
 }
 
@@ -508,6 +683,45 @@ const serializeRoom = (room: Room): string => {
 	return JSON.stringify(rest)
 }
 
+/**
+ * Fill in each subroom's `CurrentSave` from `subroom_save`, in ONE query for the whole
+ * batch. Every subroom ends up with the key present — null when it points at no save
+ * (never saved) or the pointer dangles — because the client's loader reads it directly.
+ *
+ * `rows` must line up with `subs` positionally; the pointer lives on the row, not the
+ * parsed blob.
+ */
+async function attachCurrentSaves(
+	db: D1Database,
+	subs: SubRoom[],
+	rows: SubRoomRow[]
+): Promise<void> {
+	const saveIds = [...new Set(rows.map((r) => r.current_save_id).filter((id) => id != null))]
+	const byId = new Map<number, SubRoomDataSave>()
+	if (saveIds.length > 0) {
+		const placeholders = saveIds.map((_, i) => `?${i + 1}`).join(',')
+		const { results } = await db
+			.prepare(
+				`SELECT sub_room_data_save_id, sub_room_id, data FROM subroom_save
+				 WHERE sub_room_data_save_id IN (${placeholders})`
+			)
+			.bind(...saveIds)
+			.all<SubRoomSaveRow>()
+		for (const r of results) byId.set(r.sub_room_data_save_id, parseSubRoomSaveRow(r))
+	}
+	subs.forEach((sub, i) => {
+		const id = rows[i]!.current_save_id
+		sub.CurrentSave = id == null ? null : (byId.get(id) ?? null)
+	})
+}
+
+/** Parse subroom rows and resolve their `CurrentSave` in one batched query. */
+async function parseSubRoomRows(db: D1Database, rows: SubRoomRow[]): Promise<SubRoom[]> {
+	const subs = rows.map(parseSubRoomRow)
+	await attachCurrentSaves(db, subs, rows)
+	return subs
+}
+
 /** Attach each room's `SubRooms` array from the subroom table (one batched query). */
 async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 	const ids = rooms.map((r) => Number(r.RoomId)).filter((n) => Number.isFinite(n))
@@ -518,17 +732,18 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 	const placeholders = ids.map((_, i) => `?${i + 1}`).join(',')
 	const { results } = await db
 		.prepare(
-			`SELECT sub_room_id, room_id, data FROM subroom
+			`SELECT ${SUBROOM_COLUMNS} FROM subroom
 			 WHERE room_id IN (${placeholders}) ORDER BY sub_room_id`
 		)
 		.bind(...ids)
 		.all<SubRoomRow>()
+	const subs = await parseSubRoomRows(db, results)
 	const byRoom = new Map<number, SubRoom[]>()
-	for (const r of results) {
+	results.forEach((r, i) => {
 		const list = byRoom.get(r.room_id) ?? []
-		list.push(parseSubRoomRow(r))
+		list.push(subs[i]!)
 		byRoom.set(r.room_id, list)
-	}
+	})
 	for (const room of rooms) room.SubRooms = byRoom.get(Number(room.RoomId)) ?? []
 }
 
@@ -551,19 +766,96 @@ export async function getSubRoom(
 	subRoomId: number
 ): Promise<SubRoom | null> {
 	const row = await db
-		.prepare('SELECT sub_room_id, room_id, data FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2')
+		.prepare(`SELECT ${SUBROOM_COLUMNS} FROM subroom WHERE room_id = ?1 AND sub_room_id = ?2`)
 		.bind(roomId, subRoomId)
 		.first<SubRoomRow>()
-	return row ? parseSubRoomRow(row) : null
+	if (!row) return null
+	return (await parseSubRoomRows(db, [row]))[0]!
 }
 
 /** All of a room's subrooms, ordered by SubRoomId. */
 export async function getSubRooms(db: D1Database, roomId: number): Promise<SubRoom[]> {
 	const { results } = await db
-		.prepare('SELECT sub_room_id, room_id, data FROM subroom WHERE room_id = ?1 ORDER BY sub_room_id')
+		.prepare(`SELECT ${SUBROOM_COLUMNS} FROM subroom WHERE room_id = ?1 ORDER BY sub_room_id`)
 		.bind(roomId)
 		.all<SubRoomRow>()
-	return results.map(parseSubRoomRow)
+	return parseSubRoomRows(db, results)
+}
+
+// ---- Subroom saves --------------------------------------------------------
+
+interface SubRoomSaveRow {
+	sub_room_data_save_id: number
+	sub_room_id: number
+	data: string
+}
+
+/** Materialize a save row, with its two id columns authoritative over the blob. */
+const parseSubRoomSaveRow = (row: SubRoomSaveRow): SubRoomDataSave => ({
+	...(JSON.parse(row.data) as SubRoomDataSave),
+	SubRoomDataSaveId: row.sub_room_data_save_id,
+	SubRoomId: row.sub_room_id,
+})
+
+/** Serialize a save for storage — the id columns own those two fields, not the blob. */
+const serializeSubRoomSave = (save: SubRoomDataSave): string => {
+	const { SubRoomDataSaveId: _id, SubRoomId: _sub, ...rest } = save
+	return JSON.stringify(rest)
+}
+
+/**
+ * Insert a save for a subroom, minting a fresh globally-unique `SubRoomDataSaveId` from
+ * the table's autoincrement sequence. Returns the stored save with its new id.
+ */
+async function insertSubRoomSave(
+	db: D1Database,
+	subRoomId: number,
+	save: SubRoomDataSave
+): Promise<SubRoomDataSave> {
+	const row = await db
+		.prepare(
+			'INSERT INTO subroom_save (sub_room_id, data) VALUES (?1, ?2) RETURNING sub_room_data_save_id'
+		)
+		.bind(subRoomId, serializeSubRoomSave(save))
+		.first<{ sub_room_data_save_id: number }>()
+	return { ...save, SubRoomDataSaveId: row!.sub_room_data_save_id, SubRoomId: subRoomId }
+}
+
+/**
+ * A subroom's save history, newest first. Unlike the old inline model this is real
+ * history: every save is its own row and none are overwritten.
+ */
+export async function getSubRoomSaves(
+	db: D1Database,
+	subRoomId: number
+): Promise<SubRoomDataSave[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT sub_room_data_save_id, sub_room_id, data FROM subroom_save
+			 WHERE sub_room_id = ?1 ORDER BY sub_room_data_save_id DESC`
+		)
+		.bind(subRoomId)
+		.all<SubRoomSaveRow>()
+	return results.map(parseSubRoomSaveRow)
+}
+
+/**
+ * A single save by its globally-unique id, scoped to the subroom that owns it (the
+ * restore-a-save lookup). Null when the id is unknown or belongs to another subroom.
+ */
+export async function getSubRoomSaveById(
+	db: D1Database,
+	subRoomId: number,
+	saveId: number
+): Promise<SubRoomDataSave | null> {
+	const row = await db
+		.prepare(
+			`SELECT sub_room_data_save_id, sub_room_id, data FROM subroom_save
+			 WHERE sub_room_data_save_id = ?1 AND sub_room_id = ?2`
+		)
+		.bind(saveId, subRoomId)
+		.first<SubRoomSaveRow>()
+	return row ? parseSubRoomSaveRow(row) : null
 }
 
 /**
@@ -579,7 +871,23 @@ export async function insertSubRoom(
 		.prepare('INSERT INTO subroom (room_id, data) VALUES (?1, ?2) RETURNING sub_room_id')
 		.bind(roomId, serializeSubRoom(sub, roomId))
 		.first<{ sub_room_id: number }>()
-	return { ...sub, SubRoomId: row!.sub_room_id, RoomId: roomId }
+	const subRoomId = row!.sub_room_id
+	const created: SubRoom = {
+		...sub,
+		SubRoomId: subRoomId,
+		RoomId: roomId,
+		CurrentSave: null,
+		StagedSubRoomDataSaveId: null,
+	}
+	// A copied subroom (room clone, subroom clone) carries the source's save. It gets its
+	// OWN row — a save belongs to exactly one subroom, so sharing the source's id would
+	// make the copy's content follow the source's future saves.
+	if (sub.CurrentSave && typeof sub.CurrentSave === 'object') {
+		const copy = await insertSubRoomSave(db, subRoomId, sub.CurrentSave as SubRoomDataSave)
+		await setCurrentSave(db, subRoomId, Number(copy.SubRoomDataSaveId))
+		created.CurrentSave = copy
+	}
+	return created
 }
 
 /** Overwrite a subroom's stored data blob in place. */
@@ -590,20 +898,35 @@ async function updateSubRoom(db: D1Database, sub: SubRoom): Promise<void> {
 		.run()
 }
 
+/** Point a subroom at its live/published save. */
+async function setCurrentSave(db: D1Database, subRoomId: number, saveId: number): Promise<void> {
+	await db
+		.prepare('UPDATE subroom SET current_save_id = ?2 WHERE sub_room_id = ?1')
+		.bind(subRoomId, saveId)
+		.run()
+}
+
 /**
  * Seed a room together with its subrooms — inserts the room (SubRooms stripped from the
- * blob) and each embedded subroom into the `subroom` table, preserving explicit ids.
- * Used by the migration's data model in tests (mirrors 0007_subrooms.sql's backfill).
+ * blob) and each embedded subroom into the `subroom` table, preserving explicit ids. Any
+ * subroom carrying a `CurrentSave` gets it inserted into `subroom_save` and pointed at,
+ * mirroring 0008's backfill the way this mirrors 0007's.
  */
 export async function seedRoomWithSubRooms(db: D1Database, room: Room): Promise<void> {
 	const roomId = Number(room.RoomId)
 	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
 	await db.prepare('INSERT OR IGNORE INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
 	for (const sub of subRooms) {
+		const subRoomId = Number(sub.SubRoomId)
 		await db
 			.prepare('INSERT INTO subroom (sub_room_id, room_id, data) VALUES (?1, ?2, ?3)')
-			.bind(Number(sub.SubRoomId), roomId, serializeSubRoom(sub, roomId))
+			.bind(subRoomId, roomId, serializeSubRoom(sub, roomId))
 			.run()
+		const seeded = sub.CurrentSave ?? legacySubRoomSave(sub)
+		if (seeded && typeof seeded === 'object') {
+			const save = await insertSubRoomSave(db, subRoomId, seeded as SubRoomDataSave)
+			await setCurrentSave(db, subRoomId, Number(save.SubRoomDataSaveId))
+		}
 	}
 }
 
@@ -628,6 +951,13 @@ export async function deleteRoom(db: D1Database, roomId: number): Promise<void> 
 	await db.batch([
 		db.prepare('DELETE FROM room WHERE room_id = ?1').bind(roomId),
 		db.prepare('DELETE FROM interaction WHERE room_id = ?1').bind(roomId),
+		// Saves first — they're keyed by subroom, so they'd be unreachable afterwards.
+		db
+			.prepare(
+				'DELETE FROM subroom_save WHERE sub_room_id IN (SELECT sub_room_id FROM subroom WHERE room_id = ?1)'
+			)
+			.bind(roomId),
+		db.prepare('DELETE FROM subroom WHERE room_id = ?1').bind(roomId),
 	])
 }
 

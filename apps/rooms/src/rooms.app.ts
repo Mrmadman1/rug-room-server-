@@ -25,6 +25,7 @@ import {
 	getRoomsByCreator,
 	getRoomsByIds,
 	getSimilarRooms,
+	getSubRoomSaves,
 	getVisitedRooms,
 	modifySubRoom,
 	removeCheer,
@@ -1448,34 +1449,50 @@ const app = new Hono<App>()
 		}
 	)
 
-	// A subroom's saved-data versions — the room-history / "restore a save" list, paged as
-	// PagedResultsDTO<SubRoomDataSaveDTO> (`{ Results, TotalResults }`). We don't keep a save
-	// history yet: a save (POST …/data) overwrites the current blob inline on the subroom, so
-	// there are no distinct versions to list — this returns an empty page. The
-	// unityAssetTarget/unityAssetVersion/skip/take query params are accepted and ignored.
+	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
+	// save is its own `subroom_save` row (nothing is overwritten), so this is real
+	// history, newest first, paged by skip/take.
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
 		describeRoute({
 			tags: ['Subrooms'],
 			summary: 'A subroom’s saved-data versions',
 			description: [
-				'The room-history / “restore a save” list, paged as',
-				'`PagedResultsDTO<SubRoomDataSaveDTO>`. We keep no save history — a save (`POST',
-				'…/data`) overwrites the subroom’s current blob inline, so there are no distinct',
-				'versions to list — and this is always an empty page. The',
-				'`unityAssetTarget`/`unityAssetVersion`/`skip`/`take` params are accepted and ignored.',
+				'The room-history / “restore a save” list, newest first. Every room save appends a',
+				'row rather than overwriting, so this is the subroom’s full history; it is empty',
+				'only when the subroom has never been saved.',
+				'`unityAssetTarget`/`unityAssetVersion` are accepted and ignored.',
+				'',
+				'`TotalResults` and `TotalCount` carry the same number: the client’s paged DTO and',
+				'the reference disagree on the name, so both are emitted.',
 			].join(' '),
 			parameters: [
 				roomIdParam,
 				subRoomIdParam,
 				stringQuery('unityAssetTarget', 'Accepted and ignored'),
 				stringQuery('unityAssetVersion', 'Accepted and ignored'),
-				stringQuery('skip', 'Accepted and ignored — the page is always empty'),
-				stringQuery('take', 'Accepted and ignored — the page is always empty'),
+				stringQuery('skip', 'How many saves to skip (default 0)'),
+				stringQuery('take', 'How many saves to return (default all)'),
 			],
-			responses: { 200: json(SubRoomSavesPage, 'Always an empty page') },
+			responses: { 200: json(SubRoomSavesPage, 'The subroom’s saves, newest first') },
 		}),
-		(c) => c.json({ Results: [], TotalResults: 0 })
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			// Scoped through the room so a subroom id from another room can't read its saves.
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room || !findSubRoom(room, subRoomId)) {
+				return c.json({ Results: [], TotalResults: 0, TotalCount: 0 })
+			}
+			const saves = await getSubRoomSaves(c.env.DB, subRoomId)
+
+			const skip = Number.parseInt(c.req.query('skip') ?? '', 10)
+			const take = Number.parseInt(c.req.query('take') ?? '', 10)
+			const from = Number.isNaN(skip) || skip < 0 ? 0 : skip
+			const page = saves.slice(from, Number.isNaN(take) || take < 0 ? undefined : from + take)
+
+			return c.json({ Results: page, TotalResults: saves.length, TotalCount: saves.length })
+		}
 	)
 
 	// Save a subroom's data (room save). Auth-gated (401 with empty body). Editable
@@ -1531,9 +1548,14 @@ const app = new Hono<App>()
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
+			// The client uploads BOTH blobs to `storage` first and sends their keys here:
+			// `SubRoomData` is the scene blob (what the loader downloads), `RoomData` the
+			// metadata blob. `UnityAssetId`/`AutoPublish`/`OwnershipProof` are accepted
+			// and ignored.
 			const body = (await c.req.json().catch(() => ({}))) as {
 				RoomData?: { Filename?: string }
 				SubRoomData?: { Filename?: string }
+				UnityAssetId?: string | null
 				Description?: string
 				PersistenceVersion?: number
 				InventionUsage?: string
@@ -1542,6 +1564,7 @@ const app = new Hono<App>()
 			const updated = await saveSubRoomData(c.env.DB, roomId, subRoomId, accountId, {
 				subRoomDataFilename: body.SubRoomData?.Filename,
 				roomDataFilename: body.RoomData?.Filename,
+				unityAssetId: typeof body.UnityAssetId === 'string' ? body.UnityAssetId : undefined,
 				description: typeof body.Description === 'string' ? body.Description : undefined,
 				persistenceVersion:
 					typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
