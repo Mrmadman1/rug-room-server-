@@ -330,18 +330,21 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	)
 
 	// A single version of an invention (`?inventionId=…&version=…`) — the bare
-	// RRInventionVersion, which carries the blob name the client downloads. Public.
-	// Only the current version exists (nothing writes version history yet), so any
-	// other version number 404s rather than naming a blob that isn't there.
+	// RRInventionVersion, which carries the blob name the client downloads and the
+	// SHA-256 of that blob. Public. Only the current version exists (nothing writes
+	// version history yet), so any other version number 404s rather than naming a
+	// blob that isn't there.
 	.get(
 		'/api/inventions/v1/version',
 		describeRoute({
 			tags: ['Inventions'],
 			summary: 'One version of an invention',
 			description:
-				'The bare `RRInventionVersion`, which carries the blob name the client downloads. ' +
-				'Only the current version exists — nothing writes version history yet — so any ' +
-				'other version number 404s rather than naming a blob that is not there.',
+				'The bare `RRInventionVersion`, which carries the blob name the client downloads ' +
+				'and `BlobHash`, the base64 SHA-256 of that blob (null when the named blob was ' +
+				'never uploaded). Only the current version exists — nothing writes version ' +
+				'history yet — so any other version number 404s rather than naming a blob that ' +
+				'is not there.',
 			parameters: [
 				intQuery('inventionId', 'Invention id; required'),
 				intQuery('version', 'Version number; required'),
@@ -358,7 +361,12 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const versionNumber = Number.parseInt(c.req.query('version') ?? '', 10)
 			if (Number.isNaN(versionNumber)) return c.json({ error: 'version is required' }, 400)
 
-			const version = await getInventionVersion(c.env.DB, inventionId, versionNumber)
+			const version = await getInventionVersion(
+				c.env.DB,
+				c.env.CDN_ASSETS,
+				inventionId,
+				versionNumber
+			)
 			return version === null ? c.notFound() : c.json(version)
 		}
 	)
@@ -704,7 +712,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				return c.json({ error: 'inventionDataFilename is required' }, 400)
 			}
 
-			const invention = await createInvention(c.env.DB, {
+			const invention = await createInvention(c.env.DB, c.env.CDN_ASSETS, {
 				creatorPlayerId: id,
 				inventionDataFilename,
 				name: str(body.name),

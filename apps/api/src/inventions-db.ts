@@ -130,6 +130,37 @@ function inventionBlobName(filename: string): string {
 	return filename.toLowerCase().endsWith('.inv') ? filename : `${filename}.inv`
 }
 
+/** Base64 — the encoding the real API's hash fields (`BlobHash`) come back in. */
+function toBase64(bytes: ArrayBuffer): string {
+	return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+}
+
+/**
+ * The hash of an invention's data blob: its SHA-256, base64-encoded, matching the
+ * real API's `BlobHash`. Read from the checksum the `storage` worker records at
+ * upload time, so this is normally a HEAD with no body transfer; a blob stored
+ * before that (or by anything else) is downloaded and digested instead.
+ *
+ * Null when the blob isn't in the bucket — a metadata-only save names a file that
+ * was never uploaded, and a hash of nothing would be worse than the absent hash the
+ * field already allows for.
+ */
+export async function inventionBlobHash(
+	bucket: R2Bucket,
+	blobName: string
+): Promise<string | null> {
+	const key = `invention/${inventionBlobName(blobName)}`
+	const head = await bucket.head(key)
+	if (head === null) return null
+	const recorded = head.checksums.sha256
+	if (recorded !== undefined) return toBase64(recorded)
+
+	const object = await bucket.get(key)
+	return object === null
+		? null
+		: toBase64(await crypto.subtle.digest('SHA-256', await object.arrayBuffer()))
+}
+
 /**
  * Fields the client supplies on save (camelCase); everything else is defaulted here.
  * `inventionDataFilename` is the one the caller must supply — an invention with no
@@ -163,6 +194,7 @@ export interface NewInvention {
  */
 export async function createInvention(
 	db: D1Database,
+	bucket: R2Bucket,
 	input: NewInvention
 ): Promise<SavedInvention> {
 	// Sequential id: one past the current max (the table starts empty).
@@ -171,6 +203,7 @@ export async function createInvention(
 		.first<{ next: number }>()
 	const inventionId = row?.next ?? 1
 	const now = new Date().toISOString()
+	const blobName = inventionBlobName(input.inventionDataFilename)
 	const invention: SavedInvention = {
 		InventionId: inventionId,
 		ReplicationId: crypto.randomUUID(),
@@ -183,8 +216,8 @@ export async function createInvention(
 			InventionId: inventionId,
 			ReplicationId: crypto.randomUUID(),
 			VersionNumber: 1,
-			BlobName: inventionBlobName(input.inventionDataFilename),
-			BlobHash: null,
+			BlobName: blobName,
+			BlobHash: await inventionBlobHash(bucket, blobName),
 			InstantiationCost: input.instantiationCost ?? 0,
 			LightsCost: input.lightsCost ?? 0,
 			ChipsCost: input.chipsCost ?? 0,
@@ -568,20 +601,38 @@ export async function getInventionsByRoom(
  */
 export async function getInventionVersion(
 	db: D1Database,
+	bucket: R2Bucket,
 	inventionId: number,
 	versionNumber: number
 ): Promise<InventionVersion | null> {
 	const invention = await getInventionById(db, inventionId)
 	if (invention === null) return null
-	return invention.CurrentVersionNumber === versionNumber ? invention.CurrentVersion : null
+	if (invention.CurrentVersionNumber !== versionNumber) return null
+
+	// A version saved before its blob finished uploading (or before we hashed on
+	// save at all) carries no hash. Hash it now and keep the result, so the other
+	// invention endpoints serve it too and this stays a one-time cost per blob.
+	// ModifiedAt is deliberately left alone: reading a version is not an edit.
+	if (invention.CurrentVersion.BlobHash === null) {
+		const hash = await inventionBlobHash(bucket, invention.CurrentVersion.BlobName)
+		if (hash !== null) {
+			invention.CurrentVersion = { ...invention.CurrentVersion, BlobHash: hash }
+			await storeInvention(db, invention)
+		}
+	}
+	return invention.CurrentVersion
 }
 
 /** Persist an edited invention record, bumping ModifiedAt. */
 async function writeInvention(db: D1Database, invention: SavedInvention): Promise<void> {
-	const updated: SavedInvention = { ...invention, ModifiedAt: new Date().toISOString() }
+	await storeInvention(db, { ...invention, ModifiedAt: new Date().toISOString() })
+}
+
+/** Write a record back as it stands — for changes that aren't edits (see above). */
+async function storeInvention(db: D1Database, invention: SavedInvention): Promise<void> {
 	await db
 		.prepare('UPDATE invention SET data = ?1 WHERE id = ?2')
-		.bind(JSON.stringify(updated), invention.InventionId)
+		.bind(JSON.stringify(invention), invention.InventionId)
 		.run()
 }
 

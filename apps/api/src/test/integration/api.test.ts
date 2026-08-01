@@ -110,6 +110,12 @@ async function bearer(sub = '42'): Promise<Record<string, string>> {
 	return { Authorization: `Bearer ${signingInput}.${b64url(sig)}` }
 }
 
+/** Base64 SHA-256 — the form an invention version's `BlobHash` takes. */
+async function base64Sha256(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', bytes)
+	return btoa(String.fromCharCode(...new Uint8Array(digest)))
+}
+
 describe('public endpoints', () => {
 	test('GET /api/config/v1/amplitude', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/config/v1/amplitude`)
@@ -766,6 +772,12 @@ describe('public endpoints', () => {
 	})
 
 	test('GET /api/inventions/v1/version serves the version; unknown versions 404', async () => {
+		// The data file is uploaded (via the storage worker) before the metadata save,
+		// so the version carries its hash from the start. No sha256 recorded on this
+		// object — the api worker digests the blob itself in that case.
+		const data = new Uint8Array([1, 2, 3, 4])
+		await env.CDN_ASSETS.put('invention/2026-07-12/lamp.inv', data)
+
 		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
 			headers: { ...(await bearer('7373')), 'Content-Type': 'application/json' },
@@ -777,7 +789,8 @@ describe('public endpoints', () => {
 		})
 		const { Invention } = (await save.json()) as InventionSaveResult
 
-		// The bare RRInventionVersion — the blob name is what the client downloads.
+		// The bare RRInventionVersion — the blob name is what the client downloads,
+		// BlobHash the base64 SHA-256 of what it will download.
 		const res = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=1`
 		)
@@ -786,6 +799,7 @@ describe('public endpoints', () => {
 			InventionId: Invention.InventionId,
 			VersionNumber: 1,
 			BlobName: '2026-07-12/lamp.inv',
+			BlobHash: await base64Sha256(data),
 			InstantiationCost: 42,
 		})
 
@@ -806,6 +820,44 @@ describe('public endpoints', () => {
 		expect(noVersion.status).toBe(400)
 		const noId = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/version?version=1`)
 		expect(noId.status).toBe(400)
+	})
+
+	test('BlobHash is null until the blob exists, then backfilled onto the invention', async () => {
+		// Saved before the upload landed: nothing to hash, so the field stays null
+		// rather than carrying a hash of something the client can't download.
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('7474')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Late Lamp', inventionDataFilename: '2026-07-12/late.inv' }),
+		})
+		const { Invention, InventionVersion } = (await save.json()) as InventionSaveResult
+		expect(InventionVersion.BlobHash).toBeNull()
+
+		const version = async (): Promise<Record<string, unknown>> => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=1`
+			)
+			return (await res.json()) as Record<string, unknown>
+		}
+		expect((await version()).BlobHash).toBeNull()
+
+		// Once the blob is there the hash resolves — here from the checksum recorded at
+		// upload time (what the storage worker puts), not by digesting the body.
+		const data = new Uint8Array([9, 8, 7])
+		await env.CDN_ASSETS.put('invention/2026-07-12/late.inv', data, {
+			sha256: await crypto.subtle.digest('SHA-256', data),
+		})
+		const hash = await base64Sha256(data)
+		expect((await version()).BlobHash).toBe(hash)
+
+		// And it's kept, so the other invention endpoints serve it too — without the
+		// read counting as an edit (ModifiedAt is untouched).
+		const details = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${Invention.InventionId}`
+		)
+		const stored = (await details.json()) as SavedInvention
+		expect(stored.CurrentVersion.BlobHash).toBe(hash)
+		expect(stored.ModifiedAt).toBe(Invention.ModifiedAt)
 	})
 
 	test('GET /api/inventions/v1/update edits metadata + permission, creator only', async () => {

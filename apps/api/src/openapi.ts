@@ -206,7 +206,10 @@ export const InventionVersionDto = z.object({
 	ReplicationId: z.string(),
 	VersionNumber: z.int(),
 	BlobName: z.string().describe('The `.inv` key in the storage worker‘s bucket'),
-	BlobHash: z.string().nullable(),
+	BlobHash: z
+		.string()
+		.nullable()
+		.describe('Base64 SHA-256 of the blob; null when it was never uploaded'),
 	InstantiationCost: z.int(),
 	LightsCost: z.int(),
 	ChipsCost: z.int(),
