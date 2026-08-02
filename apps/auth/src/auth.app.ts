@@ -24,11 +24,11 @@ import {
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
 
+import { verifyMetaNonce } from './meta-nonce'
 import {
 	CachedLogin,
 	ChangePasswordRequest,
 	ChangePasswordResponse,
-	FakeCachedLogin,
 	form,
 	json,
 	OAuthError,
@@ -48,15 +48,6 @@ import type { App } from './context'
 /** OAuth scopes granted by `/connect/token`. */
 const TOKEN_SCOPE =
 	'offline_access profile rn rn.accounts rn.accounts.gc rn.api rn.chat rn.clubs rn.commerce rn.match.read rn.match.write rn.notify rn.rooms rn.storage'
-
-/** The canned entry served for any Oculus cached-login lookup. See the route below. */
-const FAKE_OCULUS_CACHED_LOGIN = {
-	platform: PlatformType.Oculus,
-	platformId: '1',
-	accountId: 1,
-	lastLoginTime: '2026-07-19T17:13:29.225Z',
-	requirePassword: true,
-} as const
 
 /**
  * Signup caps, enforced on create_account only (never on login — an existing account
@@ -166,8 +157,9 @@ function accountRoles(account: Pick<Account, 'isDeveloper' | 'isModerator'> | nu
 /**
  * The platform an account's `platformId` belongs to. Nothing defaults the `platform`
  * field (see defaultAccount), so an account can carry a platform identity with no
- * platform recorded — and Steam is the only platform whose identity we can prove, so
- * an unset one *is* Steam.
+ * platform recorded — and until Meta verification landed Steam was the only identity
+ * we could prove, so an unset one *is* Steam. Every account bound since records its
+ * platform explicitly; this default only covers those older rows.
  */
 function accountPlatform(account: Pick<Account, 'platform'>): number {
 	return account.platform ?? 0
@@ -180,8 +172,9 @@ function accountPlatform(account: Pick<Account, 'platform'>): number {
  * client is handed an `account_id` it can never log into ("no linked account for this
  * platform identity" on every attempt).
  *
- * `platformId` must be the *proven* identity (the SteamID64 from a verified
- * platform_auth ticket), never the client-supplied `platform_id` field.
+ * `platformId` must be the *proven* identity — the SteamID64 read out of a verified
+ * Steam ticket, or the Meta user id a validated nonce was issued to — never the raw
+ * client-supplied `platform_id` field.
  */
 export function isLinkedToPlatformIdentity(
 	account: Pick<Account, 'platform' | 'platformId'>,
@@ -196,7 +189,7 @@ export function isLinkedToPlatformIdentity(
  * Project a linked account into the client's CachedLogin DTO — the account-picker
  * entry on the login screen. The client posts the chosen `accountId` back as a
  * `grant_type=cached_login`. `requirePassword` is false because platform ownership
- * (the platform_auth ticket) is the credential for a cached login — no prompt.
+ * (the verified `platform_auth`) is the credential for a cached login — no prompt.
  */
 function toCachedLogin(account: Account) {
 	return {
@@ -254,8 +247,6 @@ const app = new Hono<App>()
 				'Filtered to those a `cached_login` grant would actually accept, so an entry here',
 				'is always redeemable. An unknown id yields `[]` (not a 404) and the client falls',
 				'back to a fresh login or create_account.',
-				'EXCEPT platform 1 (Oculus), which is stubbed: it ignores the id and returns one',
-				'canned, non-redeemable entry with `requirePassword: true`.',
 			].join(' '),
 			parameters: [
 				{
@@ -269,27 +260,18 @@ const app = new Hono<App>()
 					name: 'id',
 					in: 'path',
 					required: true,
-					description: 'Platform-native id — a SteamID64 for Steam.',
+					description: 'Platform-native id — a SteamID64 for Steam, a user id for Meta.',
 					schema: { type: 'string' },
 				},
 			],
 			responses: {
-				200: json(
-					CachedLogin.or(FakeCachedLogin).array(),
-					'Matching accounts; `[]` if none. The canned entry for platform 1 (Oculus).'
-				),
+				200: json(CachedLogin.array(), 'Matching accounts; `[]` if none'),
 			},
 		}),
 		async (c) => {
 			const { platform, id } = c.req.param()
 			logger.info('cached login lookup', { platform, id })
 			const platformInt = Number.parseInt(platform, 10)
-			// Oculus has no identity flow yet, so there is nothing in the DB to look up and
-			// the real path would always yield []. Hand back one canned entry instead, so the
-			// Oculus client gets past its login screen. `requirePassword` is true — unlike a
-			// genuine cached login there is no platform ticket behind this, so the client must
-			// prompt. Delete this branch once Oculus platform auth lands.
-			if (platformInt === PlatformType.Oculus) return c.json([FAKE_OCULUS_CACHED_LOGIN])
 			const accounts = await getAccountsByPlatformId(c.env.DB, id)
 			// Offer only accounts the `cached_login` grant will actually accept — same check.
 			return c.json(
@@ -345,11 +327,12 @@ const app = new Hono<App>()
 				'`password` becomes the login credential. Subject to two independent signup caps,',
 				'per verified platform id and per signup IP (`MAX_ACCOUNTS_PER_PLATFORM_ID` /',
 				'`MAX_ACCOUNTS_PER_IP`; either disabled by setting it to 0). If it asserts a',
-				'`platform`, that platform must be Steam and `platform_auth` must verify.',
+				'`platform`, that platform must be verifiable (Steam or Meta) and its `platform_auth`',
+				'must verify.',
 				'',
 				'**`cached_login`** — logs into an already-linked account using platform ownership as',
-				'the credential; no password. Requires a Steam `platform_auth` ticket, and the posted',
-				'`account_id` must be linked to exactly the identity that ticket proves. An account',
+				'the credential; no password. Requires a verifying `platform_auth`, and the posted',
+				'`account_id` must be linked to exactly the identity it proves. An account',
 				'with no stored platform identity cannot be cached-logged-into.',
 				'',
 				'**`refresh_token`** — redeems a stored single-use refresh token, rotating it. The',
@@ -360,10 +343,14 @@ const app = new Hono<App>()
 				'matching `password`. An account with no stored hash cannot be logged into at all,',
 				'which is what closes id/username-only takeover.',
 				'',
-				'**Platform verification.** Steam (platform `0`) is the only platform that can be',
-				'verified, via its signed `platform_auth` ticket, so any grant authenticating by',
-				'platform identity must be Steam. The verified SteamID64 replaces the client-supplied',
-				'`platform_id` and is the only value ever written to an account. Password and refresh',
+				'**Platform verification.** Two platforms can be verified, so any grant',
+				'authenticating by platform identity must be one of them, and only a verified id is',
+				'ever written to an account. Steam (`0`) posts a Steam-signed `platform_auth` ticket,',
+				'checked offline; the SteamID64 it carries replaces the client-supplied `platform_id`.',
+				'Meta/Oculus (`1`) posts `platform_auth` as `{"Nonce":…,"AppId":…}`, which recflare',
+				'sends to Meta together with the posted `platform_id` — validation is what binds the',
+				'nonce to that user id, so a spoofed id fails. Meta logins therefore need the app',
+				'secret (`META_APP_SECRET`) and answer 500 when it is unset. Password and refresh',
 				'grants carry their own credential and are not gated this way.',
 				'',
 				'**Roles.** The token embeds a `role` claim from the account, so developer/moderator',
@@ -378,13 +365,17 @@ const app = new Hono<App>()
 				400: json(
 					OAuthError,
 					[
-						'Unusable grant: bad credentials, an unverifiable or non-Steam platform, an',
+						'Unusable grant: bad credentials, an unverifiable platform or platform_auth, an',
 						'invalid/expired refresh token, a missing account identifier, or a signup cap reached',
 					].join(' ')
 				),
 				500: json(
 					OAuthError,
-					'JWT_SECRET is unset — a token is refused rather than signed with an empty key'
+					[
+						'The server is missing a secret it cannot proceed without: JWT_SECRET (a token is',
+						'refused rather than signed with an empty key) or, on a Meta login, META_APP_SECRET',
+						'(no nonce can be validated without it).',
+					].join(' ')
 				),
 			},
 		}),
@@ -419,41 +410,93 @@ const app = new Hono<App>()
 			// login; both feed the per-IP signup cap. Absent (empty) outside the CF edge.
 			const clientIp = c.req.header('cf-connecting-ip') ?? ''
 
-			// A platform-authenticated login proves who you are with the platform itself,
-			// and we can ONLY verify Steam (platform 0) — via its Steam-signed platform_auth
-			// ticket. So those logins must be Steam:
-			//   - cached_login authenticates purely by platform identity → always Steam-only.
-			//   - create_account that asserts a platform is rejected unless it's Steam, since
-			//     we won't bind an identity we can't prove. (create_account with NO platform
-			//     is the password-account path — allowed, but it binds no platformId.)
-			// The verified SteamID64 replaces the unauthenticated `platform_id` field and is
-			// the ONLY value ever written to an account's `platformId`. Credential (password)
-			// and refresh_token grants carry their own credential and aren't gated here.
-			let verifiedSteamId: string | null = null
+			// A platform-authenticated login proves who you are with the platform itself, and
+			// we can verify exactly two: Steam (0), from its Steam-signed platform_auth ticket,
+			// and Meta/Oculus (1), by asking Meta to validate the nonce in platform_auth. So
+			// those logins must be one of those two:
+			//   - cached_login authenticates purely by platform identity → always gated.
+			//   - create_account that asserts a platform is rejected unless we can verify that
+			//     platform, since we won't bind an identity we can't prove. (create_account
+			//     with NO platform is the password-account path — allowed, but binds no
+			//     platformId.)
+			// The verified id is the ONLY value ever written to an account's `platformId`.
+			// Credential (password) and refresh_token grants carry their own credential and
+			// aren't gated here.
+			//
+			// The two platforms prove the id in opposite directions, which is why they can't
+			// share a code path: Steam's ticket *carries* a SteamID64 we read out and trust,
+			// so the posted `platform_id` is discarded. Meta's nonce carries nothing — it is
+			// validated *against* the posted `platform_id`, so that field is an input, and a
+			// spoofed one fails validation rather than being ignored. Either way what lands in
+			// `platformId` below is proven, never the raw client-supplied field.
+			let verifiedPlatformId: string | null = null
+			let verifiedPlatform: number | null = null
 			const platformAsserted = !Number.isNaN(platformInt)
 			if (grantType === 'cached_login' || (grantType === 'create_account' && platformAsserted)) {
-				if (platformInt !== PlatformType.Steam) {
-					return c.json(
-						{
-							error: 'invalid_grant',
-							error_description: 'unsupported platform; only Steam can be verified',
-						},
-						400
-					)
-				}
 				const platformAuth = typeof body.platform_auth === 'string' ? body.platform_auth : ''
-				const verified = platformAuth ? await verifySteamTicket(platformAuth) : null
-				if (!verified) {
+				if (platformInt === PlatformType.Steam) {
+					const verified = platformAuth ? await verifySteamTicket(platformAuth) : null
+					if (!verified) {
+						return c.json(
+							{
+								error: 'invalid_grant',
+								error_description: 'invalid or missing platform_auth ticket',
+							},
+							400
+						)
+					}
+					verifiedPlatform = PlatformType.Steam
+					verifiedPlatformId = verified.steamId
+				} else if (platformInt === PlatformType.Oculus) {
+					// Verifying a Meta login needs the app secret. Without it every Meta player is
+					// locked out, which is an operator misconfiguration and not the client's fault
+					// — so it answers 500, the same way an unset JWT_SECRET does below, rather than
+					// blaming the credential. (We never fall back to trusting the posted id: that
+					// would let anyone log into any Meta-linked account by naming its user id.)
+					// `.get()` throws when the secret doesn't exist in the store at all (as
+					// opposed to holding an empty/placeholder value) — the same misconfiguration
+					// from the player's side, so it takes the same branch rather than a 500 from
+					// the error handler with nothing useful in it.
+					const appSecret = await c.env.META_APP_SECRET.get().catch(() => '')
+					if (appSecret === '') {
+						logger.error('refusing a Meta login: META_APP_SECRET is empty')
+						return c.json(
+							{
+								error: 'server_error',
+								error_description: 'Meta platform verification is not configured',
+							},
+							500
+						)
+					}
+					const verified = await verifyMetaNonce(platformAuth, platformId, appSecret)
+					if (!verified.ok) {
+						// The reason is for the operator; the client is told only that it was
+						// rejected. A wrong app secret and a stale nonce look identical from the
+						// client side, so this log is the only way to tell them apart.
+						logger.info('meta nonce verification failed', {
+							platformId,
+							reason: verified.reason,
+						})
+						return c.json(
+							{
+								error: 'invalid_grant',
+								error_description: 'invalid or missing platform_auth nonce',
+							},
+							400
+						)
+					}
+					verifiedPlatform = PlatformType.Oculus
+					verifiedPlatformId = verified.identity.userId
+				} else {
 					return c.json(
 						{
 							error: 'invalid_grant',
-							error_description: 'invalid or missing platform_auth ticket',
+							error_description: 'unsupported platform; only Steam and Meta can be verified',
 						},
 						400
 					)
 				}
-				verifiedSteamId = verified.steamId
-				platformId = verified.steamId
+				platformId = verifiedPlatformId
 			}
 
 			// Resolve the account this token is for:
@@ -482,10 +525,12 @@ const app = new Hono<App>()
 				const maxPerIp = intVar(c.env.MAX_ACCOUNTS_PER_IP, DEFAULT_MAX_ACCOUNTS_PER_IP)
 				if (
 					maxPerPlatformId > 0 &&
-					verifiedSteamId !== null &&
-					(await countAccountsByPlatformId(c.env.DB, verifiedSteamId)) >= maxPerPlatformId
+					verifiedPlatformId !== null &&
+					(await countAccountsByPlatformId(c.env.DB, verifiedPlatformId)) >= maxPerPlatformId
 				) {
-					logger.info('signup rejected: platform account limit', { platformId: verifiedSteamId })
+					logger.info('signup rejected: platform account limit', {
+						platformId: verifiedPlatformId,
+					})
 					return c.json(
 						{
 							error: 'invalid_grant',
@@ -509,14 +554,14 @@ const app = new Hono<App>()
 					)
 				}
 
-				// Bind the platform identity ONLY when a Steam ticket proved it. That bound
-				// `platformId` (the SteamID64) is what a later cached login is checked against,
-				// so only this Steam user can log back into the account. A password/anonymous
-				// create_account (no platform) binds no platformId.
+				// Bind the platform identity ONLY when the platform proved it (a Steam ticket or
+				// a Meta-validated nonce). That bound `platformId` is what a later cached login
+				// is checked against, so only that platform user can log back into the account.
+				// A password/anonymous create_account (no platform) binds no platformId.
 				const account = await createAccount(c.env.DB, {
 					platforms: platformInt || 0,
-					platform: verifiedSteamId !== null ? 0 : undefined,
-					platformId: verifiedSteamId ?? undefined,
+					platform: verifiedPlatform ?? undefined,
+					platformId: verifiedPlatformId ?? undefined,
 					lastLoginTime: new Date().toISOString(),
 					deviceId: deviceId || undefined,
 					deviceClass: deviceId ? deviceClass : undefined,
@@ -553,8 +598,9 @@ const app = new Hono<App>()
 				// ownership is the credential; no password needed). An account with no stored
 				// platform identity can't be cached-logged-into and must use a fresh login.
 				//
-				// NB: `platform_id` here is the Steam-verified SteamID64 (set from the ticket
-				// above), never the client-supplied field. See steam-ticket.ts.
+				// NB: `platform_id` here is the verified identity set above — the SteamID64 from
+				// the ticket, or the Meta user id the nonce validated against — never the raw
+				// client-supplied field. See steam-ticket.ts and meta-nonce.ts.
 				//
 				const postedId = typeof body.account_id === 'string' ? body.account_id.trim() : ''
 				const account = /^\d+$/.test(postedId) ? await getAccount(c.env.DB, Number(postedId)) : null

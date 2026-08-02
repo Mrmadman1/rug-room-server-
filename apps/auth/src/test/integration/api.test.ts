@@ -31,12 +31,23 @@ const ORIENTATION_SCENE = 'c79709d8-a31b-48aa-9eb8-cc31ba9505e8'
 // accounts the login tests authenticate as (42, 77).
 const LOGIN_PASSWORD = 'correct-horse'
 
+// Meta (Oculus) logins verify their nonce by calling graph.oculus.com authenticated
+// as the app, so the tests seed an app secret and stub that call — see metaLogin.
+const META_APP_SECRET = 'test-meta-app-secret'
+const META_APP_ID = '1232175103309633'
+const META_USER_ID = '27061366730207360'
+const META_NONCE = 'xOUoGXJtC2N31BRDtoWJqBNo81o3DwfbQC57i9ApaiBIqkgmyMOgMYIng7c5jL5I'
+/** Set in beforeAll; needed to overwrite the secret in the not-configured test. */
+let metaSecretId: string
+
 // Apply the accounts schema so create_account can persist (mirrors the migration),
 // and seed the Orientation room (owned by the rooms worker) so signup can place
 // the new player there.
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
+	// The Meta app secret, likewise — a Meta login is refused outright without one.
+	metaSecretId = await adminSecretsStore(env.META_APP_SECRET).create(META_APP_SECRET)
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of REFRESH_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (owned by the rooms worker) — signup seeds the Orientation row.
@@ -101,6 +112,38 @@ async function postToken(
 	return { status: res.status, json: (await res.json()) as Record<string, unknown> }
 }
 
+/**
+ * POST a Meta grant to /connect/token with graph.oculus.com stubbed to answer
+ * `is_valid`. The worker runs in this isolate, so replacing the global fetch is what
+ * stands in for Meta — `verifyMetaNonce` resolves `globalThis.fetch` per call for
+ * exactly this reason. Returns the graph requests the worker made alongside the
+ * response, so a test can assert WHICH user id the nonce was validated against.
+ */
+async function metaLogin(
+	body: string,
+	isValid: boolean
+): Promise<{ status: number; json: Record<string, unknown>; graphCalls: URLSearchParams[] }> {
+	const graphCalls: URLSearchParams[] = []
+	const realFetch = globalThis.fetch
+	globalThis.fetch = (async (url: string, init?: { body?: string }) => {
+		if (url.startsWith('https://graph.oculus.com/')) {
+			graphCalls.push(new URLSearchParams(init?.body ?? ''))
+			return Response.json({ is_valid: isValid })
+		}
+		return realFetch(url, init)
+	}) as unknown as typeof fetch
+	try {
+		return { ...(await postToken(body)), graphCalls }
+	} finally {
+		globalThis.fetch = realFetch
+	}
+}
+
+/** The `platform_auth` payload a Meta client posts, as observed from a live login. */
+function metaPlatformAuth(): string {
+	return JSON.stringify({ Nonce: META_NONCE, AppId: META_APP_ID, Source: 'logged in user' })
+}
+
 /** POST a form-urlencoded body to changepassword with an optional bearer token. */
 function changePassword(body: string, token?: string): Promise<Response> {
 	return exports.default.fetch(`${ORIGIN}/account/me/changepassword`, {
@@ -122,32 +165,25 @@ describe('auth worker routes', () => {
 		expect(await res.text()).toBe('"AA=="')
 	})
 
-	// Platform 0 (Steam), not 1 — platform 1 is Oculus, which is stubbed below.
-	test('GET /cachedlogin/forplatformid/:platform/:id returns [] (no cached login)', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/0/abc123`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
-	})
+	test.each([
+		['0 (Steam)', 0],
+		['1 (Meta)', 1],
+	])(
+		'GET /cachedlogin/forplatformid/%s/:id returns [] for an unknown id',
+		async (_label, platform) => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/cachedlogin/forplatformid/${platform}/abc123`
+			)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual([])
+		}
+	)
 
-	// Oculus is stubbed: no DB lookup, one canned entry whatever the id.
-	test('GET /cachedlogin/forplatformid/1/:id returns the canned Oculus entry', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/1/anything`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([
-			{
-				platform: 1,
-				platformId: '1',
-				accountId: 1,
-				lastLoginTime: '2026-07-19T17:13:29.225Z',
-				requirePassword: true,
-			},
-		])
-	})
-
-	// Only Steam (platform 0) can be verified (via its signed platform_auth ticket),
-	// so every OTHER platform is rejected on the platform-authenticated grants — we
-	// won't bind or authorize an identity we can't prove.
-	test.each([1, 2, 3, 4, 5, 6, 7, 8])(
+	// Only Steam (0) and Meta (1) can be verified — Steam by its signed platform_auth
+	// ticket, Meta by validating its nonce with Meta. Every OTHER platform is rejected
+	// on the platform-authenticated grants: we won't bind or authorize an identity we
+	// can't prove.
+	test.each([2, 3, 4, 5, 6, 7, 8])(
 		'create_account rejects unverifiable platform %i',
 		async (platform) => {
 			const res = await postToken(
@@ -155,11 +191,11 @@ describe('auth worker routes', () => {
 			)
 			expect(res.status).toBe(400)
 			expect(res.json.error).toBe('invalid_grant')
-			expect(res.json.error_description).toContain('only Steam')
+			expect(res.json.error_description).toContain('only Steam and Meta')
 		}
 	)
 
-	test.each([1, 2, 3, 4, 5, 6, 7, 8])(
+	test.each([2, 3, 4, 5, 6, 7, 8])(
 		'cached_login rejects unverifiable platform %i',
 		async (platform) => {
 			const res = await postToken(
@@ -167,7 +203,7 @@ describe('auth worker routes', () => {
 			)
 			expect(res.status).toBe(400)
 			expect(res.json.error).toBe('invalid_grant')
-			expect(res.json.error_description).toContain('only Steam')
+			expect(res.json.error_description).toContain('only Steam and Meta')
 		}
 	)
 
@@ -189,6 +225,111 @@ describe('auth worker routes', () => {
 		expect(res.status).toBe(400)
 		expect(res.json.error).toBe('invalid_grant')
 		expect(res.json.error_description).toContain('platform_auth')
+	})
+
+	test('Meta create_account requires a platform_auth nonce', async () => {
+		// platform=1 with no nonce must not bind the spoofable platform_id field.
+		const res = await postToken(`grant_type=create_account&platform=1&platform_id=${META_USER_ID}`)
+		expect(res.status).toBe(400)
+		expect(res.json.error).toBe('invalid_grant')
+		expect(res.json.error_description).toContain('platform_auth')
+	})
+
+	test('Meta create_account binds the id Meta validated the nonce against', async () => {
+		const res = await metaLogin(
+			`grant_type=create_account&platform=1&platform_id=${META_USER_ID}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}&device_id=meta-device`,
+			true
+		)
+		expect(res.status).toBe(200)
+
+		// The nonce was validated against the posted user id, authenticated as the app.
+		expect(res.graphCalls).toHaveLength(1)
+		expect(res.graphCalls[0].get('nonce')).toBe(META_NONCE)
+		expect(res.graphCalls[0].get('user_id')).toBe(META_USER_ID)
+		expect(res.graphCalls[0].get('access_token')).toBe(`OC|${META_APP_ID}|${META_APP_SECRET}`)
+
+		// The account is bound to platform 1 with that id — which is what makes the
+		// cached-login picker offer it, and the cached_login grant accept it.
+		const payload = decodePayload(res.json.access_token as string)
+		const accountId = Number(payload.sub)
+		const lookup = await exports.default.fetch(
+			`${ORIGIN}/cachedlogin/forplatformid/1/${META_USER_ID}`
+		)
+		const linked = (await lookup.json()) as Array<Record<string, unknown>>
+		expect(linked).toContainEqual(
+			expect.objectContaining({ accountId, platform: 1, platformId: META_USER_ID })
+		)
+		// Platform ownership is the credential, so the client is not asked for a password.
+		expect(linked.every((a) => a.requirePassword === false)).toBe(true)
+	})
+
+	test('Meta create_account is rejected when Meta does not vouch for the nonce', async () => {
+		const res = await metaLogin(
+			`grant_type=create_account&platform=1&platform_id=${META_USER_ID}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+			false
+		)
+		expect(res.status).toBe(400)
+		expect(res.json.error).toBe('invalid_grant')
+		expect(res.json.error_description).toContain('platform_auth')
+	})
+
+	test('Meta cached_login logs into the linked account with no password', async () => {
+		const userId = '27061366730209999'
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 5150,
+					username: 'MetaPlayer',
+					platform: 1,
+					platformId: userId,
+				})
+			)
+			.run()
+		const res = await metaLogin(
+			`grant_type=cached_login&account_id=5150&platform=1&platform_id=${userId}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+			true
+		)
+		expect(res.status).toBe(200)
+		expect(res.graphCalls[0].get('user_id')).toBe(userId)
+		const payload = decodePayload(res.json.access_token as string)
+		expect(payload.sub).toBe('5150')
+	})
+
+	test('a Meta user id cannot log into an account it is not linked to', async () => {
+		// The Meta account seeded above, claimed by a different (but genuinely proven)
+		// Meta user. Even with a nonce Meta vouches for, the identity has to match the
+		// account's stored one.
+		const res = await metaLogin(
+			`grant_type=cached_login&account_id=5150&platform=1&platform_id=${META_USER_ID}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+			true
+		)
+		expect(res.status).toBe(400)
+		expect(res.json.error_description).toContain('no linked account')
+	})
+
+	test('a Meta login is refused (500) when META_APP_SECRET is unset', async () => {
+		// An operator misconfiguration, not a bad credential: without the secret no nonce
+		// can be validated, and the alternative — trusting the posted platform_id — would
+		// let anyone log into any Meta-linked account by naming its user id.
+		const admin = adminSecretsStore(env.META_APP_SECRET)
+		await admin.update('', metaSecretId)
+		try {
+			const res = await metaLogin(
+				`grant_type=create_account&platform=1&platform_id=${META_USER_ID}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true
+			)
+			expect(res.status).toBe(500)
+			expect(res.json.error).toBe('server_error')
+			// Nothing was asked of Meta, and nothing was trusted.
+			expect(res.graphCalls).toHaveLength(0)
+		} finally {
+			await admin.update(META_APP_SECRET, metaSecretId)
+		}
 	})
 
 	test('cachedlogin/forplatformid returns the DTO for a bound (Steam) account', async () => {

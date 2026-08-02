@@ -42,7 +42,7 @@ route without documenting it fails rather than silently shipping an incomplete s
   without matchmaking. A posted `password` becomes the login credential.
 - **`cached_login`** — logs into an already-linked account using platform ownership as
   the credential; no password. The posted `account_id` must be linked to exactly the
-  identity the Steam ticket proves.
+  identity `platform_auth` proves.
 - **`refresh_token`** — redeems a stored single-use refresh token, rotating it.
   30-day TTL; platform and platform id come from what was stored at issue time.
 - **`password`** — the fallback for any unrecognised or absent `grant_type`. Identifies
@@ -54,15 +54,26 @@ Access tokens live for 1 hour (`TOKEN_TTL_SECONDS` in `@repo/jwt`) and carry a `
 claim, so developer/moderator powers refresh on every login and every refresh grant.
 Grant those flags with `runx admin grant-developer` / `grant-moderator`.
 
-### Steam is the only verifiable platform
+### Verifiable platforms: Steam and Meta
 
-`platform_auth` tickets are verified **offline** — `src/steam-ticket.ts` parses the
-ticket and checks Steam's signature against Steam's system public key. No publisher
-Web API key, no network call. Steam (platform `0`) is therefore the only platform
-whose identity can be proven, so any grant that authenticates _by platform identity_
-(`cached_login`, and `create_account` when it asserts a platform) must be Steam. The
-verified SteamID64 replaces the client-supplied `platform_id` and is the only value
-ever written to an account's `platformId`.
+Only an identity we can _prove_ is ever bound to an account, so any grant that
+authenticates _by platform identity_ (`cached_login`, and `create_account` when it
+asserts a platform) must be a platform we can verify. Two are:
+
+- **Steam (`0`)** — `src/steam-ticket.ts` parses the `platform_auth` ticket and checks
+  Steam's signature against Steam's system public key. Verified **offline**: no
+  publisher Web API key, no network call. The SteamID64 the ticket carries replaces the
+  client-supplied `platform_id`.
+- **Meta / Oculus (`1`)** — `src/meta-nonce.ts` posts the nonce in `platform_auth` to
+  `graph.oculus.com/user_nonce_validate`, authenticated as the app with
+  `META_APP_SECRET`. Meta's nonce proves nothing by itself; validation is what binds it
+  to a user id, so here the posted `platform_id` is an _input_ to the check and a
+  spoofed one fails. This means an outbound request on every Meta login, and no Meta
+  login at all without the app secret — an unset `META_APP_SECRET` answers 500 rather
+  than falling back to trusting the client.
+
+Everything else is refused. Whichever platform, the value written to an account's
+`platformId` is the verified one, never the raw `platform_id` field.
 
 ## Signup caps
 
@@ -82,6 +93,7 @@ small private server, or when a shared network is being locked out.
 | -------------------- | ------------- | ------------------------------------------------------ |
 | `DB`                 | D1            | Shared `recflare` database; this worker owns `account` |
 | `JWT_SECRET`         | Secrets Store | Shared HS256 signing key                               |
+| `META_APP_SECRET`    | Secrets Store | Meta app secret; only used to validate a login nonce   |
 | `MAX_ACCOUNTS_PER_*` | vars          | Optional signup caps; read via `intVar`                |
 
 Migrations live in `migrations/` and are tracked in their own `d1_migrations_auth`
@@ -109,12 +121,19 @@ wrangler secrets-store store create recflare --scopes workers
 
 # Set the shared signing key (prompted for the value)
 wrangler secrets-store secret create <store-id> --name JWT_SECRET --scopes workers --remote
+
+# Set the Meta app secret. Required for the deploy to succeed even with no Meta app —
+# a binding to a missing secret is a deploy error. Any placeholder will do; Meta
+# sign-ins then answer 500 until it holds the real value.
+wrangler secrets-store secret create <store-id> --name META_APP_SECRET --scopes workers --remote
 ```
 
-For local `wrangler dev`, seed a local value (omit `--remote`) so `.get()` resolves:
+For local `wrangler dev`, seed local values (omit `--remote`) so `.get()` resolves:
 
 ```sh
 wrangler secrets-store secret create local --name JWT_SECRET --value <dev-key> --scopes workers
+wrangler secrets-store secret create local --name META_APP_SECRET --value <app-secret> --scopes workers
 ```
 
-Rotating the store value invalidates all existing tokens (clients re-authenticate).
+Rotating the signing key invalidates all existing tokens (clients re-authenticate).
+The Meta secret is read per request, so updating it takes effect without a redeploy.

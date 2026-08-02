@@ -69,8 +69,8 @@ export const PlatformType = {
 export type PlatformType = (typeof PlatformType)[keyof typeof PlatformType]
 
 /**
- * A PlatformType by value. Only Steam can actually be verified — see the
- * platform-auth notes on `POST /connect/token`.
+ * A PlatformType by value. Only Steam and Oculus (Meta) can actually be verified —
+ * see the platform-auth notes on `POST /connect/token`.
  */
 export const PlatformTypeSchema = z
 	.union([z.literal(-1), z.int().min(0).max(Math.max(...Object.values(PlatformType)))])
@@ -83,20 +83,14 @@ export const PlatformTypeSchema = z
 /** One entry on the client's login screen, from `toCachedLogin`. */
 export const CachedLogin = z.object({
 	platform: PlatformTypeSchema,
-	platformId: z.string().describe('Platform-native id (a SteamID64 for Steam); "" if unlinked'),
+	platformId: z
+		.string()
+		.describe('Platform-native id (a SteamID64 for Steam, a user id for Meta); "" if unlinked'),
 	accountId: z.int().describe('Post this back as `account_id` on a cached_login grant'),
 	lastLoginTime: z.iso.datetime().describe("Falls back to the account's createdAt"),
 	requirePassword: z
 		.literal(false)
 		.describe('Always false — platform ownership is the credential for a cached login'),
-})
-
-/**
- * The stubbed Oculus cached login. Same shape as `CachedLogin`, but `requirePassword`
- * is true — nothing proves platform ownership, so the client has to prompt.
- */
-export const FakeCachedLogin = CachedLogin.extend({
-	requirePassword: z.literal(true).describe('Always true — the entry is not platform-backed'),
 })
 
 /** OAuth-shaped error body. Always HTTP 400 except `server_error` (500). */
@@ -139,11 +133,17 @@ export const TokenRequest = z.object({
 	platform_id: z
 		.string()
 		.optional()
-		.describe('Unverified; ignored in favour of the Steam-verified id where a ticket is required'),
+		.describe(
+			'On Steam, unverified and ignored in favour of the id the ticket carries. On Meta it is ' +
+				'the id the nonce is validated against, so it must be the real (numeric) user id'
+		),
 	platform_auth: z
 		.string()
 		.optional()
-		.describe('Steam session ticket. Required for cached_login and platform create_account'),
+		.describe(
+			'Platform proof, required for cached_login and platform create_account. Steam: ' +
+				'`{"Ticket":"<hex>","AppId":…}`. Meta: `{"Nonce":…,"AppId":…,"Source":…}`'
+		),
 	refresh_token: z.string().optional().describe('Required on a refresh_token grant'),
 	device_id: z
 		.string()

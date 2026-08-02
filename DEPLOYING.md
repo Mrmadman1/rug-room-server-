@@ -104,6 +104,24 @@ binds it so tokens signed by `auth` verify everywhere. Record its id in `.env` a
 wrangler secrets-store secret create <store-id> --name JWT_SECRET --scopes workers --remote
 ```
 
+The same store also holds `META_APP_SECRET`, the app secret from your app's page in
+the Meta developer dashboard (developers.meta.com). Only the `auth` worker binds it,
+and only to authenticate itself to Meta when validating a headset login's nonce —
+unlike Steam's ticket, which verifies offline, a Meta login cannot be checked without
+it. Create it too:
+
+```bash
+wrangler secrets-store secret create <store-id> --name META_APP_SECRET --scopes workers --remote
+```
+
+> ⚠️ Both secrets must **exist** in the store or `just deploy` fails on the `auth`
+> worker — a binding to a missing secret is a deploy error. If you have no Meta app,
+> create `META_APP_SECRET` with any placeholder value: Meta sign-ins then fail with a
+> 500 ("Meta platform verification is not configured") and nothing else is affected.
+> Steam and password sign-ins are unaffected either way. Put the real value in later
+> with `wrangler secrets-store secret update` — no redeploy needed, the worker reads
+> the secret per request.
+
 Then apply the schema. `just migrate` will set up the database and populate it with data. This runs non-interactively, so be careful!
 
 ```bash
