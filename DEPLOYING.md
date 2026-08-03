@@ -217,6 +217,52 @@ single address, so raise it (or set it to `0`) if real players report being lock
 > `just deploy`. `.env` is the durable place. Real secrets don't belong there either — they
 > go in the Cloudflare Secrets Store, like the shared `JWT_SECRET` above.
 
+### Signing up on the website (Turnstile)
+
+Players get an account by launching the game, which needs no setup. The website can create
+one too — that path has no platform identity behind it, so it runs behind a
+[Turnstile](https://developers.cloudflare.com/turnstile/) bot check and is **closed until
+you configure one**. Two steps, both one-time:
+
+1. Create the widget: Cloudflare dashboard → **Turnstile** → **Add widget**, mode
+   **Managed**, hostnames your domain (add `localhost` if you want it in `just dev` against
+   real keys). It gives you a **site key** and a **secret key**.
+2. Put both in the same Secrets Store the shared `JWT_SECRET` lives in — they're the switch
+   that opens signup, and store values survive deploys:
+
+   ```bash
+   wrangler secrets-store secret create <store-id> --name TURNSTILE_SITE_KEY \
+     --scopes workers --remote
+   wrangler secrets-store secret create <store-id> --name TURNSTILE_SECRET_KEY \
+     --scopes workers --remote
+   ```
+
+Then `just deploy -F www`. The site key is public — the browser needs it to render the
+widget, and gets it from `GET /api/config` — but it lives next to its secret so signup is
+configured in one place. The secret key never leaves the worker: `/api/signup` verifies the
+token against Turnstile server-side before it calls `auth`.
+
+Signup opens only when **both** resolve. With either missing, `/api/config` reports signup
+closed (the site shows sign-in only) and `POST /api/signup` refuses — a missed step costs
+you the signup form, never an unprotected one. That is also how you turn signup back off:
+`wrangler secrets-store secret delete <store-id> --name TURNSTILE_SECRET_KEY --remote`,
+then redeploy `www` (values are cached per isolate, so a warm worker keeps the old one
+until fresh isolates start). For local dev, seed the same two names into the local store
+from `apps/www` — Turnstile's documented always-passes test keypair
+(`1x00000000000000000000AA` / `1x0000000000000000000000000000000AA`) works there without a
+widget:
+
+```bash
+cd apps/www
+printf '1x00000000000000000000AA' |
+  wrangler secrets-store secret create local --name TURNSTILE_SITE_KEY --scopes workers
+printf '1x0000000000000000000000000000000AA' |
+  wrangler secrets-store secret create local --name TURNSTILE_SECRET_KEY --scopes workers
+```
+
+Both `auth` account caps above still apply on top of the bot check, and the per-IP one is
+the only cap that can see a web signup.
+
 ## Repository Structure
 
 - `apps/` - The service workers, one deployable Worker per subdirectory. Each has

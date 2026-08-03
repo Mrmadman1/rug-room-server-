@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { DISCORD_INVITE, DOWNLOAD_URL, LICENSE_URL, SOURCE_REPO } from '../links'
+import {
+	DISCORD_INVITE,
+	DOWNLOAD_URL,
+	LICENSE_URL,
+	QUEST_DOWNLOAD_URL,
+	SOURCE_REPO,
+} from '../links'
 
 import type { ReactNode } from 'react'
 
@@ -12,6 +18,16 @@ interface SelfAccount {
 	email: string | null
 	/** Whether this session may use admin controls (from the token's role claim). */
 	isAdmin?: boolean
+}
+
+/**
+ * Site config from the BFF (`/api/config`). `signupEnabled` is false when the operator
+ * has no Turnstile keypair configured — web signup runs behind that bot check, so
+ * without it the endpoint is closed and the UI must not offer the form.
+ */
+interface SiteConfig {
+	signupEnabled: boolean
+	turnstileSiteKey: string | null
 }
 
 /**
@@ -85,12 +101,18 @@ function Link({
 export function App() {
 	// undefined = still checking the session; null = signed out.
 	const [account, setAccount] = useState<SelfAccount | null | undefined>(undefined)
+	// undefined until the config lands. Signup is treated as closed until told otherwise,
+	// so a slow (or failed) config fetch can't flash a form the server would refuse.
+	const [config, setConfig] = useState<SiteConfig | undefined>(undefined)
 	const { path, navigate } = useRouter()
 
 	useEffect(() => {
 		api<SelfAccount>('/api/me')
 			.then((me) => setAccount(me))
 			.catch(() => setAccount(null))
+		api<SiteConfig>('/api/config')
+			.then((c) => setConfig(c))
+			.catch(() => setConfig({ signupEnabled: false, turnstileSiteKey: null }))
 	}, [])
 
 	const logout = useCallback(async () => {
@@ -102,12 +124,22 @@ export function App() {
 	return (
 		<>
 			<NavBar account={account} path={path} navigate={navigate} onLogout={logout} />
-			{path === '/login' ? (
-				<LoginPage account={account} navigate={navigate} onAuthed={setAccount} />
+			{path === '/login' || path === '/signup' ? (
+				// One page, two doors. `/signup` exists so the homepage's create-account link
+				// lands on that tab instead of dropping people on sign-in to find it — and so
+				// the URL is linkable. Unknown paths fall back to index.html (see the assets
+				// config in wrangler.jsonc), so a cold load of /signup reaches the SPA.
+				<LoginPage
+					account={account}
+					config={config}
+					initialTab={path === '/signup' ? 'signup' : 'login'}
+					navigate={navigate}
+					onAuthed={setAccount}
+				/>
 			) : path === '/account' ? (
 				<AccountPage account={account} navigate={navigate} onChange={setAccount} />
 			) : (
-				<HomePage />
+				<HomePage account={account} config={config} navigate={navigate} />
 			)}
 			<SiteFooter />
 		</>
@@ -205,12 +237,25 @@ function useSlideshow() {
  * on top of them. Everything about how the thing is built sits below, for whoever
  * scrolls looking for it.
  */
-function HomePage() {
+function HomePage({
+	account,
+	config,
+	navigate,
+}: {
+	account: SelfAccount | null | undefined
+	config: SiteConfig | undefined
+	navigate: Navigate
+}) {
 	const feed = useSlideshow()
+
+	// The signup offer only makes sense to a signed-out visitor when the server would
+	// actually take one. `account === undefined` is still-checking, so it shows nothing
+	// rather than offering an account to someone who already has one.
+	const offerSignup = account === null && config?.signupEnabled === true
 
 	return (
 		<main>
-			<Stage slides={feed.slides} />
+			<Stage slides={feed.slides} offerSignup={offerSignup} navigate={navigate} />
 			<div className="shell home">
 				<About slides={feed.slides} error={feed.error} />
 			</div>
@@ -219,31 +264,36 @@ function HomePage() {
 }
 
 /**
- * The hero: a rotating in-game photo with the headline and the way in over it. The
- * photo is the backdrop, never the payload — when the feed is slow or down the stage
- * still renders, so "Play now!" is reachable either way.
+ * The hero: the headline and the way in on the left, a rotating in-game photo on the
+ * right. The photo is proof, never the payload — when the feed is slow or down the
+ * frame holds its space and the left half reads the same, so "Play now!" is reachable
+ * either way.
  */
-function Stage({ slides }: { slides: Slide[] | null }) {
+function Stage({
+	slides,
+	offerSignup,
+	navigate,
+}: {
+	slides: Slide[] | null
+	offerSignup: boolean
+	navigate: Navigate
+}) {
 	const [idx, setIdx] = useState(0)
+	const count = slides?.length ?? 0
 
+	// A timeout keyed on the current slide rather than one long-lived interval: steering
+	// by hand re-arms it, so a photo you just picked gets its full six seconds.
 	useEffect(() => {
-		if (!slides || slides.length < 2) return
-		const t = setInterval(() => setIdx((i) => (i + 1) % slides.length), 6000)
-		return () => clearInterval(t)
-	}, [slides])
+		if (count < 2) return
+		const t = setTimeout(() => setIdx((i) => (i + 1) % count), 6000)
+		return () => clearTimeout(t)
+	}, [count, idx])
 
 	const slide = slides && slides.length > 0 ? slides[idx] : null
+	const step = (by: number) => setIdx((i) => (i + by + count) % count)
 
 	return (
 		<section className="stage">
-			{slide && (
-				<img
-					className="stage-photo"
-					key={slide.url}
-					src={slide.url}
-					alt={`Photo taken in game by ${slide.username}`}
-				/>
-			)}
 			<div className="stage-body">
 				{/* Deliberately doesn't name the game: this is a fan project, so the
 				    trademark stays out of the headline and appears lower down, in
@@ -251,37 +301,87 @@ function Stage({ slides }: { slides: Slide[] | null }) {
 				<h1 className="stage-title">
 					Play like it&apos;s <em>2023</em>.
 				</h1>
+				<p className="stage-lede">
+					The servers you remember, rebuilt and running — free, open source, and up right now.
+				</p>
 				<div className="stage-actions">
 					<a className="cta" href={DOWNLOAD_URL} target="_blank" rel="noreferrer">
 						Download for PC
+					</a>
+					<a className="cta" href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
+						Download for Quest
 					</a>
 					<a className="cta discord" href={DISCORD_INVITE} target="_blank" rel="noreferrer">
 						Join the Discord
 					</a>
 				</div>
+				{/* A line rather than a fourth button: the download is the point of this page,
+				    and launching the game makes an account by itself — signing up here is the
+				    way in for someone who wants one first. Hidden entirely when signup is
+				    closed, matching /login, which hides its create-account tab the same way. */}
+				{offerSignup && (
+					<p className="stage-alt">
+						New here?{' '}
+						<Link to="/signup" navigate={navigate}>
+							Create an account
+						</Link>
+					</p>
+				)}
 			</div>
-			{slide && (
+			<div className="stage-show">
+				<div className="stage-frame">
+					{slide && (
+						<img
+							className="stage-photo"
+							key={slide.url}
+							src={slide.url}
+							alt={`Photo taken in game by ${slide.username}`}
+						/>
+					)}
+				</div>
+				{/* Always mounted, so the frame doesn't shift down when the feed lands. */}
 				<div className="stage-foot">
-					<span className="credit">
-						Photo by @{slide.username}
-						{slide.roomName && ` in ${slide.roomName}`}
-					</span>
-					{slides && slides.length > 1 && (
-						<span className="dots">
-							{slides.map((s, i) => (
-								<button
-									key={s.url}
-									className={i === idx ? 'on' : ''}
-									onClick={() => setIdx(i)}
-									aria-label={`Show photo ${i + 1} of ${slides.length}`}
-									aria-current={i === idx}
-								/>
-							))}
+					{slide && (
+						<span className="credit">
+							Photo by @{slide.username}
+							{slide.roomName && ` in ${slide.roomName}`}
+						</span>
+					)}
+					{/* Arrows and a count, not a dot per photo: the feed runs to SLIDESHOW_LIMIT
+					    (130) images, and a dot each is both unusable and wide enough to shove
+					    the headline's half of the split off the page. */}
+					{count > 1 && (
+						<span className="steer">
+							<button onClick={() => step(-1)} aria-label="Previous photo">
+								<Chevron />
+							</button>
+							<span className="count">
+								{idx + 1} / {count}
+							</span>
+							<button onClick={() => step(1)} aria-label="Next photo">
+								<Chevron next />
+							</button>
 						</span>
 					)}
 				</div>
-			)}
+			</div>
 		</section>
+	)
+}
+
+/** The slideshow's back/forward mark. Decorative — the buttons carry the label. */
+function Chevron({ next }: { next?: boolean }) {
+	return (
+		<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+			<path
+				d={next ? 'M9 5l7 7-7 7' : 'M15 5l-7 7 7 7'}
+				fill="none"
+				stroke="currentColor"
+				strokeWidth="2.2"
+				strokeLinecap="round"
+				strokeLinejoin="round"
+			/>
+		</svg>
 	)
 }
 
@@ -297,8 +397,8 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
 				<h2 className="about-title">An open source rebuild of the 2023 servers</h2>
 				<p className="about-lede">
 					A free fan project, made by players who missed it. Aiming to be{' '}
-					<strong>feature-complete</strong> and infinitely scalable — no gatekeeping, no basement
-					server.
+					<strong>feature-complete</strong> and infinitely scalable —{' '}
+					<strong>architected for the cloud</strong>, no gatekeeping, no basement server.
 				</p>
 			</div>
 			<div className="about-side">
@@ -324,34 +424,85 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
 	)
 }
 
-/** The sign-in page. Redirects to the account page once a session exists. */
+/**
+ * The sign-in page — sign in, plus create-account when the server says signup is open
+ * (it needs a Turnstile keypair; see SiteConfig). Redirects to the account page once a
+ * session exists, however it was obtained.
+ */
 function LoginPage({
 	account,
+	config,
+	initialTab,
 	navigate,
 	onAuthed,
 }: {
 	account: SelfAccount | null | undefined
+	config: SiteConfig | undefined
+	initialTab: 'signup' | 'login'
 	navigate: Navigate
 	onAuthed: (a: SelfAccount) => void
 }) {
+	// The tab IS the route (`/login` vs `/signup`) rather than local state, so the two can
+	// never disagree — switching tabs pushes history, and back goes back to the other one.
+	const tab = initialTab
+
 	useEffect(() => {
 		if (account) navigate('/account')
 	}, [account, navigate])
 
+	const authed = (a: SelfAccount) => {
+		onAuthed(a)
+		navigate('/account')
+	}
+
+	const siteKey = config?.signupEnabled ? config.turnstileSiteKey : null
+
 	return (
 		<main className="shell">
 			<section className="card">
-				<h2>Sign in</h2>
-				<p className="muted">
-					Launch the game first — that creates an account linked to your Steam ID. Once you set a
-					password, use your username and that password to sign in here.
-				</p>
-				<LoginForm
-					onAuthed={(a) => {
-						onAuthed(a)
-						navigate('/account')
-					}}
-				/>
+				{siteKey && (
+					<div className="tabs">
+						<button className={tab === 'login' ? 'active' : ''} onClick={() => navigate('/login')}>
+							Sign in
+						</button>
+						<button
+							className={tab === 'signup' ? 'active' : ''}
+							onClick={() => navigate('/signup')}
+						>
+							Create account
+						</button>
+					</div>
+				)}
+				{siteKey && tab === 'signup' ? (
+					<>
+						<h2>Create account</h2>
+						<p className="muted">
+							A username is assigned for you — you&apos;ll see it on your account page. Choose a
+							password, and the two together sign you in here and in the game.
+						</p>
+						<SignupForm siteKey={siteKey} onAuthed={authed} />
+					</>
+				) : (
+					<>
+						<h2>Sign in</h2>
+						<p className="muted">
+							Use your username and password. Launching the game also creates an account, linked to
+							your Steam ID — set a password on it and it signs in here too.
+						</p>
+						<LoginForm onAuthed={authed} />
+						{/* The tabs above already offer this; the line under the button is where
+						    someone who just found out they have no account is actually looking.
+						    Gated on the same key, so it can't point at a door that isn't there. */}
+						{siteKey && (
+							<p className="muted swap">
+								Don&apos;t have an account?{' '}
+								<Link to="/signup" navigate={navigate}>
+									Create one
+								</Link>
+							</p>
+						)}
+					</>
+				)}
 			</section>
 		</main>
 	)
@@ -409,9 +560,180 @@ function useAction() {
 	return { pending, error, done, run }
 }
 
-// Manual web signups are disabled for now, so only sign-in is exposed (accounts are
-// created via the game/platform, not the website). To bring signups back, restore a
-// SignupForm calling POST /api/signup and re-enable that endpoint in www.app.ts.
+/**
+ * Turnstile's browser API, as much of it as the signup widget uses. Loaded from
+ * Cloudflare at runtime (see loadTurnstile) rather than bundled, so it isn't in
+ * node_modules and has no types of its own.
+ */
+interface TurnstileApi {
+	render: (
+		el: HTMLElement,
+		opts: {
+			sitekey: string
+			action?: string
+			callback?: (token: string) => void
+			'expired-callback'?: () => void
+		}
+	) => string | undefined
+	reset: (widgetId?: string) => void
+	remove: (widgetId?: string) => void
+}
+
+declare global {
+	interface Window {
+		turnstile?: TurnstileApi
+	}
+}
+
+/**
+ * Load Turnstile's script, once per page, resolving when `window.turnstile` is ready.
+ * `render=explicit` stops it scanning the document for widgets: this is a SPA, so the
+ * container mounts and unmounts with the form and we render into it ourselves.
+ *
+ * The promise is cached at module scope, so switching tabs back and forth reuses the
+ * loaded script instead of appending another tag. A rejection is cached too — the retry
+ * is a page reload, which is what the error message asks for.
+ */
+let turnstileScript: Promise<void> | null = null
+function loadTurnstile(): Promise<void> {
+	turnstileScript ??= new Promise<void>((resolve, reject) => {
+		const el = document.createElement('script')
+		el.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+		el.async = true
+		el.defer = true
+		el.onload = () => resolve()
+		el.onerror = () => reject(new Error('load failed'))
+		document.head.appendChild(el)
+	})
+	return turnstileScript
+}
+
+/**
+ * Mount a Turnstile widget and hand back the token it produces. No token means no
+ * submit: the BFF refuses a signup without one, so the form gates its button on it
+ * rather than letting the request fail.
+ *
+ * `reset` re-arms the widget for another attempt — a token is single-use, so a rejected
+ * signup can't be retried with the same one.
+ */
+function useTurnstile(siteKey: string) {
+	const container = useRef<HTMLDivElement | null>(null)
+	const widgetId = useRef<string | undefined>(undefined)
+	const [token, setToken] = useState('')
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		let live = true
+		loadTurnstile()
+			.then(() => {
+				// StrictMode mounts twice, and the cleanup below removes the first widget; bail
+				// if this effect is the stale one so we don't render into a detached container.
+				if (!live || !container.current || !window.turnstile) return
+				widgetId.current = window.turnstile.render(container.current, {
+					sitekey: siteKey,
+					// Marker Cloudflare uses to segment Turnstile integrations; carries no user data.
+					action: 'turnstile-spin-v1',
+					callback: (t) => setToken(t),
+					// Tokens expire after a few minutes; drop ours so the button locks again and
+					// Turnstile can hand us a fresh one.
+					'expired-callback': () => setToken(''),
+				})
+			})
+			.catch(() => {
+				if (live) setError("Couldn't load the bot check — reload the page to try again.")
+			})
+
+		return () => {
+			live = false
+			if (widgetId.current) window.turnstile?.remove(widgetId.current)
+			widgetId.current = undefined
+		}
+	}, [siteKey])
+
+	const reset = useCallback(() => {
+		setToken('')
+		if (widgetId.current) window.turnstile?.reset(widgetId.current)
+	}, [])
+
+	return { container, token, error, reset }
+}
+
+/**
+ * Create an account from the website: a password, plus a Turnstile token proving a human
+ * filled the form. The username comes back auto-assigned from `auth` (players don't pick
+ * one), and the session is live on success — so this lands on the account page, where the
+ * username is shown.
+ */
+function SignupForm({
+	siteKey,
+	onAuthed,
+}: {
+	siteKey: string
+	onAuthed: (a: SelfAccount) => void
+}) {
+	const [password, setPassword] = useState('')
+	const [email, setEmail] = useState('')
+	const { container, token, error: widgetError, reset } = useTurnstile(siteKey)
+	const { pending, error, run } = useAction()
+
+	return (
+		<form
+			onSubmit={(e) => {
+				e.preventDefault()
+				void run(async () => {
+					try {
+						const { account } = await api<{ account: SelfAccount }>('/api/signup', {
+							password,
+							email,
+							turnstileToken: token,
+						})
+						onAuthed(account)
+						return ''
+					} catch (err) {
+						// The token is spent either way, so re-arm the widget before they retry.
+						reset()
+						throw err
+					}
+				})
+			}}
+		>
+			<label>
+				Password
+				<input
+					type="password"
+					value={password}
+					autoComplete="new-password"
+					onChange={(e) => setPassword(e.target.value)}
+					required
+				/>
+			</label>
+			{/* Optional, and the button doesn't wait on it — but it's the only contact detail
+			    an account has, so the hint says plainly what it's for rather than leaving it
+			    to be guessed. `type="email"` gets the right keyboard on mobile and a free
+			    format check; the worker re-checks it before the account is created. */}
+			<label>
+				Email <span className="optional">optional</span>
+				<input
+					type="email"
+					value={email}
+					autoComplete="email"
+					onChange={(e) => setEmail(e.target.value)}
+				/>
+				<span className="hint">
+					How you get back in if you forget your password — there&apos;s no other way to reach you.
+					You can add it later on your account page.
+				</span>
+			</label>
+			<div className="turnstile" ref={container} />
+			{widgetError && <p className="error">{widgetError}</p>}
+			{error && <p className="error">{error}</p>}
+			<button type="submit" disabled={pending || token === ''}>
+				{pending ? 'Creating…' : 'Create account'}
+			</button>
+		</form>
+	)
+}
+
 function LoginForm({ onAuthed }: { onAuthed: (a: SelfAccount) => void }) {
 	const [username, setUsername] = useState('')
 	const [password, setPassword] = useState('')

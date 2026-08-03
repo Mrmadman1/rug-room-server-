@@ -28,6 +28,32 @@
 		"not_found_handling": "single-page-application",
 		"run_worker_first": ["/api/*", "/docs", "/docs/openapi/*", "/privacy"]
 	},
+	// The Turnstile keypair guarding web signup, out of the same account-level Secrets
+	// Store every other worker binds for JWT_SECRET — values live there, never in this
+	// file. The "local" store_id placeholder is replaced with RECFLARE_SECRETS_STORE at
+	// deploy time, exactly as it is for the other workers.
+	//
+	//   wrangler secrets-store secret create <store-id> --name TURNSTILE_SITE_KEY \
+	//     --scopes workers --remote
+	//   wrangler secrets-store secret create <store-id> --name TURNSTILE_SECRET_KEY \
+	//     --scopes workers --remote
+	//
+	// Creating both is what OPENS signup; if either can't be resolved it stays closed, so
+	// an operator who skips this gets no signup rather than an unprotected one. The SITE
+	// key is public (it ships to the browser to render the widget) and is kept here beside
+	// its secret so one place configures signup. See src/turnstile.ts.
+	"secrets_store_secrets": [
+		{
+			"binding": "TURNSTILE_SITE_KEY",
+			"store_id": "local",
+			"secret_name": "TURNSTILE_SITE_KEY"
+		},
+		{
+			"binding": "TURNSTILE_SECRET_KEY",
+			"store_id": "local",
+			"secret_name": "TURNSTILE_SECRET_KEY"
+		}
+	],
 	"upload_source_maps": true,
 	"observability": {
 		"logs": {
