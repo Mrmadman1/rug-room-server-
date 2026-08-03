@@ -504,19 +504,27 @@ const app = new Hono<App>()
 		}
 	)
 
-	// "Hot" rooms feed — public, non-dorm rooms ordered by engagement, optionally
-	// filtered to a single `tag` (e.g. `rro`). Paginated via skip/take (take
-	// defaults to 100). Returns `{ Results, TotalResults }` like search.
+	// "Hot" rooms feed — public, non-dorm rooms ordered by live player count (their
+	// instances' presence), then stored engagement, optionally filtered to a single
+	// `tag` (e.g. `rro`). `tag=new` is a pseudo-tag no room carries: it serves the
+	// player-made (non-RRO) rooms newest-first. Paginated via skip/take (take defaults
+	// to 100). Returns `{ Results, TotalResults }` like search.
 	.get(
 		'/rooms/hot',
 		describeRoute({
 			tags: ['Discovery'],
 			summary: 'The “hot” rooms feed',
 			description: [
-				'Public, non-dorm rooms ordered by engagement, optionally narrowed to a single `tag`',
-				'(the browse screen’s filter chips post one, e.g. `rro`).',
+				'Public, non-dorm rooms ordered by how many players are in them right now — live',
+				'presence summed across each room’s instances — falling back to stored engagement',
+				'for rooms nobody is in. Optionally narrowed to a single `tag` (the browse screen’s',
+				'filter chips post one, e.g. `rro`). The `new` chip is a pseudo-tag — no room carries',
+				'a `new` tag — and instead serves the player-made (non-RRO) rooms, newest first.',
 			].join(' '),
-			parameters: [stringQuery('tag', 'Restrict to rooms carrying this tag'), ...pageParams(100)],
+			parameters: [
+				stringQuery('tag', 'Restrict to rooms carrying this tag (or `new`, a pseudo-tag)'),
+				...pageParams(100),
+			],
 			responses: { 200: json(PagedRooms, 'The feed page') },
 		}),
 		async (c) => {

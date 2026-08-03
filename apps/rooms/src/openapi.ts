@@ -132,7 +132,11 @@ export const RoomTagDto = z.object({
 	Type: z.int().describe('0 = owner-set, 2 = auto'),
 })
 
-/** A room's engagement counters. Nothing increments these yet, so they stay at 0. */
+/**
+ * A room's engagement counters. `CheerCount`/`FavoriteCount` are aggregated from the
+ * per-player `interaction` rows on every read; nothing records visits yet, so
+ * `VisitorCount`/`VisitCount` stay at 0.
+ */
 export const RoomStatsDto = z.object({
 	CheerCount: z.int(),
 	FavoriteCount: z.int(),

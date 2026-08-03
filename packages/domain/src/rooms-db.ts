@@ -18,6 +18,7 @@
  */
 
 import { Accessibility, Role } from './enums'
+import { countPlayersByRoom } from './presence-db'
 
 /** Schema DDL (mirror of the head migration schema, sans the seed INSERT). */
 export const ROOM_SCHEMA_DDL: string[] = [
@@ -177,6 +178,9 @@ export async function cloneRoom(
 		// client renders a virtual "RRO" tag on the clone.
 		IsRRO: false,
 		Roles: roles,
+		// A fresh room has no engagement of its own — don't inherit the source's counters
+		// (the derived ones are recomputed per read, but the clone is returned as-is here).
+		Stats: storedStats(source.Stats),
 		CreatedAt: new Date().toISOString(),
 	}
 
@@ -783,11 +787,13 @@ const serializeSubRoom = (sub: SubRoom, roomId: number): string => {
 
 /**
  * Serialize a room for a full-blob write, dropping any hydrated `SubRooms` so it never
- * gets denormalized back into the room JSON (subrooms are the `subroom` table's job).
+ * gets denormalized back into the room JSON (subrooms are the `subroom` table's job) and
+ * zeroing the derived engagement counters (those are the `interaction` table's job — see
+ * {@link attachStats}), so a write can't bake a snapshot of them into the blob.
  */
 const serializeRoom = (room: Room): string => {
-	const { SubRooms: _subRooms, ...rest } = room
-	return JSON.stringify(rest)
+	const { SubRooms: _subRooms, Stats: stats, ...rest } = room
+	return JSON.stringify({ ...rest, Stats: storedStats(stats) })
 }
 
 /**
@@ -854,15 +860,108 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 	for (const room of rooms) room.SubRooms = byRoom.get(Number(room.RoomId)) ?? []
 }
 
-/** Hydrate a single room's `SubRooms` (no-op for null). */
+// ---- Room stats -----------------------------------------------------------
+// A room's cheer/favorite counters are DERIVED from the `interaction` table rather than
+// stored: they're recomputed on every read, so a cheer shows up immediately and the
+// counts can't drift from the per-player rows they're made of. The blob keeps them at 0
+// (see {@link serializeRoom}). `VisitorCount`/`VisitCount` are left as the blob has them
+// — nothing records a visit yet, and `interaction.last_visited_at` is only stamped by the
+// cheer/favorite toggles, so counting those rows would report cheerers as visitors.
+
+/** One room's derived engagement counters (the aggregate maps below key these by RoomId). */
+export interface RoomStats {
+	CheerCount: number
+	FavoriteCount: number
+}
+
+interface RoomStatsRow {
+	room_id: number
+	cheers: number
+	favorites: number
+}
+
+/** The counters a room starts life with (and the shape the client expects). */
+const ZERO_STATS = { CheerCount: 0, FavoriteCount: 0, VisitorCount: 0, VisitCount: 0 }
+
+/** D1 caps a query at 100 bound parameters, and a feed page can carry more ids than that. */
+const STATS_ID_LIMIT = 90
+
+/** A room's RoomId, or 0 for a blob without one. */
+const roomIdOf = (room: Room): number => (typeof room.RoomId === 'number' ? room.RoomId : 0)
+
+/**
+ * The `Stats` object to persist: whatever the room carried, with the derived counters
+ * back at 0 so the blob never holds a stale copy of them.
+ */
+function storedStats(stats: unknown): Record<string, unknown> {
+	const stored =
+		typeof stats === 'object' && stats !== null ? (stats as Record<string, unknown>) : {}
+	return { ...ZERO_STATS, ...stored, CheerCount: 0, FavoriteCount: 0 }
+}
+
+/**
+ * Cheer/favorite counts per room, aggregated from `interaction` in ONE grouped query.
+ * Restricted to `roomIds` when given (a feed page), otherwise covering every room —
+ * which is also what a page too large to bind gets, since scanning the whole table is
+ * cheaper than splitting the query. Rooms nobody has interacted with are absent.
+ */
+export async function getRoomStats(
+	db: D1Database,
+	roomIds?: number[]
+): Promise<Map<number, RoomStats>> {
+	const byRoom = new Map<number, RoomStats>()
+	if (roomIds && roomIds.length === 0) return byRoom
+	const ids = roomIds && roomIds.length <= STATS_ID_LIMIT ? roomIds : []
+	const where =
+		ids.length > 0 ? `WHERE room_id IN (${ids.map((_, i) => `?${i + 1}`).join(',')})` : ''
+	const { results } = await db
+		.prepare(
+			`SELECT room_id, SUM(cheered) AS cheers, SUM(favorited) AS favorites
+			 FROM interaction ${where} GROUP BY room_id`
+		)
+		.bind(...ids)
+		.all<RoomStatsRow>()
+	for (const r of results) {
+		byRoom.set(r.room_id, { CheerCount: r.cheers ?? 0, FavoriteCount: r.favorites ?? 0 })
+	}
+	return byRoom
+}
+
+/**
+ * Overwrite each room's derived counters from the interaction table, in one query for
+ * the whole batch. Callers that already aggregated (the feeds rank by these counts, so
+ * they need them before paging) pass their map in rather than paying for a second query.
+ */
+async function attachStats(
+	db: D1Database,
+	rooms: Room[],
+	stats?: Map<number, RoomStats>
+): Promise<void> {
+	if (rooms.length === 0) return
+	const byRoom = stats ?? (await getRoomStats(db, [...new Set(rooms.map(roomIdOf))]))
+	for (const room of rooms) {
+		const counts = byRoom.get(roomIdOf(room))
+		room.Stats = {
+			...storedStats(room.Stats),
+			CheerCount: counts?.CheerCount ?? 0,
+			FavoriteCount: counts?.FavoriteCount ?? 0,
+		}
+	}
+}
+
+/** Hydrate a single room's `SubRooms` and derived `Stats` (no-op for null). */
 async function hydrateRoom(db: D1Database, room: Room | null): Promise<Room | null> {
-	if (room) await attachSubRooms(db, [room])
+	if (room) await hydrateRooms(db, [room])
 	return room
 }
 
-/** Hydrate many rooms' `SubRooms` in one batched query. */
-async function hydrateRooms(db: D1Database, rooms: Room[]): Promise<Room[]> {
-	await attachSubRooms(db, rooms)
+/** Hydrate many rooms' `SubRooms` and derived `Stats` (one batched query each). */
+async function hydrateRooms(
+	db: D1Database,
+	rooms: Room[],
+	stats?: Map<number, RoomStats>
+): Promise<Room[]> {
+	await Promise.all([attachSubRooms(db, rooms), attachStats(db, rooms, stats)])
 	return rooms
 }
 
@@ -1472,20 +1571,51 @@ export async function searchRooms(
 	}
 }
 
-/** Engagement score used to order the hot feed (cheers weigh most, then favorites). */
-function hotScore(room: Room): number {
-	const stats = room.Stats as Record<string, unknown> | null | undefined
-	const n = (v: unknown): number => (typeof v === 'number' ? v : 0)
-	return n(stats?.CheerCount) * 3 + n(stats?.FavoriteCount) * 2 + n(stats?.VisitorCount)
+/**
+ * Engagement score used to order the hot feed (cheers weigh most, then favorites).
+ * Cheers/favorites come from the caller's aggregated {@link getRoomStats} map — ranking
+ * happens before hydration, so the room blob's copies are still zero at this point.
+ */
+function hotScore(room: Room, stats: Map<number, RoomStats>): number {
+	const counts = stats.get(roomIdOf(room))
+	const stored = room.Stats as Record<string, unknown> | null | undefined
+	const visitors = typeof stored?.VisitorCount === 'number' ? stored.VisitorCount : 0
+	return (counts?.CheerCount ?? 0) * 3 + (counts?.FavoriteCount ?? 0) * 2 + visitors
+}
+
+/**
+ * The browse screen's "New" chip posts `tag=new` to the hot feed, but `new` is a
+ * PSEUDO-tag: no room carries it. It means "recently created by a player", so it
+ * selects the non-RRO rooms and orders them newest-first instead of by population.
+ */
+const NEW_TAG = 'new'
+
+/**
+ * True if the room is a Rec Room Original. `IsRRO` is the flag the client renders a
+ * virtual "RRO" tag from; the auto-derived `rro` tag is checked too so a room that only
+ * carries the tag isn't mistaken for player-made.
+ */
+function isRRO(room: Room): boolean {
+	return room.IsRRO === true || roomHasAnyTag(room, new Set(['rro']))
+}
+
+/** A room's CreatedAt as epoch millis; 0 (i.e. oldest) when it's missing or unparseable. */
+function createdAt(room: Room): number {
+	const ts = typeof room.CreatedAt === 'string' ? Date.parse(room.CreatedAt) : NaN
+	return Number.isNaN(ts) ? 0 : ts
 }
 
 /**
  * The "hot" rooms feed: public, non-dorm rooms not excluded from lists, ordered
- * by engagement and optionally filtered to a single `tag` (with the same aliases
- * as search). Paginated via skip/take; returns `{ Results, TotalResults }` like
- * search. Ties (and the all-zero seed data) fall back to RoomId order so paging
- * is stable. The dataset is small, so this filters/sorts in memory rather than
- * in SQL.
+ * by how many players are in them RIGHT NOW (live presence summed across the
+ * room's instances), and optionally filtered to a single `tag` (with the same
+ * aliases as search). "Hot" is a live-population feed, so current players lead;
+ * rooms nobody is in — and the all-zero seed data — fall back to the stored
+ * engagement score, then to RoomId order so paging stays stable. Paginated via
+ * skip/take; returns `{ Results, TotalResults }` like search. The dataset is
+ * small, so this filters/sorts in memory rather than in SQL.
+ *
+ * `tag=new` is the one filter that isn't a tag lookup — see {@link NEW_TAG}.
  */
 export async function getHotRooms(
 	db: D1Database,
@@ -1499,15 +1629,34 @@ export async function getHotRooms(
 	)
 
 	const t = tag.trim().toLowerCase()
+	if (t === NEW_TAG) {
+		// Newest player-made rooms first; RoomId (which is minted in creation order)
+		// breaks ties so rooms created in the same instant still page stably.
+		const fresh = rooms
+			.filter((r) => !isRRO(r))
+			.sort((a, b) => createdAt(b) - createdAt(a) || roomIdOf(b) - roomIdOf(a))
+		return {
+			Results: await hydrateRooms(db, fresh.slice(skip, skip + take)),
+			TotalResults: fresh.length,
+		}
+	}
+
 	if (t !== '') {
 		const accepted = new Set([t, ...(TAG_ALIASES[t] ?? [])])
 		rooms = rooms.filter((r) => roomHasAnyTag(r, accepted))
 	}
 
-	const roomId = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
-	rooms.sort((a, b) => hotScore(b) - hotScore(a) || roomId(a) - roomId(b))
+	const players = await countPlayersByRoom(db)
+	const playerCount = (r: Room): number => players.get(roomIdOf(r)) ?? 0
+	const stats = await getRoomStats(db)
+	rooms.sort(
+		(a, b) =>
+			playerCount(b) - playerCount(a) ||
+			hotScore(b, stats) - hotScore(a, stats) ||
+			roomIdOf(a) - roomIdOf(b)
+	)
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
 		TotalResults: rooms.length,
 	}
 }
@@ -1526,13 +1675,14 @@ export async function getRecommendedRooms(
 	take: number
 ): Promise<Room[]> {
 	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
-	const roomId = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
+	const stats = await getRoomStats(db)
 	return hydrateRooms(
 		db,
 		parseAll(results)
 			.filter((r) => r.IsDorm !== true && r.Accessibility === 1 && r.ExcludeFromLists !== true)
-			.sort((a, b) => hotScore(b) - hotScore(a) || roomId(a) - roomId(b))
-			.slice(skip, skip + take)
+			.sort((a, b) => hotScore(b, stats) - hotScore(a, stats) || roomIdOf(a) - roomIdOf(b))
+			.slice(skip, skip + take),
+		stats
 	)
 }
 
@@ -1611,7 +1761,7 @@ export async function getSimilarRooms(
 
 	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
 	const sharedCount = (r: Room): number => roomTags(r).filter((t) => targetTags.has(t)).length
-	const roomIdOf = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
+	const stats = await getRoomStats(db)
 
 	const scored = parseAll(results)
 		.filter(
@@ -1627,12 +1777,12 @@ export async function getSimilarRooms(
 	scored.sort(
 		(a, b) =>
 			b.shared - a.shared ||
-			hotScore(b.room) - hotScore(a.room) ||
+			hotScore(b.room, stats) - hotScore(a.room, stats) ||
 			roomIdOf(a.room) - roomIdOf(b.room)
 	)
 	const rooms = scored.map((x) => x.room)
 	return {
-		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
 		TotalResults: rooms.length,
 	}
 }
@@ -1647,7 +1797,6 @@ export async function getSimilarRooms(
 export async function getBaseRooms(db: D1Database, skip: number, take: number): Promise<Room[]> {
 	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
 	const base = new Set(['base'])
-	const roomIdOf = (r: Room): number => (typeof r.RoomId === 'number' ? r.RoomId : 0)
 	return hydrateRooms(
 		db,
 		parseAll(results)
@@ -1722,6 +1871,8 @@ export async function getOrCreateDormRoom(db: D1Database, accountId: number): Pr
 		Roles: [
 			{ AccountId: accountId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: 0 },
 		],
+		// Counters start at zero rather than inheriting the template dorm's (see cloneRoom).
+		Stats: storedStats(template?.Stats),
 		CreatedAt: new Date().toISOString(),
 	}
 	// serializeRoom drops any SubRooms carried over from the template; the dorm's own

@@ -15,6 +15,7 @@ import {
 	getRoomInstance,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
+	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
@@ -83,15 +84,9 @@ const TEST_ROOMS = [
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
-	await env.DB.prepare(
-		`CREATE TABLE IF NOT EXISTS room (
-			data TEXT NOT NULL,
-			room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.RoomId')) VIRTUAL,
-			name_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.Name'))) VIRTUAL,
-			creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL,
-			is_dorm INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsDorm')) VIRTUAL
-		)`
-	).run()
+	// The rooms worker's schema (room + interaction) — reading a room aggregates its
+	// cheer/favorite Stats from `interaction`, so both tables have to be here.
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Subrooms live in their own table now; seed each room and split its subrooms into it.
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const r of TEST_ROOMS) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)

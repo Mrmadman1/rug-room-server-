@@ -368,6 +368,49 @@ describe('rooms endpoints', () => {
 		expect(body.TotalResults).toBeGreaterThan(body.Results.length)
 	})
 
+	it('GET /rooms/hot ranks rooms by the live presence in their instances', async () => {
+		const feed = async (): Promise<number[]> =>
+			(
+				(await (await SELF.fetch(`${ORIGIN}/rooms/hot?skip=0&take=100`)).json()) as {
+					Results: Array<{ RoomId: number }>
+				}
+			).Results.map((r) => r.RoomId)
+
+		// Two rooms from the tail of the engagement-ordered feed, so any move to the
+		// front can only come from presence.
+		const before = await feed()
+		const busiest = before[before.length - 1]
+		const quieter = before[before.length - 2]
+
+		// Two players in two different instances of `busiest`, one in `quieter`, plus a
+		// lobby presence (no instance) that must not count for anyone.
+		const expiresAt = Math.floor(Date.now() / 1000) + 900
+		const seed = env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		await env.DB.batch(
+			[
+				{ accountId: 90001, roomInstance: { roomInstanceId: 1000901, roomId: busiest } },
+				{ accountId: 90002, roomInstance: { roomInstanceId: 1000902, roomId: busiest } },
+				{ accountId: 90003, roomInstance: { roomInstanceId: 1000903, roomId: quieter } },
+				{ accountId: 90004, roomInstance: null },
+			].map((p) => seed.bind(JSON.stringify({ ...p, expiresAt })))
+		)
+
+		expect((await feed()).slice(0, 2)).toEqual([busiest, quieter])
+
+		// Expired presence doesn't count — the feed falls back to engagement order.
+		await env.DB.prepare(
+			`UPDATE presence SET data = json_set(data, '$.expiresAt', ?1)
+			 WHERE account_id IN (90001, 90002, 90003, 90004)`
+		)
+			.bind(Math.floor(Date.now() / 1000) - 1)
+			.run()
+		expect(await feed()).toEqual(before)
+
+		await env.DB.prepare(
+			'DELETE FROM presence WHERE account_id IN (90001, 90002, 90003, 90004)'
+		).run()
+	})
+
 	it('GET /rooms/hot aliases #recroomoriginal to the rro tag', async () => {
 		const aliased = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/hot?tag=recroomoriginal`)
@@ -377,6 +420,66 @@ describe('rooms endpoints', () => {
 		}
 		expect(aliased.TotalResults).toBe(direct.TotalResults)
 		expect(aliased.TotalResults).toBeGreaterThan(0)
+	})
+
+	it('GET /rooms/hot?tag=new serves player-made rooms newest-first (pseudo-tag)', async () => {
+		type Feed = { Results: Array<{ Name: string }>; TotalResults: number }
+		const feed = async (): Promise<Feed> =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/hot?tag=new&skip=0&take=100`)).json()) as Feed
+		const names = async (): Promise<string[]> => (await feed()).Results.map((r) => r.Name)
+
+		// No room carries a `new` tag, and every seeded room is a Rec Room Original — so
+		// the feed is empty until a player makes something.
+		expect(await feed()).toEqual({ Results: [], TotalResults: 0 })
+
+		const seeded: number[] = []
+		const seed = async (room: Record<string, unknown>) => {
+			seeded.push(Number(room.RoomId))
+			await seedRoomWithSubRooms(env.DB, { Accessibility: 1, IsDorm: false, IsRRO: false, ...room })
+		}
+
+		// Two player-made public rooms and one that isn't public.
+		await seed({ RoomId: 9001, Name: 'OlderPlayerRoom', CreatedAt: '2026-07-01T00:00:00Z' })
+		await seed({ RoomId: 9002, Name: 'NewerPlayerRoom', CreatedAt: '2026-07-02T00:00:00Z' })
+		await seed({
+			RoomId: 9003,
+			Name: 'UnlistedPlayerRoom',
+			CreatedAt: '2026-07-03T00:00:00Z',
+			Accessibility: 2,
+		})
+
+		// Newest first, and the non-public room is excluded as it is everywhere else.
+		expect(await feed()).toMatchObject({
+			Results: [{ Name: 'NewerPlayerRoom' }, { Name: 'OlderPlayerRoom' }],
+			TotalResults: 2,
+		})
+
+		// An RRO stays out even when it's the newest room in the database — by the flag,
+		// or by the auto-derived `rro` tag alone.
+		await seed({
+			RoomId: 9004,
+			Name: 'BrandNewRRO',
+			CreatedAt: '2026-07-04T00:00:00Z',
+			IsRRO: true,
+		})
+		await seed({
+			RoomId: 9005,
+			Name: 'TaggedRRO',
+			CreatedAt: '2026-07-05T00:00:00Z',
+			Tags: [{ Tag: 'rro', Type: 2 }],
+		})
+		expect(await names()).toEqual(['NewerPlayerRoom', 'OlderPlayerRoom'])
+
+		// Paging comes off the same order.
+		const page = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/hot?tag=new&skip=1&take=1`)
+		).json()) as Feed
+		expect(page).toMatchObject({ Results: [{ Name: 'OlderPlayerRoom' }], TotalResults: 2 })
+
+		// Leave the shared feeds as they were for the tests that follow.
+		const ids = seeded.join(',')
+		await env.DB.prepare(`DELETE FROM room WHERE room_id IN (${ids})`).run()
+		await env.DB.prepare(`DELETE FROM subroom WHERE room_id IN (${ids})`).run()
 	})
 
 	it('GET /rooms/base returns a bare array of base/template rooms (incl. non-public)', async () => {
@@ -1593,6 +1696,55 @@ describe('rooms endpoints', () => {
 			await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me`, { headers: other })
 		).json()) as Interaction
 		expect(otherGet).toMatchObject({ Cheered: false, Favorited: false })
+	})
+
+	it('room Stats aggregate cheers/favorites from the interaction table', async () => {
+		type Stats = {
+			CheerCount: number
+			FavoriteCount: number
+			VisitorCount: number
+			VisitCount: number
+		}
+		// Room 15 (CrimsonCauldron) is untouched by the other interaction tests.
+		const searched = async (): Promise<Stats> => {
+			const body = (await (
+				await SELF.fetch(`${ORIGIN}/rooms/search?query=crimsoncauldron`)
+			).json()) as { Results: Array<{ Stats: Stats }> }
+			return body.Results[0]!.Stats
+		}
+		const direct = async (): Promise<Stats> =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/15`)).json()) as { Stats: Stats }).Stats
+		const interact = async (player: string, action: string, method: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/15/interactionby/me/${action}`, {
+				method,
+				headers: await bearer(player),
+			})
+
+		// Nobody has interacted with it yet.
+		expect(await searched()).toEqual({
+			CheerCount: 0,
+			FavoriteCount: 0,
+			VisitorCount: 0,
+			VisitCount: 0,
+		})
+
+		// Two players cheer it; one of them also favorites it.
+		await interact('561', 'cheer', 'PUT')
+		await interact('562', 'cheer', 'PUT')
+		await interact('561', 'favorite', 'PUT')
+
+		// Both the search results and the room itself report the aggregate.
+		expect(await searched()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
+		expect(await direct()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
+
+		// Clearing a cheer decrements it. Nothing records visits, so those stay 0.
+		await interact('562', 'cheer', 'DELETE')
+		expect(await direct()).toEqual({
+			CheerCount: 1,
+			FavoriteCount: 1,
+			VisitorCount: 0,
+			VisitCount: 0,
+		})
 	})
 
 	it('DELETE /rooms/:id/interactionby/me/cheer clears the cheer (auth-gated, idempotent)', async () => {

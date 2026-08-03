@@ -8,6 +8,7 @@ import {
 	getAccountsByDeviceId,
 	hashPassword,
 	PRESENCE_SCHEMA_DDL,
+	ROOM_SCHEMA_DDL,
 	SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -60,12 +61,9 @@ beforeAll(async () => {
 			.bind(JSON.stringify({ accountId: id, username: `Player${id}`, passwordHash: hash }))
 			.run()
 	}
-	await env.DB.prepare(
-		`CREATE TABLE IF NOT EXISTS room (
-			data TEXT NOT NULL,
-			room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.RoomId')) VIRTUAL
-		)`
-	).run()
+	// The rooms worker's schema (room + interaction) — reading a room aggregates its
+	// cheer/favorite Stats from `interaction`, so both tables have to be here.
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Subrooms live in their own table; seed the Orientation room and split its subroom into it.
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	await seedRoomWithSubRooms(env.DB, {
