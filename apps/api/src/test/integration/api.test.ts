@@ -11,6 +11,7 @@ import {
 
 import '../../api.app'
 
+import { SCHEMA_DDL as EVENTS_SCHEMA_DDL } from '../../events-db'
 import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
@@ -18,6 +19,7 @@ import { getReportsAgainst, SCHEMA_DDL as REPORTS_SCHEMA_DDL } from '../../repor
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { Env } from '../../context'
+import type { PlayerEvent, PlayerEventResult } from '../../events-db'
 import type { SavedImage } from '../../images-db'
 import type { InventionSaveResult, SavedInvention } from '../../inventions-db'
 
@@ -89,6 +91,9 @@ beforeAll(async () => {
 
 	// Warnings table (owned by the api worker) — moderator-issued warnings land here.
 	for (const stmt of WARNINGS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Player events table (owned by the api worker) — scheduled events live here.
+	for (const stmt of EVENTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -205,17 +210,6 @@ describe('public endpoints', () => {
 		expect(reps.map((r) => r.AccountId)).toEqual([1, 2])
 	})
 
-	test('GET /api/playerevents/v1/tagfilters returns empty filter chips', async () => {
-		// No player-event storage → no tags in use → no chips. Trending is null.
-		const res = await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/tagfilters`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({
-			PinnedFilters: [],
-			PopularFilters: [],
-			TrendingFilters: null,
-		})
-	})
-
 	test('GET /api/activities/charades/v1/words/Charades returns the word bank', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/activities/charades/v1/words/Charades`)
 		expect(res.status).toBe(200)
@@ -223,26 +217,6 @@ describe('public endpoints', () => {
 		expect(Array.isArray(words)).toBe(true)
 		expect(words.length).toBeGreaterThan(0)
 		expect(words[0]).toEqual({ Id: 1, Difficulty: 0, EN_US: 'David Bowie' })
-	})
-
-	test('GET /api/playerevents/v1/clubs returns an empty event list', async () => {
-		// The client deserializes this as a bare array — an envelope here fails with
-		// "expected:'[', actual:'{'". No player-event storage yet → empty.
-		const res = await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/clubs?id=1&id=2`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
-
-		// The single-club form does wrap its events with a paging cursor.
-		const one = await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/club/1`)
-		expect(one.status).toBe(200)
-		expect(await one.json()).toEqual({ ContinuationToken: '', Events: [] })
-	})
-
-	test('GET /api/playerevents/v1/searchlive returns an empty list', async () => {
-		// No player-event storage yet → nothing live to return.
-		const res = await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/searchlive`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
 	})
 
 	test('GET /api/PlayerReporting/v1/moderationBlockDetails reports "not blocked"', async () => {
@@ -2252,10 +2226,390 @@ describe('mutual friends', () => {
 	})
 
 	test('GET /api/relationships/mutualfriends is auth-gated', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/relationships/mutualfriends?id=${OTHER}`
-		)
+		const res = await exports.default.fetch(`${ORIGIN}/api/relationships/mutualfriends?id=${OTHER}`)
 		expect(res.status).toBe(401)
+	})
+})
+
+describe('player events', () => {
+	const HOUR = 60 * 60 * 1000
+	/** Seconds precision, no milliseconds — the form the client sends and reads back. */
+	const at = (offsetMs: number): string =>
+		new Date(Date.now() + offsetMs).toISOString().replace(/\.\d{3}Z$/, 'Z')
+
+	const post = async (path: string, body: unknown, sub = '42'): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: { ...(await bearer(sub)), 'content-type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+
+	const create = async (body: unknown, sub = '42'): Promise<PlayerEvent> => {
+		const res = await post('/api/playerevents/v2', body, sub)
+		expect(res.status).toBe(200)
+		return ((await res.json()) as PlayerEventResult).PlayerEvent
+	}
+
+	const get = async (path: string, sub?: string): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}${path}`, sub ? { headers: await bearer(sub) } : undefined)
+
+	// The fixture set every test below reads. Times are relative to the run so the
+	// upcoming/live/finished distinction the browse queries make is real.
+	let upcoming: PlayerEvent
+	let clubEvent: PlayerEvent
+	let liveEvent: PlayerEvent
+	let pastEvent: PlayerEvent
+
+	beforeAll(async () => {
+		// Posted nested under `PlayerEvent` — the envelope form the client sends back.
+		upcoming = await create({
+			PlayerEvent: {
+				ImageName: 'e63dcbffe8d14a7696bea7117dc3dd28.jpg',
+				RoomId: 10916706,
+				SubRoomId: 11195660,
+				ClubId: null,
+				Name: 'Building a Better Room Using Trigonometry',
+				Description: '',
+				StartTime: at(HOUR),
+				EndTime: at(2 * HOUR),
+				State: 0,
+				Accessibility: 1,
+				IsMultiInstance: false,
+				SupportMultiInstanceRoomChat: true,
+				DefaultBroadcastPermissions: 0,
+				CanRequestBroadcastPermissions: 0,
+			},
+		})
+		// …and this one at the top level, the other form in circulation.
+		clubEvent = await create({
+			RoomId: 23570830,
+			ClubId: 7,
+			Name: 'DUNGEONS Escape ROOM',
+			Description: 'Try and escape the DUNGEONS with upto 4 players!',
+			StartTime: at(3 * HOUR),
+			EndTime: at(4 * HOUR),
+			CanRequestBroadcastPermissions: 2147483647,
+		})
+		liveEvent = await create(
+			{ RoomId: 3, ClubId: 7, Name: 'Live Jam', StartTime: at(-HOUR), EndTime: at(HOUR) },
+			'43'
+		)
+		pastEvent = await create({
+			RoomId: 3,
+			Name: 'Trigonometry Retrospective',
+			StartTime: at(-3 * HOUR),
+			EndTime: at(-2 * HOUR),
+		})
+	})
+
+	test('GET /api/playerevents/v1/tagfilters serves the event categories, auth-gated', async () => {
+		expect((await get('/api/playerevents/v1/tagfilters')).status).toBe(401)
+
+		const res = await get('/api/playerevents/v1/tagfilters', '42')
+		expect(res.status).toBe(200)
+		// Static — the categories the client offers, not derived from stored events.
+		// Trending is null even in the reference: it needs recent-activity data.
+		expect(await res.json()).toEqual({
+			PinnedFilters: [
+				'workshops',
+				'celebration',
+				'game',
+				'meetup',
+				'performance',
+				'coop',
+				'grandopening',
+				'class',
+				'competition',
+			],
+			PopularFilters: [
+				'workshops',
+				'celebration',
+				'class',
+				'coop',
+				'competition',
+				'game',
+				'grandopening',
+				'meetup',
+				'performance',
+			],
+			TrendingFilters: null,
+		})
+	})
+
+	test('POST /api/playerevents/v2 creates an event, auth-gated', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/playerevents/v2`, {
+			method: 'POST',
+			body: '{}',
+		})
+		expect(res.status).toBe(401)
+
+		// The stored record carries exactly the client's field set — nothing more.
+		expect(upcoming).toEqual({
+			PlayerEventId: upcoming.PlayerEventId,
+			CreatorPlayerId: 42,
+			ImageName: 'e63dcbffe8d14a7696bea7117dc3dd28.jpg',
+			RoomId: 10916706,
+			SubRoomId: 11195660,
+			ClubId: null,
+			Name: 'Building a Better Room Using Trigonometry',
+			Description: '',
+			StartTime: at(HOUR),
+			EndTime: at(2 * HOUR),
+			AttendeeCount: 1,
+			State: 0,
+			Accessibility: 1,
+			IsMultiInstance: false,
+			SupportMultiInstanceRoomChat: true,
+			DefaultBroadcastPermissions: 0,
+			CanRequestBroadcastPermissions: 0,
+		})
+		// Timestamps come back at seconds precision, as the client sends them.
+		expect(upcoming.StartTime).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
+	})
+
+	test('POST /api/playerevents/v2 answers the write envelope, not the bare event', async () => {
+		const res = await post('/api/playerevents/v2', { Name: 'Enveloped', RoomId: 3 })
+		const body = (await res.json()) as PlayerEventResult
+		expect(body.Result).toBe(0)
+		// Always null: no event tags are stored, but the field has to be present.
+		expect(body.TagModifyResult).toBeNull()
+		expect(body.PlayerEvent.Name).toBe('Enveloped')
+	})
+
+	test('POST /api/playerevents/v2 pushes a PlayerEventCreated notification to the creator', async () => {
+		// The notify DO is stubbed to record its last notifyPlayer call (see vitest.config).
+		const event = await create({
+			RoomId: 58,
+			Name: 'Open Mic',
+			Description: 'come hang',
+			StartTime: at(HOUR),
+			EndTime: at(3 * HOUR),
+		})
+		const res = await env.RECFLARE_NOTIFICATIONS_HUB.getByName('global').fetch('http://do/last')
+		const last = (await res.json()) as {
+			playerId: number
+			notificationType: number
+			data: Record<string, unknown>
+		}
+		expect(last.playerId).toBe(42) // the creator
+		expect(last.notificationType).toBe(80) // NotificationType.PlayerEventCreated
+
+		// camelCase, unlike the PascalCase record the response carries; `tags` and
+		// `broadcastingRoomInstanceId` don't exist on the record, and `State` is dropped.
+		// The real hub strips the null values from the frame before it goes on the wire.
+		expect(last.data).toEqual({
+			tags: [],
+			playerEventId: event.PlayerEventId,
+			creatorPlayerId: 42,
+			roomId: 58,
+			subRoomId: null,
+			clubId: null,
+			name: 'Open Mic',
+			description: 'come hang',
+			imageName: '', // empty string, not the record's null
+			startTime: `${event.StartTime.slice(0, -1)}.0000000Z`,
+			endTime: `${event.EndTime.slice(0, -1)}.0000000Z`,
+			attendeeCount: 1,
+			accessibility: 1,
+			isMultiInstance: false,
+			supportMultiInstanceRoomChat: false,
+			defaultBroadcastPermissions: 0,
+			canRequestBroadcastPermissions: 0,
+			broadcastingRoomInstanceId: null,
+		})
+		// Tick precision on the frame; the stored record keeps its bare form.
+		expect(event.StartTime).toMatch(/:\d{2}Z$/)
+	})
+
+	test('POST /api/playerevents/v2 takes the creator from the token, not the body', async () => {
+		const event = await create({ Name: 'Not Yours', RoomId: 3, CreatorPlayerId: 999 })
+		expect(event.CreatorPlayerId).toBe(42)
+	})
+
+	test('POST /api/playerevents/v2 defaults an empty body rather than rejecting it', async () => {
+		const event = await create({})
+		expect(event).toMatchObject({
+			Name: 'Untitled Event',
+			Description: '',
+			RoomId: 0,
+			SubRoomId: null,
+			ClubId: null,
+			ImageName: null,
+			AttendeeCount: 1,
+			State: 0,
+			Accessibility: 1,
+			IsMultiInstance: false,
+			SupportMultiInstanceRoomChat: false,
+			DefaultBroadcastPermissions: 0,
+			CanRequestBroadcastPermissions: 0,
+		})
+		// A start with no end runs for an hour.
+		expect(Date.parse(event.EndTime) - Date.parse(event.StartTime)).toBe(HOUR)
+	})
+
+	test('GET /api/playerevents/v1/:eventId serves the bare event', async () => {
+		const res = await get(`/api/playerevents/v1/${upcoming.PlayerEventId}`)
+		expect(res.status).toBe(200)
+		// No envelope here — unlike the writes.
+		expect(await res.json()).toEqual(upcoming)
+
+		expect((await get('/api/playerevents/v1/999999')).status).toBe(404)
+	})
+
+	test('GET /api/playerevents/v1/bulk answers in request order, skipping unknown ids', async () => {
+		const res = await get(
+			`/api/playerevents/v1/bulk?id=${clubEvent.PlayerEventId}&id=999999&id=${upcoming.PlayerEventId}`
+		)
+		expect(res.status).toBe(200)
+		const events = (await res.json()) as PlayerEvent[]
+		// Request order, not id order — and the missing id leaves no hole.
+		expect(events.map((e) => e.PlayerEventId)).toEqual([
+			clubEvent.PlayerEventId,
+			upcoming.PlayerEventId,
+		])
+
+		// No ids is an empty list, not every event.
+		expect(await (await get('/api/playerevents/v1/bulk')).json()).toEqual([])
+	})
+
+	test('GET /api/playerevents/v1/search matches name and description, skipping finished events', async () => {
+		const search = async (qs: string): Promise<PlayerEvent[]> =>
+			(await (await get(`/api/playerevents/v1/search${qs}`)).json()) as PlayerEvent[]
+
+		// Every term has to match, across name OR description.
+		expect((await search('?query=dungeons+escape')).map((e) => e.PlayerEventId)).toEqual([
+			clubEvent.PlayerEventId,
+		])
+		// …matched case-insensitively, and against the description too.
+		expect((await search('?query=upto%204%20players')).map((e) => e.PlayerEventId)).toEqual([
+			clubEvent.PlayerEventId,
+		])
+
+		// `pastEvent` matches on name but has already ended, so the browse query drops it.
+		const trig = await search('?query=trigonometry')
+		expect(trig.map((e) => e.PlayerEventId)).toEqual([upcoming.PlayerEventId])
+		expect(trig.map((e) => e.PlayerEventId)).not.toContain(pastEvent.PlayerEventId)
+
+		// Soonest first, and take/skip page through that order.
+		const all = await search('')
+		const starts = all.map((e) => e.StartTime)
+		expect([...starts].sort()).toEqual(starts)
+		expect(await search('?take=1')).toEqual([all[0]])
+		expect(await search('?skip=1&take=1')).toEqual([all[1]])
+	})
+
+	test('GET /api/playerevents/v1/searchlive serves what is running right now', async () => {
+		const res = await get('/api/playerevents/v1/searchlive')
+		expect(res.status).toBe(200)
+		const ids = ((await res.json()) as PlayerEvent[]).map((e) => e.PlayerEventId)
+		expect(ids).toContain(liveEvent.PlayerEventId)
+		// Started in an hour / finished already — neither is live.
+		expect(ids).not.toContain(upcoming.PlayerEventId)
+		expect(ids).not.toContain(pastEvent.PlayerEventId)
+	})
+
+	test('GET /api/playerevents/v1/clubs is a bare array; /club/:id is a paged envelope', async () => {
+		// The client deserializes the multi-club form as a list — an envelope here fails
+		// with "expected:'[', actual:'{'". Do not unify the two.
+		const many = await get('/api/playerevents/v1/clubs?id=7&id=8')
+		expect(many.status).toBe(200)
+		const events = (await many.json()) as PlayerEvent[]
+		expect(events.map((e) => e.PlayerEventId)).toEqual([
+			liveEvent.PlayerEventId, // started an hour ago — soonest first
+			clubEvent.PlayerEventId,
+		])
+
+		// The single-club form does wrap its events with a paging cursor.
+		const one = await get('/api/playerevents/v1/club/7')
+		expect(one.status).toBe(200)
+		expect(await one.json()).toEqual({ ContinuationToken: '', Events: events })
+
+		// A club with no events, and the no-ids case.
+		expect(await (await get('/api/playerevents/v1/club/8')).json()).toEqual({
+			ContinuationToken: '',
+			Events: [],
+		})
+		expect(await (await get('/api/playerevents/v1/clubs')).json()).toEqual([])
+	})
+
+	test('GET /api/playerevents/v1/all lists the caller’s own events, auth-gated', async () => {
+		expect((await get('/api/playerevents/v1/all')).status).toBe(401)
+
+		const mine = (await (await get('/api/playerevents/v1/all', '42')).json()) as {
+			Created: PlayerEvent[]
+			Responses: unknown[]
+		}
+		const ids = mine.Created.map((e) => e.PlayerEventId)
+		expect(ids).toContain(upcoming.PlayerEventId)
+		// 43 created that one, not 42.
+		expect(ids).not.toContain(liveEvent.PlayerEventId)
+		// Finished events stay in the creator's own list — only the browse queries drop them.
+		expect(ids).toContain(pastEvent.PlayerEventId)
+		// Nothing records an RSVP yet.
+		expect(mine.Responses).toEqual([])
+
+		const theirs = (await (await get('/api/playerevents/v1/all', '43')).json()) as {
+			Created: PlayerEvent[]
+		}
+		expect(theirs.Created.map((e) => e.PlayerEventId)).toEqual([liveEvent.PlayerEventId])
+	})
+
+	test('POST /api/playerevents/v2/:eventId edits only what the body carries, creator-only', async () => {
+		const event = await create({
+			RoomId: 5,
+			SubRoomId: 6,
+			ClubId: 9,
+			Name: 'Original',
+			Description: 'Original description',
+			StartTime: at(5 * HOUR),
+			EndTime: at(6 * HOUR),
+		})
+		const path = `/api/playerevents/v2/${event.PlayerEventId}`
+
+		expect(
+			(await exports.default.fetch(`${ORIGIN}${path}`, { method: 'POST', body: '{}' })).status
+		).toBe(401)
+		// 43 didn't create it.
+		expect((await post(path, { Name: 'Hijacked' }, '43')).status).toBe(403)
+		expect((await post('/api/playerevents/v2/999999', { Name: 'Nope' })).status).toBe(404)
+
+		const res = await post(path, { Name: 'Renamed' })
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as PlayerEventResult
+		expect(body.Result).toBe(0)
+		// Only the name moved; a partial post can't blank out the rest.
+		expect(body.PlayerEvent).toEqual({ ...event, Name: 'Renamed' })
+
+		// And it stuck.
+		expect(await (await get(`/api/playerevents/v1/${event.PlayerEventId}`)).json()).toEqual(
+			body.PlayerEvent
+		)
+	})
+
+	test('POST /api/playerevents/v2/:eventId clears a nullable id when the body sends null', async () => {
+		const event = await create({ RoomId: 5, SubRoomId: 6, ClubId: 9, Name: 'Clearable' })
+		const res = await post(`/api/playerevents/v2/${event.PlayerEventId}`, {
+			// Nested form again, and an explicit null — absent leaves the value alone,
+			// null genuinely clears it.
+			PlayerEvent: { ClubId: null, ImageName: null },
+		})
+		const updated = ((await res.json()) as PlayerEventResult).PlayerEvent
+		expect(updated.ClubId).toBeNull()
+		expect(updated.ImageName).toBeNull()
+		expect(updated.SubRoomId).toBe(6)
+	})
+
+	test('POST /api/playerevents/v2/:eventId cannot move ownership or the attendee count', async () => {
+		const event = await create({ RoomId: 5, Name: 'Fixed' })
+		const res = await post(`/api/playerevents/v2/${event.PlayerEventId}`, {
+			PlayerEventId: 424242,
+			CreatorPlayerId: 43,
+			AttendeeCount: 500,
+		})
+		const updated = ((await res.json()) as PlayerEventResult).PlayerEvent
+		expect(updated.PlayerEventId).toBe(event.PlayerEventId)
+		expect(updated.CreatorPlayerId).toBe(42)
+		expect(updated.AttendeeCount).toBe(1)
 	})
 })
 
@@ -2330,10 +2684,13 @@ describe('openapi', () => {
 			'GET /api/playerReputation/v1/{id}',
 			'GET /api/playerReputation/v2/bulk',
 			'GET /api/playerevents/v1/all',
+			'GET /api/playerevents/v1/bulk',
 			'GET /api/playerevents/v1/club/{clubId}',
 			'GET /api/playerevents/v1/clubs',
+			'GET /api/playerevents/v1/search',
 			'GET /api/playerevents/v1/searchlive',
 			'GET /api/playerevents/v1/tagfilters',
+			'GET /api/playerevents/v1/{eventId}',
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/quickPlay/v1/getandclear',
@@ -2368,6 +2725,8 @@ describe('openapi', () => {
 			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
+			'POST /api/playerevents/v2',
+			'POST /api/playerevents/v2/{eventId}',
 			'POST /api/players/v1/progression/bulk',
 			'POST /api/players/v2/progression/bulk',
 			'POST /api/playerwarnings',
