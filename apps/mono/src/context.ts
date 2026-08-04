@@ -12,6 +12,9 @@ import type { SharedHonoEnv, SharedHonoVariables } from '@repo/hono-helpers/src/
 export type Env = SharedHonoEnv & {
 	// HS256 JWT signing key (shared Secrets Store). Tokens signed by `auth` verify everywhere.
 	JWT_SECRET: SecretsStoreSecret
+	// Meta (Oculus) app secret, from the same store. Read only by `auth`, to validate a
+	// headset login's nonce with Meta (see apps/auth/src/meta-nonce.ts).
+	META_APP_SECRET: SecretsStoreSecret
 	// Shared `recflare` database (accounts, auth, api, clubs, match, rooms, …).
 	DB: D1Database
 	// Image storage bucket (api, img).

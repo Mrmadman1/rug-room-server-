@@ -2,13 +2,20 @@ import { adminSecretsStore, env } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
-import { GAME_VERSION, seedRoomWithSubRooms, SUBROOM_SCHEMA_DDL } from '@repo/domain'
+import {
+	GAME_VERSION,
+	ROOM_SCHEMA_DDL,
+	seedRoomWithSubRooms,
+	SUBROOM_SCHEMA_DDL,
+} from '@repo/domain'
 
 import '../../api.app'
 
 import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
+import { getReportsAgainst, SCHEMA_DDL as REPORTS_SCHEMA_DDL } from '../../reports-db'
+import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { Env } from '../../context'
 import type { SavedImage } from '../../images-db'
@@ -44,14 +51,9 @@ const TEST_ROOMS = [
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
-	await env.DB.prepare(
-		`CREATE TABLE IF NOT EXISTS room (
-			data TEXT NOT NULL,
-			room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.RoomId')) VIRTUAL,
-			name_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.Name'))) VIRTUAL,
-			creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL
-		)`
-	).run()
+	// The rooms worker's schema (room + interaction) — reading a room aggregates its
+	// cheer/favorite Stats from `interaction`, so both tables have to be here.
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Subrooms live in their own table now; getRoomById hydrates from it, so create it and
 	// split each seeded room's subrooms into it (mirrors the rooms worker's 0007 migration).
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -81,6 +83,12 @@ beforeAll(async () => {
 
 	// Inventions table (owned by the api worker) — invention save/mine use it.
 	for (const stmt of INVENTIONS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Reports table (owned by the api worker) — player reports are recorded here.
+	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Warnings table (owned by the api worker) — moderator-issued warnings land here.
+	for (const stmt of WARNINGS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -94,10 +102,13 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+// `roles` mints the `role` claim the auth worker stamps from an account's flags; left
+// off, the token carries none, which is what a plain player's looks like to the
+// role-gated routes.
+async function bearer(sub = '42', roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...(roles && { role: roles }) })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -108,6 +119,12 @@ async function bearer(sub = '42'): Promise<Record<string, string>> {
 	)
 	const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
 	return { Authorization: `Bearer ${signingInput}.${b64url(sig)}` }
+}
+
+/** Base64 SHA-256 — the form an invention version's `BlobHash` takes. */
+async function base64Sha256(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', bytes)
+	return btoa(String.fromCharCode(...new Uint8Array(digest)))
 }
 
 describe('public endpoints', () => {
@@ -766,6 +783,12 @@ describe('public endpoints', () => {
 	})
 
 	test('GET /api/inventions/v1/version serves the version; unknown versions 404', async () => {
+		// The data file is uploaded (via the storage worker) before the metadata save,
+		// so the version carries its hash from the start. No sha256 recorded on this
+		// object — the api worker digests the blob itself in that case.
+		const data = new Uint8Array([1, 2, 3, 4])
+		await env.CDN_ASSETS.put('invention/2026-07-12/lamp.inv', data)
+
 		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
 			headers: { ...(await bearer('7373')), 'Content-Type': 'application/json' },
@@ -777,7 +800,8 @@ describe('public endpoints', () => {
 		})
 		const { Invention } = (await save.json()) as InventionSaveResult
 
-		// The bare RRInventionVersion — the blob name is what the client downloads.
+		// The bare RRInventionVersion — the blob name is what the client downloads,
+		// BlobHash the base64 SHA-256 of what it will download.
 		const res = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=1`
 		)
@@ -786,6 +810,7 @@ describe('public endpoints', () => {
 			InventionId: Invention.InventionId,
 			VersionNumber: 1,
 			BlobName: '2026-07-12/lamp.inv',
+			BlobHash: await base64Sha256(data),
 			InstantiationCost: 42,
 		})
 
@@ -806,6 +831,44 @@ describe('public endpoints', () => {
 		expect(noVersion.status).toBe(400)
 		const noId = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/version?version=1`)
 		expect(noId.status).toBe(400)
+	})
+
+	test('BlobHash is null until the blob exists, then backfilled onto the invention', async () => {
+		// Saved before the upload landed: nothing to hash, so the field stays null
+		// rather than carrying a hash of something the client can't download.
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('7474')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Late Lamp', inventionDataFilename: '2026-07-12/late.inv' }),
+		})
+		const { Invention, InventionVersion } = (await save.json()) as InventionSaveResult
+		expect(InventionVersion.BlobHash).toBeNull()
+
+		const version = async (): Promise<Record<string, unknown>> => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=1`
+			)
+			return (await res.json()) as Record<string, unknown>
+		}
+		expect((await version()).BlobHash).toBeNull()
+
+		// Once the blob is there the hash resolves — here from the checksum recorded at
+		// upload time (what the storage worker puts), not by digesting the body.
+		const data = new Uint8Array([9, 8, 7])
+		await env.CDN_ASSETS.put('invention/2026-07-12/late.inv', data, {
+			sha256: await crypto.subtle.digest('SHA-256', data),
+		})
+		const hash = await base64Sha256(data)
+		expect((await version()).BlobHash).toBe(hash)
+
+		// And it's kept, so the other invention endpoints serve it too — without the
+		// read counting as an edit (ModifiedAt is untouched).
+		const details = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${Invention.InventionId}`
+		)
+		const stored = (await details.json()) as SavedInvention
+		expect(stored.CurrentVersion.BlobHash).toBe(hash)
+		expect(stored.ModifiedAt).toBe(Invention.ModifiedAt)
 	})
 
 	test('GET /api/inventions/v1/update edits metadata + permission, creator only', async () => {
@@ -1044,6 +1107,179 @@ describe('auth-gated endpoints', () => {
 			headers: { Authorization: 'Bearer not-a-real-token' },
 		})
 		expect(res.status).toBe(401)
+	})
+})
+
+describe('player reports', () => {
+	const submit = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+		exports.default.fetch(`${ORIGIN}/api/PlayerReporting/v3/create`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+
+	test('POST /api/PlayerReporting/v3/create records the report', async () => {
+		const res = await submit(
+			{
+				PlayerIdReported: '205',
+				ReportCategory: '100',
+				Details: 'ya know',
+				HeightReporter: '1.64',
+				HeightReported: '1.65',
+				RoomId: '58',
+				RoomInstanceType: 'Public',
+			},
+			await bearer()
+		)
+		expect(res.status).toBe(200)
+		// `error` is an empty string, not null — the real service's envelope.
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const [row] = await getReportsAgainst(env.DB, 205)
+		expect(row).toMatchObject({
+			// The reporter is the token's subject, not a body field.
+			reporter_player_id: 42,
+			reported_player_id: 205,
+			report_category: 100,
+			details: 'ya know',
+			height_reporter: 1.64,
+			height_reported: 1.65,
+			room_id: 58,
+			room_instance_type: 'Public',
+		})
+		expect(row?.created_at).toBeTruthy()
+	})
+
+	// Everything but the reported player is optional — a report raised outside a room
+	// carries no RoomId, and 0 means "no room" rather than room zero.
+	test('POST /api/PlayerReporting/v3/create stores absent fields as null', async () => {
+		const res = await submit({ PlayerIdReported: '206', RoomId: '0' }, await bearer())
+		expect(res.status).toBe(200)
+
+		const [row] = await getReportsAgainst(env.DB, 206)
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 206,
+			report_category: 0,
+			details: null,
+			height_reporter: null,
+			height_reported: null,
+			room_id: null,
+			room_instance_type: null,
+		})
+	})
+
+	// Append-only: a second report against the same player is a second row.
+	test('POST /api/PlayerReporting/v3/create appends rather than dedupes', async () => {
+		await submit({ PlayerIdReported: '207', Details: 'first' }, await bearer())
+		await submit({ PlayerIdReported: '207', Details: 'second' }, await bearer())
+		const rows = await getReportsAgainst(env.DB, 207)
+		expect(rows).toHaveLength(2)
+		// Newest first.
+		expect(rows.map((r) => r.details)).toEqual(['second', 'first'])
+	})
+
+	test('POST /api/PlayerReporting/v3/create 401s without a bearer token', async () => {
+		const res = await submit({ PlayerIdReported: '205' })
+		expect(res.status).toBe(401)
+	})
+
+	test('POST /api/PlayerReporting/v3/create 400s without a reported player', async () => {
+		const res = await submit({ Details: 'ya know' }, await bearer())
+		expect(res.status).toBe(400)
+		// Same envelope as the success branch — the client parses only one shape.
+		expect(await res.json()).toEqual({ success: false, error: 'PlayerIdReported is required' })
+	})
+})
+
+describe('player warnings', () => {
+	const MOD = ['gameClient', 'moderator']
+
+	const issue = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+		exports.default.fetch(`${ORIGIN}/api/playerwarnings`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+
+	test('POST /api/playerwarnings records the warning', async () => {
+		const res = await issue(
+			{
+				WarnedPlayerId: '205',
+				ReportCategory: '101',
+				DisplayReason: 'Sexual gestures',
+				ModeratorNote: 'dfg',
+			},
+			await bearer('42', MOD)
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const [row] = await getWarningsAgainst(env.DB, 205)
+		expect(row).toMatchObject({
+			// The moderator is the token's subject, not a body field.
+			moderator_player_id: 42,
+			warned_player_id: 205,
+			report_category: 101,
+			display_reason: 'Sexual gestures',
+			moderator_note: 'dfg',
+		})
+		expect(row?.created_at).toBeTruthy()
+	})
+
+	test('POST /api/playerwarnings stores absent fields as null', async () => {
+		const res = await issue({ WarnedPlayerId: '206' }, await bearer('42', MOD))
+		expect(res.status).toBe(200)
+
+		const [row] = await getWarningsAgainst(env.DB, 206)
+		expect(row).toMatchObject({
+			warned_player_id: 206,
+			report_category: 0,
+			display_reason: null,
+			moderator_note: null,
+		})
+	})
+
+	// Append-only, like reports: warning the same player twice is two rows.
+	test('POST /api/playerwarnings appends rather than dedupes', async () => {
+		await issue({ WarnedPlayerId: '207', ModeratorNote: 'first' }, await bearer('42', MOD))
+		await issue({ WarnedPlayerId: '207', ModeratorNote: 'second' }, await bearer('42', MOD))
+		const rows = await getWarningsAgainst(env.DB, 207)
+		expect(rows).toHaveLength(2)
+		// Newest first.
+		expect(rows.map((r) => r.moderator_note)).toEqual(['second', 'first'])
+	})
+
+	test('POST /api/playerwarnings 401s without a bearer token', async () => {
+		const res = await issue({ WarnedPlayerId: '205' })
+		expect(res.status).toBe(401)
+	})
+
+	// A valid token is not enough — a plain player's carries neither staff role.
+	// Nothing is written on the rejected branch.
+	test('POST /api/playerwarnings 403s without a staff role', async () => {
+		for (const roles of [undefined, ['gameClient']]) {
+			const res = await issue({ WarnedPlayerId: '208' }, await bearer('42', roles))
+			expect(res.status).toBe(403)
+			expect(await res.json()).toEqual({ success: false, error: 'Forbidden' })
+		}
+		expect(await getWarningsAgainst(env.DB, 208)).toHaveLength(0)
+	})
+
+	// `developer` gets in as well as `moderator` — staff hold both.
+	test('POST /api/playerwarnings accepts the developer role', async () => {
+		const res = await issue(
+			{ WarnedPlayerId: '209' },
+			await bearer('42', ['gameClient', 'developer'])
+		)
+		expect(res.status).toBe(200)
+		expect(await getWarningsAgainst(env.DB, 209)).toHaveLength(1)
+	})
+
+	test('POST /api/playerwarnings 400s without a warned player', async () => {
+		const res = await issue({ ModeratorNote: 'dfg' }, await bearer('42', MOD))
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ success: false, error: 'WarnedPlayerId is required' })
 	})
 })
 
@@ -1867,6 +2103,162 @@ describe('relationships', () => {
 	})
 })
 
+describe('messages', () => {
+	// The notify DO is stubbed to record every notifyPlayer call (see vitest.config).
+	type Sent = {
+		playerId: number
+		notificationType: number
+		data: { FromPlayerId: number; ToPlayerId: number; Type: number; Data: string }
+	}
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	const pushed = async (): Promise<Sent[]> =>
+		(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+	const send = async (fields: Record<string, string>, headers?: Record<string, string>) => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		return exports.default.fetch(`${ORIGIN}/api/messages/v2/send`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+	}
+
+	// NotificationType.MessageReceived — the same frame the Coach broadcast uses.
+	const MESSAGE_RECEIVED = 2
+
+	test('POST /api/messages/v2/send pushes MessageReceived to the recipient', async () => {
+		const res = await send({ ToPlayerId: '2', Type: '10', Data: '' }, await bearer('42'))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		expect(await pushed()).toEqual([
+			{
+				// Delivered to the recipient, not the sender.
+				playerId: 2,
+				notificationType: MESSAGE_RECEIVED,
+				// FromPlayerId is the token's subject, not a body field.
+				data: { FromPlayerId: 42, ToPlayerId: 2, Type: 10, Data: '' },
+			},
+		])
+	})
+
+	test('POST /api/messages/v2/send defaults Type and Data when omitted', async () => {
+		const res = await send({ ToPlayerId: '2' }, await bearer('42'))
+		expect(res.status).toBe(200)
+		expect((await pushed())[0]?.data).toEqual({
+			FromPlayerId: 42,
+			ToPlayerId: 2,
+			Type: 0,
+			Data: '',
+		})
+	})
+
+	test('POST /api/messages/v2/send 400s without a recipient, pushing nothing', async () => {
+		const res = await send({ Type: '10' }, await bearer('42'))
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ success: false, error: 'ToPlayerId is required' })
+		expect(await pushed()).toEqual([])
+	})
+
+	test('POST /api/messages/v2/send is auth-gated', async () => {
+		const res = await send({ ToPlayerId: '2' })
+		expect(res.status).toBe(401)
+		expect(await pushed()).toEqual([])
+	})
+})
+
+describe('mutual friends', () => {
+	// High, distinct ids so the friendships seeded here don't collide with the
+	// relationship tests above.
+	const CALLER = 800
+	const OTHER = 801
+
+	type Card = { AccountId: number; Username: string; DisplayName: string; ProfileImage: string }
+
+	const mutuals = async (query: string, sub = String(CALLER)): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}/api/relationships/mutualfriends${query}`, {
+			headers: await bearer(sub),
+		})
+
+	beforeAll(async () => {
+		const rel = (a: number, b: number, type = 3) =>
+			env.DB.prepare(
+				'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
+			).bind(a, b, type)
+		// 804 has no profileImage key at all — the projection must still answer a
+		// string. 806 is deliberately given no account row.
+		const account = (id: number, extra: Record<string, unknown>) =>
+			env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)').bind(
+				JSON.stringify({ accountId: id, username: `P${id}`, displayName: `Player ${id}`, ...extra })
+			)
+
+		await env.DB.batch([
+			account(CALLER, { profileImage: 'p800.jpg' }),
+			account(OTHER, { profileImage: 'p801.jpg' }),
+			account(802, { profileImage: 'p802.jpg' }),
+			account(803, { profileImage: 'p803.jpg' }),
+			account(804, {}),
+			// Seeded 804-first so the ascending order of the answer is the code's doing,
+			// not the insertion order's.
+			rel(CALLER, 804),
+			rel(802, CALLER), // friendship recorded from the other direction
+			rel(CALLER, 803),
+			rel(CALLER, 806),
+			rel(OTHER, 804), // shared → in the answer
+			rel(OTHER, 802), // shared → in the answer
+			rel(803, OTHER, 1), // only a pending request → NOT a friend of OTHER
+			rel(OTHER, 806), // shared, but 806 has no account row → dropped
+		])
+	})
+
+	test('GET /api/relationships/mutualfriends returns the shared friends', async () => {
+		const res = await mutuals(`?id=${OTHER}`)
+		expect(res.status).toBe(200)
+		const cards = (await res.json()) as Card[]
+		// 803 is only a pending request on OTHER's side, and 806 has no account row.
+		expect(cards.map((p) => p.AccountId)).toEqual([802, 804])
+		expect(cards[0]).toEqual({
+			AccountId: 802,
+			Username: 'P802',
+			DisplayName: 'Player 802',
+			ProfileImage: 'p802.jpg',
+		})
+		// No stored image → an empty string, never null/undefined.
+		expect(cards[1]?.ProfileImage).toBe('')
+	})
+
+	// The degenerate cases answer an empty list rather than an error — this feeds a
+	// profile panel, which would otherwise have nothing to render.
+	// `?id=` is the only accepted form — `?playerId=` reads as no id at all.
+	test('GET /api/relationships/mutualfriends answers [] for a missing/self/bad id', async () => {
+		for (const query of ['', '?id=0', '?id=-5', '?id=abc', `?id=${CALLER}`, `?playerId=${OTHER}`]) {
+			const res = await mutuals(query)
+			expect(res.status, query).toBe(200)
+			expect(await res.json(), query).toEqual([])
+		}
+	})
+
+	// Symmetric: 802 and 803 aren't friends with each other, but both are friends with
+	// 800, so 800 is what they have in common.
+	test('GET /api/relationships/mutualfriends works between two other players', async () => {
+		const cards = (await (await mutuals('?id=803', '802')).json()) as Card[]
+		expect(cards.map((p) => p.AccountId)).toEqual([CALLER])
+	})
+
+	test('GET /api/relationships/mutualfriends answers [] with nothing in common', async () => {
+		// 809 has no relationships at all.
+		const cards = (await (await mutuals('?id=809', '802')).json()) as Card[]
+		expect(cards).toEqual([])
+	})
+
+	test('GET /api/relationships/mutualfriends is auth-gated', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/relationships/mutualfriends?id=${OTHER}`
+		)
+		expect(res.status).toBe(401)
+	})
+})
+
 describe('openapi', () => {
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
@@ -1945,6 +2337,7 @@ describe('openapi', () => {
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/quickPlay/v1/getandclear',
+			'GET /api/relationships/mutualfriends',
 			'GET /api/relationships/v1/favorite',
 			'GET /api/relationships/v1/ignore',
 			'GET /api/relationships/v1/mute',
@@ -1964,6 +2357,7 @@ describe('openapi', () => {
 			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
 			'POST /api/PlayerReporting/v1/deviceId',
 			'POST /api/PlayerReporting/v1/hile',
+			'POST /api/PlayerReporting/v3/create',
 			'POST /api/avatar/v2/gifts/generate',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',
@@ -1971,10 +2365,12 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v6/save',
+			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
 			'POST /api/players/v1/progression/bulk',
 			'POST /api/players/v2/progression/bulk',
+			'POST /api/playerwarnings',
 			'POST /api/relationships/v1/favorite',
 			'POST /api/relationships/v1/ignore',
 			'POST /api/relationships/v1/mute',

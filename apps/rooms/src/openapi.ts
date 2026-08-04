@@ -64,6 +64,12 @@ export const FORBIDDEN_RESPONSE = {
 	description: 'A valid token, but not the room’s creator or a co-owner (empty body)',
 }
 
+/** The 403 the friends-only routes return (empty body). */
+export const NOT_FRIENDS_RESPONSE = {
+	description:
+		'A valid token, but the caller is not that player (nor a friend of theirs) (empty body)',
+}
+
 // ---- Parameters ------------------------------------------------------------
 
 /** A digits-only id path parameter (the route patterns constrain these to `[0-9]+`). */
@@ -82,6 +88,12 @@ export const roomIdParam = idParam('roomId', 'Room id')
 
 /** The `:subRoomId` path parameter. */
 export const subRoomIdParam = idParam('subRoomId', 'Subroom id (globally unique, not per-room)')
+
+/** The `:playerId` path parameter (an account id). */
+export const playerIdParam = idParam('playerId', 'The account whose list to read')
+
+/** The `:playerId` path parameter on the unban route. */
+export const bannedPlayerIdParam = idParam('playerId', 'The banned account to unban')
 
 /** An optional string query parameter. */
 export function stringQuery(name: string, description: string): OpenAPIV3_1.ParameterObject {
@@ -123,7 +135,11 @@ export const RoomTagDto = z.object({
 	Type: z.int().describe('0 = owner-set, 2 = auto'),
 })
 
-/** A room's engagement counters. Nothing increments these yet, so they stay at 0. */
+/**
+ * A room's engagement counters. `CheerCount`/`FavoriteCount` are aggregated from the
+ * per-player `interaction` rows on every read; nothing records visits yet, so
+ * `VisitorCount`/`VisitCount` stay at 0.
+ */
 export const RoomStatsDto = z.object({
 	CheerCount: z.int(),
 	FavoriteCount: z.int(),
@@ -428,6 +444,42 @@ export const RoleRequest = z.object({
 	role: z.string().describe('The role tier: 10 Host, 20 Moderator, 30 CoOwner, 255 Creator'),
 })
 
+/** `POST /rooms/{roomId}/bans` — the player to ban from the room. */
+export const BanRequest = z.object({
+	id: z.string().describe('Account id of the player to ban'),
+	banMask: z
+		.string()
+		.optional()
+		.describe('Stored verbatim; meaning unknown — the client sends `0`. Defaults to 0'),
+})
+
+/** A stored room ban — what `POST /rooms/{roomId}/bans` answers in `value`. */
+export const RoomBanDto = z.object({
+	RoomId: z.int(),
+	BannedPlayerId: z.int(),
+	BanMask: z.int(),
+	BannedByAccountId: z.int().describe('Who issued the ban'),
+	CreatedAt: z.string(),
+})
+
+/**
+ * One entry of `GET /rooms/{roomId}/bans` — the client's ban-list shape. camelCase and
+ * a different field set from the {@link RoomBanDto} the write answers: no room id (the
+ * path already says which room) and no ban mask.
+ */
+export const RoomBanEntryDto = z.object({
+	accountId: z.int().describe('The banned player'),
+	bannedByAccountId: z.int().describe('Who issued the ban'),
+	banStartTime: z.string().describe('ISO 8601 UTC, when the ban was issued'),
+})
+
+/** The envelope the ban write answers — same shape as the room writes, `value` is the ban. */
+export const RoomBanEnvelope = z.object({
+	success: z.boolean(),
+	error: z.string().describe('Empty on success'),
+	value: RoomBanDto.nullable().describe('Null on a rejection'),
+})
+
 /** `PUT /rooms/{roomId}/warning`. */
 export const WarningRequest = z.object({
 	warningMask: z.string().describe('Content-warning bit flags, as an integer'),
@@ -478,6 +530,35 @@ export const SubRoomAccessibilityRequest = z.object({
 				'`Dev_Unlisted` (case-insensitive) — or its ordinal 0–4'
 		),
 })
+
+/**
+ * `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions` — the entries to change, keyed by
+ * (`Permission`, `Role`). Only the pairs sent are touched. `Override` is the client's
+ * checkbox: true stores the entry, false clears it back to the default.
+ */
+export const SubRoomPermissionsRequest = z
+	.array(
+		z.object({
+			Permission: z
+				.string()
+				.describe('e.g. `CAN_SAVE_INVENTIONS`, `CAN_INVITE`, `CAN_USE_DELETE_ALL_BUTTON`'),
+			Role: z.int().describe('The role tier the entry applies to (0 = everyone, 30 = co-owner)'),
+			Override: z
+				.boolean()
+				.describe(
+					'The override checkbox, and a JSON boolean unlike `Value`: true stores this entry, ' +
+						'false DELETES any stored one so the pair falls back to its default'
+				),
+			Type: z.int().describe('Always 0 in what the client sends; stored verbatim'),
+			Value: z
+				.string()
+				.describe(
+					'A STRING, not a boolean — usually `True` / `False`, but kept verbatim: not every ' +
+						'permission’s UI is a True/False picker. Ignored when `Override` is false'
+				),
+		})
+	)
+	.describe('An array — the client sends one even when changing a single permission')
 
 /**
  * `POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save` — promotes one save to live.
@@ -543,11 +624,13 @@ export const SubRoomSavesPage = z.object({
 
 /** One entry of the permission table the client applies when it spawns into a room. */
 export const RoomPermissionDto = z.object({
-	Override: z.boolean(),
+	Override: z.boolean().describe('Always true on an entry that came from a subroom’s overrides'),
 	Permission: z.string().describe('e.g. `CAN_USE_MAKER_PEN`, `CAN_SAVE_INVENTIONS`'),
 	Role: z.int().describe('The role tier the permission applies to (0 = everyone)'),
 	Type: z.int(),
-	Value: z.string().describe('Always `True` — a permission is present or absent'),
+	Value: z
+		.string()
+		.describe('A STRING, not a boolean — `True` on the defaults, anything on an override'),
 })
 
 /**
@@ -556,6 +639,11 @@ export const RoomPermissionDto = z.object({
  * `PhotonAccessToken` is deliberately empty: the reference server signs it with a
  * secret/algorithm we don't have, and our Photon setup accepts an empty token. The
  * global (Role 0) maker pen is granted only to the hardcoded dev accounts.
+ *
+ * `Permissions` is the default table with the overrides stored on the subroom the caller
+ * is standing in merged over it (see
+ * `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions`): an override replaces the
+ * default with the same (`Permission`, `Role`), and one naming a new pair is appended.
  */
 export const PhotonAccessTokenDto = z.object({
 	Permissions: z.array(RoomPermissionDto),

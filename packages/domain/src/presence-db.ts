@@ -153,6 +153,28 @@ export async function countPlayersInInstance(
 }
 
 /**
+ * Live head-count per ROOM, keyed by room id — the players standing in any of a
+ * room's instances right now. One grouped query rather than a count per room, so
+ * feeds that rank by "who's playing" (the hot feed) stay a single read. Counts
+ * only unexpired presence; rooms nobody is in are simply absent from the map, and
+ * lobby (null-instance) presence is excluded.
+ */
+export async function countPlayersByRoom(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<Map<number, number>> {
+	const { results } = await db
+		.prepare(
+			`SELECT room_id AS roomId, COUNT(*) AS n FROM presence
+			 WHERE expires_at > ?1 AND room_instance_id IS NOT NULL AND room_id IS NOT NULL
+			 GROUP BY room_id`
+		)
+		.bind(now)
+		.all<{ roomId: number; n: number }>()
+	return new Map(results.map((r) => [r.roomId, r.n]))
+}
+
+/**
  * The room instances that expired presence rows still point at — the instances a
  * player was in when they stopped heartbeating (a crash or a hard quit, where no
  * matchmake ever moved them out). Their head-count has really dropped, so callers

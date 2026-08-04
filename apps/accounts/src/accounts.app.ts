@@ -112,7 +112,9 @@ function toSelfAccountDto(account: Account) {
 	return {
 		...toAccountDto(account),
 		email: account.email ?? null,
-		birthday: null,
+		// @todo he game client needs this to be set. I forget how birthdays were set, so for now
+		// everyone can be old.
+		birthday: '1904-01-01T00:00:00.000Z',
 		availableUsernameChanges: account.availableUsernameChanges ?? DEFAULT_USERNAME_CHANGES,
 	}
 }

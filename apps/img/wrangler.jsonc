@@ -17,10 +17,18 @@
 		"run_worker_first": true
 	},
 	// Images are stored as objects in an R2 bucket and streamed back by key.
+	// `recflare-cdn` (owned by the `cdn` worker, written by `storage`) is bound
+	// alongside it: uploads posted to `storage` as FileType 3 land under its
+	// `image/` prefix with no extension, and the client asks THIS worker for them
+	// by the bare name — see the extensionless-key branch in src/img.app.ts.
 	"r2_buckets": [
 		{
 			"binding": "IMAGES",
 			"bucket_name": "recflare-img"
+		},
+		{
+			"binding": "CDN_ASSETS",
+			"bucket_name": "recflare-cdn"
 		}
 	],
 	// Shared `recflare` D1 — the `img` worker owns the `images` metadata table

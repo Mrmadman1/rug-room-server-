@@ -97,6 +97,16 @@ export const BareString = z.string()
 /** The `{ error }` body the 400 / 403 branches return. */
 export const ErrorResponse = z.object({ error: z.string() })
 
+/**
+ * The `{ success, error }` envelope the report / warning writes and the message send
+ * answer with — `error` is an empty string on success, never null, and the rejected
+ * branches use the same shape so there is only one thing to parse.
+ */
+export const SuccessErrorEnvelope = z.object({
+	success: z.boolean(),
+	error: z.string().describe('Empty string when the call succeeded'),
+})
+
 // ---- Config ----------------------------------------------------------------
 
 /** `GET /api/config/v1/amplitude` — analytics keys (all disabled on this server). */
@@ -160,8 +170,33 @@ export const RelationshipDto = z.object({
 	Muted: z.int().describe('0/1 — the caller‘s own flag'),
 })
 
+/**
+ * `POST /api/messages/v2/send` form body — a message sent to another player. Everything
+ * is a string on the wire (it's form-encoded). The sender is NOT in the body — it's
+ * taken from the bearer token.
+ */
+export const SendMessageRequest = z.object({
+	ToPlayerId: z.string().describe('Account id of the recipient'),
+	Type: z
+		.string()
+		.optional()
+		.describe('The Message-model type, e.g. `10`. Passed through unmapped; defaults to 0'),
+	Data: z.string().optional().describe('The message payload; often empty'),
+})
+
 /** The `{ Success, Message }` ack the flag toggles answer with. */
 export const AckResponse = z.object({ Success: z.boolean(), Message: z.string() })
+
+/**
+ * One entry of `GET /api/relationships/mutualfriends` — a friend both players share.
+ * A trimmed account card, not a relationship: no relationship type or flags.
+ */
+export const MutualFriendDto = z.object({
+	AccountId: z.int(),
+	Username: z.string(),
+	DisplayName: z.string(),
+	ProfileImage: z.string().describe('The image name; an empty string when the account has none'),
+})
 
 // ---- Progression -----------------------------------------------------------
 
@@ -206,7 +241,10 @@ export const InventionVersionDto = z.object({
 	ReplicationId: z.string(),
 	VersionNumber: z.int(),
 	BlobName: z.string().describe('The `.inv` key in the storage worker‘s bucket'),
-	BlobHash: z.string().nullable(),
+	BlobHash: z
+		.string()
+		.nullable()
+		.describe('Base64 SHA-256 of the blob; null when it was never uploaded'),
 	InstantiationCost: z.int(),
 	LightsCost: z.int(),
 	ChipsCost: z.int(),
@@ -406,6 +444,48 @@ export const ModerationBlockDetails = z.object({
 	Message: z.string().nullable(),
 	PlayerIdReporter: z.int().nullable(),
 	TimeoutStartedAt: z.string().nullable(),
+})
+
+/**
+ * `POST /api/PlayerReporting/v3/create` form body — a player report. Everything is a
+ * string on the wire (it's form-encoded); only `PlayerIdReported` is required. The
+ * reporter is NOT in the body — it's taken from the bearer token.
+ */
+export const CreateReportRequest = z.object({
+	PlayerIdReported: z.string().describe('Account id of the player being reported'),
+	ReportCategory: z
+		.string()
+		.optional()
+		.describe('The reason picked in the report UI, e.g. `100`. Stored verbatim; unmapped'),
+	Details: z.string().optional().describe('The free-text description the reporter typed'),
+	HeightReporter: z
+		.string()
+		.optional()
+		.describe('Reporter’s player height in metres at report time, e.g. `1.64`'),
+	HeightReported: z.string().optional().describe('Reported player’s height in metres'),
+	RoomId: z.string().optional().describe('Room the report was raised in, if any'),
+	RoomInstanceType: z
+		.string()
+		.optional()
+		.describe('Instance type name, e.g. `Public`. Stored verbatim'),
+})
+
+/**
+ * `POST /api/playerwarnings` form body — a warning a moderator hands down. Everything
+ * is a string on the wire (it's form-encoded); only `WarnedPlayerId` is required. The
+ * moderator is NOT in the body — it's taken from the bearer token.
+ */
+export const CreateWarningRequest = z.object({
+	WarnedPlayerId: z.string().describe('Account id of the player being warned'),
+	ReportCategory: z
+		.string()
+		.optional()
+		.describe('The reason category, e.g. `101`. Stored verbatim; unmapped'),
+	DisplayReason: z
+		.string()
+		.optional()
+		.describe('What the warned player is shown, e.g. `Sexual gestures`'),
+	ModeratorNote: z.string().optional().describe('Internal note; never shown to the player'),
 })
 
 /** `POST /api/PlayerReporting/v1/deviceId` form body — the id rotation the client reports. */

@@ -15,6 +15,9 @@ const SIGNATURE_KEY_ID = 'KEY:RSA:p1.rec.net'
 /** Static asset served (200) when the requested key is missing from R2. */
 const FALLBACK_ASSET_PATH = '/DefaultProfileImage.jpg'
 
+/** Prefix extensionless keys resolve under in the shared `recflare-cdn` bucket. */
+const CDN_IMAGE_PREFIX = 'image/'
+
 /**
  * Cache-Control for served images. Uploaded images are immutable once written,
  * so cache for a year and mark `immutable` so browsers never revalidate. A new
@@ -99,6 +102,23 @@ function resizeImage(input: Uint8Array, transform: Transform): Uint8Array {
 	} finally {
 		for (const image of owned) image.free()
 	}
+}
+
+/**
+ * Which bucket (and under which key) a requested path resolves in.
+ *
+ * Every object the `api` worker writes to `recflare-img` keeps a file extension
+ * (`.jpg` is forced when the upload has none), so an extensionless key can only be
+ * a `storage` upload: FileType 3 lands in the shared `recflare-cdn` bucket as
+ * `image/<date>/<uuid>` and the client references it by the bare `<date>/<uuid>`
+ * name it got back. That makes the extension a reliable discriminator —
+ * `/2028-06-01/<uuid>` here is `recflare-cdn`'s `image/2028-06-01/<uuid>`.
+ */
+function resolveObject(env: Env, key: string): { bucket: R2Bucket; objectKey: string } {
+	const filename = key.slice(key.lastIndexOf('/') + 1)
+	return filename.includes('.')
+		? { bucket: env.IMAGES, objectKey: key }
+		: { bucket: env.CDN_ASSETS, objectKey: CDN_IMAGE_PREFIX + key }
 }
 
 // Import the signing key once per isolate. The key material is constant for the
@@ -231,9 +251,11 @@ app.get(
 					description: [
 						'Image hosting for recflare, a private-server reimplementation of the Rec Room',
 						'backend. Serves every image the client renders — profile photos, room thumbnails,',
-						'club banners and the photo feed — from an R2 bucket, with bundled static assets',
+						'club banners and the photo feed — out of R2, with bundled static assets',
 						'(`static/`) taking precedence over the bucket and `DefaultProfileImage.jpg` served',
-						'as the fallback when a key is missing. Optional on-the-fly center-crop and resize',
+						'as the fallback when a key is missing. Keys with an extension come from the',
+						'`recflare-img` bucket; extensionless ones are `storage` uploads and come from the',
+						'shared `recflare-cdn` bucket under its `image/` prefix. Optional center-crop and resize',
 						'run through the Photon WASM codec; `?sig=p1` adds the RSA-SHA1 `Content-Signature`',
 						'header the client verifies against `KEY:RSA:p1.rec.net`.',
 						'',
@@ -265,6 +287,12 @@ app.get(
 			'(e.g. `Base/Clearcut.jpg`). A bundled static asset always wins over an R2 object of',
 			'the same key; when neither exists the bundled `DefaultProfileImage.jpg` is served',
 			'with a 200 rather than a 404, so the client never renders a broken image.',
+			'',
+			'Which bucket the key resolves in depends on its extension. A key with one (always',
+			'the case for an `api` image upload) comes from `recflare-img`. A key WITHOUT one is',
+			'a `storage` upload and comes from the shared `recflare-cdn` bucket under its',
+			'`image/` prefix, so `/2028-06-01/<uuid>` here serves `image/2028-06-01/<uuid>`',
+			'there.',
 			'',
 			'Responses carry `Cache-Control: public, max-age=31536000, immutable` — an uploaded',
 			'image is never rewritten in place, a new image gets a new key.',
@@ -360,8 +388,9 @@ app.get(
 		// resized response carries no etag, so the client can never send a matching
 		// one. Skip the precondition when a transform is requested.
 		const ifNoneMatch = transform ? undefined : c.req.header('if-none-match')?.replace(/"/g, '')
-		const object = await c.env.IMAGES.get(
-			key,
+		const { bucket, objectKey } = resolveObject(c.env, key)
+		const object = await bucket.get(
+			objectKey,
 			ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : undefined
 		)
 		if (!object) {

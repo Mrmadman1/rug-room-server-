@@ -34,8 +34,15 @@ const PUBLIC_SPKI_B64 =
 // bucket path rather than a static asset.
 const R2_KEY = 'user-photo.jpg'
 
+// An extensionless name, as returned by the `storage` worker for a FileType 3
+// upload — served from `recflare-cdn` under `image/`, not `recflare-img`.
+const CDN_NAME = '2028-06-01/12345-67890-12345'
+
 beforeAll(async () => {
 	await env.IMAGES.put(R2_KEY, IMAGE_BYTES, {
+		httpMetadata: { contentType: 'image/jpeg' },
+	})
+	await env.CDN_ASSETS.put(`image/${CDN_NAME}`, IMAGE_BYTES, {
 		httpMetadata: { contentType: 'image/jpeg' },
 	})
 	// Seed R2 with a key that ALSO exists in `static/` to prove static wins.
@@ -56,6 +63,38 @@ describe('img endpoints', () => {
 		expect(res.status).toBe(200)
 		expect(res.headers.get('content-type')).toBe('image/jpeg')
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES)
+	})
+
+	it('serves an extensionless key from the cdn bucket under image/', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/${CDN_NAME}`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('image/jpeg')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES)
+	})
+
+	it('does not look for an extensionless key in the image bucket', async () => {
+		// Same bare name seeded into `recflare-img` instead: extensionless keys only
+		// ever resolve against `recflare-cdn`, so this falls through to the default.
+		await env.IMAGES.put('2028-06-02/only-in-img', IMAGE_BYTES)
+		const res = await SELF.fetch(`${ORIGIN}/2028-06-02/only-in-img`)
+		expect(res.status).toBe(200)
+		const body = new Uint8Array(await res.arrayBuffer())
+		expect(body.length).toBeGreaterThan(IMAGE_BYTES.length)
+	})
+
+	it('resizes an extensionless cdn image', async () => {
+		// Exercises the transform path against the cdn bucket, not just the stream-through.
+		// Needs a decodable JPEG, so reuse a bundled static asset's bytes.
+		const real = await (await SELF.fetch(`${ORIGIN}/3DCharades.jpg`)).arrayBuffer()
+		await env.CDN_ASSETS.put('image/2028-06-03/real-photo', real, {
+			httpMetadata: { contentType: 'image/jpeg' },
+		})
+
+		const res = await SELF.fetch(`${ORIGIN}/2028-06-03/real-photo?width=128`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('image/jpeg')
+		expect(res.headers.get('etag')).toBeNull()
+		expect(jpegSize(new Uint8Array(await res.arrayBuffer())).width).toBe(128)
 	})
 
 	it('serves a static asset in preference to an R2 object of the same key', async () => {

@@ -13,6 +13,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { NotificationType } from '../../../../notify/src/notification-types'
 import importRooms from '../../../static/ImportRooms.json'
 
 import type { Env } from '../../context'
@@ -31,10 +32,12 @@ function b64url(input: ArrayBuffer | string): string {
 	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
-async function bearer(sub: string): Promise<Record<string, string>> {
+// `roles` mints the `role` claim the auth worker stamps from an account's flags; left
+// off, the token carries none — what a plain player's looks like to the role gates.
+async function bearer(sub: string, roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...(roles && { role: roles }) })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -58,6 +61,25 @@ beforeAll(async () => {
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
+
+	// Relationship table (owned by the api worker) — `visitedby/:playerId` reads it to
+	// check the caller is a friend of the player whose history they're asking for.
+	await env.DB.prepare(
+		`CREATE TABLE IF NOT EXISTS relationship (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			requester_id INTEGER NOT NULL,
+			target_id INTEGER NOT NULL,
+			relationship_type INTEGER NOT NULL DEFAULT 0
+		)`
+	).run()
+	const insertRel = env.DB.prepare(
+		'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
+	)
+	await env.DB.batch([
+		insertRel.bind(791, 790, 3), // friends — the caller (791) is the requester
+		insertRel.bind(790, 792, 3), // friends — the caller (792) is the target
+		insertRel.bind(793, 790, 1), // request out, not accepted — 793 is NOT a friend
+	])
 })
 
 describe('rooms endpoints', () => {
@@ -260,6 +282,62 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
+	it('GET /rooms/visitedby/:playerId serves a friend’s visited rooms and 403s everyone else', async () => {
+		// Give 790 a visit history (cheering/favoriting stamps a last-visit).
+		const subject = await bearer('790')
+		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, {
+			method: 'PUT',
+			headers: subject,
+		})
+		await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me/favorite`, {
+			method: 'PUT',
+			headers: subject,
+		})
+
+		// A mutual friend reads it — a bare array, regardless of which side of the
+		// relationship row the caller sits on.
+		for (const friend of ['791', '792']) {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`, {
+				headers: await bearer(friend),
+			})
+			expect(res.status).toBe(200)
+			const body = (await res.json()) as Array<{ RoomId: number }>
+			expect(body.map((r) => r.RoomId).sort((a, b) => a - b)).toEqual([2, 12])
+		}
+
+		// Paginated via skip/take.
+		const page = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/visitedby/790?skip=0&take=1`, {
+				headers: await bearer('791'),
+			})
+		).json()) as unknown[]
+		expect(page.length).toBe(1)
+
+		// Your own history is readable by id, not just via `me`.
+		const own = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`, { headers: subject })
+		).json()) as unknown[]
+		expect(own.length).toBe(2)
+
+		// A pending request is not a friendship, and a stranger is not either → 403.
+		for (const outsider of ['793', '794']) {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`, {
+				headers: await bearer(outsider),
+			})
+			expect(res.status).toBe(403)
+		}
+
+		// No token at all → 401, never a fallback account.
+		const anon = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`)
+		expect(anon.status).toBe(401)
+
+		// `visitedby/me` still routes to the literal handler, not the id pattern.
+		const me = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers: subject })
+		).json()) as unknown[]
+		expect(me.length).toBe(2)
+	})
+
 	it('GET /rooms/hot returns a paginated { Results, TotalResults } of public rooms', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/hot?skip=0&take=100`)
 		expect(res.status).toBe(200)
@@ -293,6 +371,49 @@ describe('rooms endpoints', () => {
 		expect(body.TotalResults).toBeGreaterThan(body.Results.length)
 	})
 
+	it('GET /rooms/hot ranks rooms by the live presence in their instances', async () => {
+		const feed = async (): Promise<number[]> =>
+			(
+				(await (await SELF.fetch(`${ORIGIN}/rooms/hot?skip=0&take=100`)).json()) as {
+					Results: Array<{ RoomId: number }>
+				}
+			).Results.map((r) => r.RoomId)
+
+		// Two rooms from the tail of the engagement-ordered feed, so any move to the
+		// front can only come from presence.
+		const before = await feed()
+		const busiest = before[before.length - 1]
+		const quieter = before[before.length - 2]
+
+		// Two players in two different instances of `busiest`, one in `quieter`, plus a
+		// lobby presence (no instance) that must not count for anyone.
+		const expiresAt = Math.floor(Date.now() / 1000) + 900
+		const seed = env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		await env.DB.batch(
+			[
+				{ accountId: 90001, roomInstance: { roomInstanceId: 1000901, roomId: busiest } },
+				{ accountId: 90002, roomInstance: { roomInstanceId: 1000902, roomId: busiest } },
+				{ accountId: 90003, roomInstance: { roomInstanceId: 1000903, roomId: quieter } },
+				{ accountId: 90004, roomInstance: null },
+			].map((p) => seed.bind(JSON.stringify({ ...p, expiresAt })))
+		)
+
+		expect((await feed()).slice(0, 2)).toEqual([busiest, quieter])
+
+		// Expired presence doesn't count — the feed falls back to engagement order.
+		await env.DB.prepare(
+			`UPDATE presence SET data = json_set(data, '$.expiresAt', ?1)
+			 WHERE account_id IN (90001, 90002, 90003, 90004)`
+		)
+			.bind(Math.floor(Date.now() / 1000) - 1)
+			.run()
+		expect(await feed()).toEqual(before)
+
+		await env.DB.prepare(
+			'DELETE FROM presence WHERE account_id IN (90001, 90002, 90003, 90004)'
+		).run()
+	})
+
 	it('GET /rooms/hot aliases #recroomoriginal to the rro tag', async () => {
 		const aliased = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/hot?tag=recroomoriginal`)
@@ -302,6 +423,66 @@ describe('rooms endpoints', () => {
 		}
 		expect(aliased.TotalResults).toBe(direct.TotalResults)
 		expect(aliased.TotalResults).toBeGreaterThan(0)
+	})
+
+	it('GET /rooms/hot?tag=new serves player-made rooms newest-first (pseudo-tag)', async () => {
+		type Feed = { Results: Array<{ Name: string }>; TotalResults: number }
+		const feed = async (): Promise<Feed> =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/hot?tag=new&skip=0&take=100`)).json()) as Feed
+		const names = async (): Promise<string[]> => (await feed()).Results.map((r) => r.Name)
+
+		// No room carries a `new` tag, and every seeded room is a Rec Room Original — so
+		// the feed is empty until a player makes something.
+		expect(await feed()).toEqual({ Results: [], TotalResults: 0 })
+
+		const seeded: number[] = []
+		const seed = async (room: Record<string, unknown>) => {
+			seeded.push(Number(room.RoomId))
+			await seedRoomWithSubRooms(env.DB, { Accessibility: 1, IsDorm: false, IsRRO: false, ...room })
+		}
+
+		// Two player-made public rooms and one that isn't public.
+		await seed({ RoomId: 9001, Name: 'OlderPlayerRoom', CreatedAt: '2026-07-01T00:00:00Z' })
+		await seed({ RoomId: 9002, Name: 'NewerPlayerRoom', CreatedAt: '2026-07-02T00:00:00Z' })
+		await seed({
+			RoomId: 9003,
+			Name: 'UnlistedPlayerRoom',
+			CreatedAt: '2026-07-03T00:00:00Z',
+			Accessibility: 2,
+		})
+
+		// Newest first, and the non-public room is excluded as it is everywhere else.
+		expect(await feed()).toMatchObject({
+			Results: [{ Name: 'NewerPlayerRoom' }, { Name: 'OlderPlayerRoom' }],
+			TotalResults: 2,
+		})
+
+		// An RRO stays out even when it's the newest room in the database — by the flag,
+		// or by the auto-derived `rro` tag alone.
+		await seed({
+			RoomId: 9004,
+			Name: 'BrandNewRRO',
+			CreatedAt: '2026-07-04T00:00:00Z',
+			IsRRO: true,
+		})
+		await seed({
+			RoomId: 9005,
+			Name: 'TaggedRRO',
+			CreatedAt: '2026-07-05T00:00:00Z',
+			Tags: [{ Tag: 'rro', Type: 2 }],
+		})
+		expect(await names()).toEqual(['NewerPlayerRoom', 'OlderPlayerRoom'])
+
+		// Paging comes off the same order.
+		const page = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/hot?tag=new&skip=1&take=1`)
+		).json()) as Feed
+		expect(page).toMatchObject({ Results: [{ Name: 'OlderPlayerRoom' }], TotalResults: 2 })
+
+		// Leave the shared feeds as they were for the tests that follow.
+		const ids = seeded.join(',')
+		await env.DB.prepare(`DELETE FROM room WHERE room_id IN (${ids})`).run()
+		await env.DB.prepare(`DELETE FROM subroom WHERE room_id IN (${ids})`).run()
 	})
 
 	it('GET /rooms/base returns a bare array of base/template rooms (incl. non-public)', async () => {
@@ -558,6 +739,21 @@ describe('rooms endpoints', () => {
 		}
 	})
 
+	const postForm = async (
+		path: string,
+		fields: Record<string, string>,
+		sub?: string,
+		roles?: string[]
+	) =>
+		SELF.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: {
+				...(sub ? await bearer(sub, roles) : {}),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams(fields).toString(),
+		})
+
 	const putForm = async (path: string, fields: Record<string, string>, sub?: string) =>
 		SELF.fetch(`${ORIGIN}${path}`, {
 			method: 'PUT',
@@ -743,6 +939,200 @@ describe('rooms endpoints', () => {
 		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 5, Role: 10 }))
 		// The seeded co-owner (account 2) is left intact.
 		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 2, Role: 30 }))
+	})
+
+	it('POST /rooms/:id/bans is gated to the room’s owners or staff, and persists', async () => {
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		const bansOf = async (roomId: number) =>
+			(
+				await env.DB.prepare(
+					'SELECT banned_player_id, ban_mask, banned_by_account_id FROM room_ban WHERE room_id = ?1'
+				)
+					.bind(roomId)
+					.all<{ banned_player_id: number; ban_mask: number; banned_by_account_id: number }>()
+			).results
+
+		// No token → 401 (auth gate).
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '205' })).status).toBe(401)
+		// A valid token, no role on the room and no staff role → 403.
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '205' }, '999')).status).toBe(403)
+		// Unknown room → failure envelope.
+		expect(
+			await envOf(await postForm('/rooms/99999/bans', { banMask: '0', id: '205' }, '1'))
+		).toMatchObject({ success: false, error: 'This room does not exist!' })
+
+		// The owner bans player 205 — the real client body.
+		const ok = await postForm('/rooms/2/bans', { banMask: '0', id: '205' }, '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({
+			success: true,
+			error: '',
+			value: { RoomId: 2, BannedPlayerId: 205, BanMask: 0, BannedByAccountId: 1 },
+		})
+		expect(await bansOf(2)).toEqual([
+			{ banned_player_id: 205, ban_mask: 0, banned_by_account_id: 1 },
+		])
+
+		// Re-banning rewrites the one row rather than appending a second.
+		expect((await postForm('/rooms/2/bans', { banMask: '7', id: '205' }, '2')).status).toBe(200)
+		expect(await bansOf(2)).toEqual([
+			{ banned_player_id: 205, ban_mask: 7, banned_by_account_id: 2 },
+		])
+
+		// A staff token bans in a room they have no role on.
+		const byStaff = await postForm('/rooms/2/bans', { id: '206' }, '999', [
+			'gameClient',
+			'moderator',
+		])
+		expect(byStaff.status).toBe(200)
+		// banMask defaults to 0 when the field is absent.
+		expect(await envOf(byStaff)).toMatchObject({ value: { BannedPlayerId: 206, BanMask: 0 } })
+
+		// Refusals: no id, yourself, and an owner of the room (a co-owner must not be
+		// able to ban the creator out of their own room).
+		expect(await envOf(await postForm('/rooms/2/bans', { id: 'nope' }, '1'))).toMatchObject({
+			success: false,
+			value: null,
+		})
+		expect(await envOf(await postForm('/rooms/2/bans', { id: '1' }, '1'))).toMatchObject({
+			success: false,
+			error: 'You cannot ban yourself!',
+		})
+		expect(await envOf(await postForm('/rooms/2/bans', { id: '1' }, '2'))).toMatchObject({
+			success: false,
+			error: 'You cannot ban an owner of this room!',
+		})
+		// Nothing was written by any of the refusals.
+		expect(await bansOf(2)).toHaveLength(2)
+	})
+
+	it('POST /rooms/:id/bans kicks the banned player', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: unknown }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sentSince = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+		// The room's current name, read rather than hardcoded — earlier tests rename it.
+		const { Name } = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { Name: string }
+
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '207' }, '1')).status).toBe(200)
+
+		// A ModerationKick (id 22) to the BANNED player, not the caller — it ejects them
+		// from the instance they're in now; the row keeps them out of future matchmakes.
+		// Asserted against the enum rather than a literal: the ids are notify's to change.
+		expect(await sentSince()).toEqual([
+			{
+				playerId: 207,
+				notificationType: NotificationType.ModerationKick,
+				// The client's moderation payload, camelCase, in wire order.
+				data: {
+					reportCategory: -1, // Moderator — a person acted, not the system
+					duration: 0, // a room ban has no expiry
+					gameSessionId: 0,
+					// The host ejected them (as opposed to a room vote-kick, which doesn't
+					// exist yet). Account 1 owns RecCenter, so it hosts it.
+					isHostKick: true,
+					message: `You have been banned from ${Name}.`,
+					playerIdReporter: 1,
+					isBan: true,
+					isVoiceModAutoban: false,
+				},
+			},
+		])
+
+		// A staff moderator doesn't host the room, so it isn't a host kick — and
+		// `playerIdReporter` is still whoever caused it.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect(
+			(await postForm('/rooms/2/bans', { id: '208' }, '999', ['gameClient', 'moderator'])).status
+		).toBe(200)
+		expect((await sentSince())[0]).toMatchObject({
+			playerId: 208,
+			data: { isHostKick: false, playerIdReporter: 999 },
+		})
+	})
+
+	it('GET /rooms/:id/bans lists the room’s bans, under the same gate', async () => {
+		type Entry = { accountId: number; bannedByAccountId: number; banStartTime: string }
+		const list = async (path: string, sub?: string, roles?: string[]) =>
+			SELF.fetch(`${ORIGIN}${path}`, { headers: sub ? await bearer(sub, roles) : {} })
+
+		// Room 3 is owned by account 1 (it has no bans yet) — ban two players into it.
+		expect((await postForm('/rooms/3/bans', { id: '401' }, '1')).status).toBe(200)
+		expect((await postForm('/rooms/3/bans', { id: '402' }, '1')).status).toBe(200)
+
+		// No token → 401; a valid token with no room role and no staff role → 403.
+		expect((await list('/rooms/3/bans')).status).toBe(401)
+		expect((await list('/rooms/3/bans', '999')).status).toBe(403)
+
+		const res = await list('/rooms/3/bans', '1')
+		expect(res.status).toBe(200)
+		// A bare array in the client's camelCase shape — no room id, no ban mask.
+		const bans = (await res.json()) as Entry[]
+		expect(bans.map((b) => b.accountId).sort((a, b) => a - b)).toEqual([401, 402])
+		expect(bans[0]).toEqual({
+			accountId: expect.any(Number),
+			bannedByAccountId: 1,
+			banStartTime: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+		})
+
+		// A staffer can read a list for a room they have no role on.
+		expect((await list('/rooms/3/bans', '999', ['gameClient', 'moderator'])).status).toBe(200)
+
+		// An unknown room reads the same as a room with nobody banned — no probing which
+		// room ids exist.
+		expect(await (await list('/rooms/99999/bans', '1')).json()).toEqual([])
+	})
+
+	it('DELETE /rooms/:id/bans/:playerId lifts a ban, under the same gate', async () => {
+		const del = async (path: string, sub?: string, roles?: string[]) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method: 'DELETE',
+				headers: sub ? await bearer(sub, roles) : {},
+			})
+		const isBanned = async (roomId: number, playerId: number) =>
+			(await env.DB.prepare(
+				'SELECT 1 AS hit FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2'
+			)
+				.bind(roomId, playerId)
+				.first()) !== null
+
+		// Two bans to lift: one removed by the owner, one by a staffer.
+		expect((await postForm('/rooms/2/bans', { id: '305' }, '1')).status).toBe(200)
+		expect((await postForm('/rooms/2/bans', { id: '306' }, '1')).status).toBe(200)
+
+		// No token → 401; a valid token with no room role and no staff role → 403.
+		expect((await del('/rooms/2/bans/305')).status).toBe(401)
+		expect((await del('/rooms/2/bans/305', '999')).status).toBe(403)
+		expect(await isBanned(2, 305)).toBe(true)
+
+		// Unknown room → failure envelope.
+		expect(await envOf(await del('/rooms/99999/bans/305', '1'))).toMatchObject({
+			success: false,
+			error: 'This room does not exist!',
+		})
+
+		// The owner lifts it; the removed ban comes back as `value`.
+		const ok = await del('/rooms/2/bans/305', '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({
+			success: true,
+			error: '',
+			value: { RoomId: 2, BannedPlayerId: 305 },
+		})
+		expect(await isBanned(2, 305)).toBe(false)
+
+		// Unbanning someone who isn't banned is a rejection, not a silent success.
+		expect(await envOf(await del('/rooms/2/bans/305', '1'))).toMatchObject({
+			success: false,
+			error: 'This player is not banned from this room!',
+			value: null,
+		})
+
+		// A staff token may lift a ban in a room they have no role on.
+		expect((await del('/rooms/2/bans/306', '999', ['gameClient', 'developer'])).status).toBe(200)
+		expect(await isBanned(2, 306)).toBe(false)
 	})
 
 	it('PUT /rooms/:id/warning is auth-gated, owner/co-owner-only, and persists', async () => {
@@ -1433,13 +1823,10 @@ describe('rooms endpoints', () => {
 	})
 
 	it('GET /photon_access_token 401s without a token', async () => {
-		for (const path of ['/photon_access_token', '/roomserver/photon_access_token']) {
-			const res = await SELF.fetch(`${ORIGIN}${path}`)
-			expect(res.status).toBe(401)
-		}
+		expect((await SELF.fetch(`${ORIGIN}/photon_access_token`)).status).toBe(401)
 	})
 
-	it('GET /photon_access_token (bare + /roomserver) returns permissions + presence instance', async () => {
+	it('GET /photon_access_token returns permissions + presence instance', async () => {
 		// Seed the caller's presence so RoomInstanceId reflects their current instance.
 		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
 			.bind(
@@ -1450,22 +1837,19 @@ describe('rooms endpoints', () => {
 				})
 			)
 			.run()
-		const headers = await bearer('777')
-		for (const path of ['/photon_access_token', '/roomserver/photon_access_token']) {
-			const res = await SELF.fetch(`${ORIGIN}${path}`, { headers })
-			expect(res.status).toBe(200)
-			const body = (await res.json()) as {
-				Permissions: Array<{ Permission: string; Role: number }>
-				PhotonAccessToken: string
-				RoomInstanceId: number | null
-			}
-			expect(body.Permissions.length).toBe(11)
-			expect(body.RoomInstanceId).toBe(1000042)
-			// A non-dev account does NOT get the global (Role 0) maker pen.
-			expect(
-				body.Permissions.some((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)
-			).toBe(false)
+		const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer('777') })
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			Permissions: Array<{ Permission: string; Role: number }>
+			PhotonAccessToken: string
+			RoomInstanceId: number | null
 		}
+		expect(body.Permissions.length).toBe(11)
+		expect(body.RoomInstanceId).toBe(1000042)
+		// A non-dev account does NOT get the global (Role 0) maker pen.
+		expect(body.Permissions.some((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toBe(
+			false
+		)
 	})
 
 	it('GET /photon_access_token returns null RoomInstanceId when the caller has no presence', async () => {
@@ -1524,6 +1908,55 @@ describe('rooms endpoints', () => {
 			await SELF.fetch(`${ORIGIN}/rooms/12/interactionby/me`, { headers: other })
 		).json()) as Interaction
 		expect(otherGet).toMatchObject({ Cheered: false, Favorited: false })
+	})
+
+	it('room Stats aggregate cheers/favorites from the interaction table', async () => {
+		type Stats = {
+			CheerCount: number
+			FavoriteCount: number
+			VisitorCount: number
+			VisitCount: number
+		}
+		// Room 15 (CrimsonCauldron) is untouched by the other interaction tests.
+		const searched = async (): Promise<Stats> => {
+			const body = (await (
+				await SELF.fetch(`${ORIGIN}/rooms/search?query=crimsoncauldron`)
+			).json()) as { Results: Array<{ Stats: Stats }> }
+			return body.Results[0]!.Stats
+		}
+		const direct = async (): Promise<Stats> =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/15`)).json()) as { Stats: Stats }).Stats
+		const interact = async (player: string, action: string, method: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/15/interactionby/me/${action}`, {
+				method,
+				headers: await bearer(player),
+			})
+
+		// Nobody has interacted with it yet.
+		expect(await searched()).toEqual({
+			CheerCount: 0,
+			FavoriteCount: 0,
+			VisitorCount: 0,
+			VisitCount: 0,
+		})
+
+		// Two players cheer it; one of them also favorites it.
+		await interact('561', 'cheer', 'PUT')
+		await interact('562', 'cheer', 'PUT')
+		await interact('561', 'favorite', 'PUT')
+
+		// Both the search results and the room itself report the aggregate.
+		expect(await searched()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
+		expect(await direct()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
+
+		// Clearing a cheer decrements it. Nothing records visits, so those stay 0.
+		await interact('562', 'cheer', 'DELETE')
+		expect(await direct()).toEqual({
+			CheerCount: 1,
+			FavoriteCount: 1,
+			VisitorCount: 0,
+			VisitCount: 0,
+		})
 	})
 
 	it('DELETE /rooms/:id/interactionby/me/cheer clears the cheer (auth-gated, idempotent)', async () => {
@@ -1674,6 +2107,254 @@ describe('rooms endpoints', () => {
 		// The ordinal still works.
 		expect((await envOf(await putForm(path, { accessibility: '1' }, '1'))).success).toBe(true)
 		expect(await accessibilityOf()).toBe(1)
+	})
+
+	// The permission table a room's creator saves on a subroom, and how it reaches the
+	// client: `PUT …/permissions` stores entries keyed by (Permission, Role), and
+	// `GET /photon_access_token` merges them over its defaults for whoever is standing in
+	// that subroom. Room 2 / subroom 2 is owned by account 1; account 743 is the visitor
+	// whose presence points at it.
+	describe('subroom permissions', () => {
+		type Permission = { Permission: string; Role: number; Override: boolean; Value: string }
+
+		const putPermissions = async (path: string, body: unknown, sub?: string) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method: 'PUT',
+				headers: { ...(sub ? await bearer(sub) : {}), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+
+		// Put a player in an instance of the given subroom, then read the permission table
+		// the client would apply when it spawns there.
+		const permissionsIn = async (accountId: number, subRoomId: number): Promise<Permission[]> => {
+			await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						roomInstance: { roomInstanceId: 1000900 + subRoomId, roomId: 2, subRoomId },
+						expiresAt: Math.floor(Date.now() / 1000) + 900,
+					})
+				)
+				.run()
+			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
+				headers: await bearer(String(accountId)),
+			})
+			expect(res.status).toBe(200)
+			return ((await res.json()) as { Permissions: Permission[] }).Permissions
+		}
+
+		const entry = (list: Permission[], permission: string, role: number) =>
+			list.find((p) => p.Permission === permission && p.Role === role)
+
+		it('is auth-gated and creator-only', async () => {
+			const body = [
+				{ Permission: 'CAN_SAVE_INVENTIONS', Role: 30, Override: false, Type: 0, Value: 'True' },
+			]
+			// No token → 401.
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body)).status).toBe(401)
+			// A valid token that isn't the room's creator → 403.
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '999')).status).toBe(
+				403
+			)
+			// Not even a co-owner: account 2 holds Role 30 on the seeded rooms. Co-owners may
+			// build in a room but don't decide what a role may do.
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(403)
+			// Unknown room / unknown subroom → 404.
+			expect((await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1')).status).toBe(
+				404
+			)
+			// A subroom id belonging to another room doesn't resolve either.
+			expect((await putPermissions('/rooms/2/subrooms/9999/permissions', body, '1')).status).toBe(
+				404
+			)
+		})
+
+		it('answers an empty 200 — the client reads no body', async () => {
+			const res = await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_SPAWN_INVENTIONS', Role: 30, Override: true, Type: 0, Value: 'True' }],
+				'1'
+			)
+			expect(res.status).toBe(200)
+			expect(await res.text()).toBe('')
+		})
+
+		it('a checked Override replaces the matching default in place', async () => {
+			const before = await permissionsIn(743, 2)
+			expect(before.length).toBe(11)
+			const at = before.findIndex((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 30)
+			// The default for this pair is an un-overridden grant.
+			expect(before[at]).toMatchObject({ Override: false, Value: 'True' })
+
+			expect(
+				(
+					await putPermissions(
+						'/rooms/2/subrooms/2/permissions',
+						[
+							{
+								Permission: 'CAN_USE_MAKER_PEN',
+								Role: 30,
+								Override: true,
+								Type: 0,
+								Value: 'False',
+							},
+						],
+						'1'
+					)
+				).status
+			).toBe(200)
+
+			const after = await permissionsIn(743, 2)
+			// Replaced, not appended — and at the same index, so the table doesn't reshuffle.
+			expect(after.length).toBe(11)
+			expect(after[at]).toMatchObject({
+				Permission: 'CAN_USE_MAKER_PEN',
+				Role: 30,
+				Override: true,
+				Value: 'False',
+			})
+
+			// Re-sending the same (Permission, Role) updates that entry rather than adding one.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 30, Override: true, Type: 0, Value: 'True' }],
+				'1'
+			)
+			const changed = await permissionsIn(743, 2)
+			expect(changed.length).toBe(11)
+			expect(changed[at]).toMatchObject({ Override: true, Value: 'True' })
+		})
+
+		it('an unchecked Override erases the entry, back to the default', async () => {
+			const stored = async () =>
+				(await env.DB.prepare(
+					`SELECT COUNT(*) AS n FROM subroom_permission
+					 WHERE sub_room_id = 2 AND permission = 'CAN_USE_MAKER_PEN' AND role = 30`
+				).first<{ n: number }>())!.n
+
+			// The previous test left this pair overridden.
+			expect(await stored()).toBe(1)
+
+			// `Override: false` means "fall back to the default" — the `Value` riding along is
+			// not stored, it's whatever the picker happened to show.
+			expect(
+				(
+					await putPermissions(
+						'/rooms/2/subrooms/2/permissions',
+						[
+							{
+								Permission: 'CAN_USE_MAKER_PEN',
+								Role: 30,
+								Override: false,
+								Type: 0,
+								Value: 'True',
+							},
+						],
+						'1'
+					)
+				).status
+			).toBe(200)
+
+			// The row is gone, and the token serves the default for the pair again.
+			expect(await stored()).toBe(0)
+			const table = await permissionsIn(743, 2)
+			expect(table.length).toBe(11)
+			expect(entry(table, 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
+				Override: false,
+				Value: 'True',
+			})
+
+			// Clearing a pair that was never overridden is a no-op, not an insert.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_INVITE', Role: 0, Override: false, Type: 0, Value: 'True' }],
+				'1'
+			)
+			expect((await permissionsIn(743, 2)).length).toBe(11)
+		})
+
+		it('appends a permission the defaults do not carry, and scopes it to its subroom', async () => {
+			// CAN_INVITE is in none of the defaults, so it lands as a new entry.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_INVITE', Role: 30, Override: true, Type: 0, Value: 'False' }],
+				'1'
+			)
+			const inSubRoom2 = await permissionsIn(744, 2)
+			expect(inSubRoom2.length).toBe(12)
+			expect(entry(inSubRoom2, 'CAN_INVITE', 30)).toMatchObject({
+				Override: true,
+				Value: 'False',
+			})
+
+			// A different subroom is untouched — the table is per-subroom, not per-room.
+			expect((await permissionsIn(744, 3)).length).toBe(11)
+			// And so is a player in no instance at all.
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = ?1').bind(744).run()
+			const lobby = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
+				headers: await bearer('744'),
+			})
+			expect(((await lobby.json()) as { Permissions: Permission[] }).Permissions.length).toBe(11)
+		})
+
+		it('keeps a Value that isn’t True/False verbatim', async () => {
+			// Not every permission's UI is the True/False picker, so nothing interprets the
+			// string — it goes to the client exactly as the creator set it.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'MAX_SPAWNED_INVENTIONS', Role: 0, Override: true, Type: 0, Value: '25' }],
+				'1'
+			)
+			expect(entry(await permissionsIn(747, 2), 'MAX_SPAWNED_INVENTIONS', 0)).toMatchObject({
+				Override: true,
+				Value: '25',
+			})
+		})
+
+		it('applies over the dev accounts’ global maker pen, without listing a pair twice', async () => {
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[
+					{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' },
+					// The third sample body — a Role 0 grant the defaults already carry.
+					{
+						Permission: 'CAN_USE_DELETE_ALL_BUTTON',
+						Role: 0,
+						Override: true,
+						Type: 0,
+						Value: 'True',
+					},
+				],
+				'1'
+			)
+			// Account 3 is one of the hardcoded dev accounts, so it gets the global (Role 0)
+			// maker pen prepended — which this subroom then revokes. The merge runs last and
+			// replaces it in place, so the pair appears exactly ONCE: a table listing it twice
+			// with two values would leave which one applies up to the client.
+			const devTable = await permissionsIn(3, 2)
+			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toEqual([
+				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'False' },
+			])
+			expect(entry(devTable, 'CAN_USE_DELETE_ALL_BUTTON', 0)).toMatchObject({ Value: 'True' })
+
+			// A normal player in the same subroom sees the same revocation.
+			expect(entry(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN', 0)).toMatchObject({
+				Value: 'False',
+			})
+		})
+
+		it('a cloned subroom inherits the source’s permission table', async () => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/clone`, {
+				method: 'POST',
+				headers: await bearer('1'),
+			})
+			const room = (await res.json()) as { value: { SubRooms: Array<{ SubRoomId: number }> } }
+			const cloneId = Math.max(...room.value.SubRooms.map((s) => s.SubRoomId))
+
+			const inClone = await permissionsIn(746, cloneId)
+			expect(entry(inClone, 'CAN_INVITE', 30)).toMatchObject({ Value: 'False' })
+			expect(entry(inClone, 'CAN_USE_MAKER_PEN', 0)).toMatchObject({ Value: 'False' })
+		})
 	})
 
 	it('POST /rooms/:id/subrooms/:sid/clone is auth-gated, owner-only, and copies the subroom', async () => {
@@ -1922,6 +2603,7 @@ describe('rooms endpoints', () => {
 		)
 		expect([...documented].sort()).toEqual([
 			'DELETE /rooms/{roomId}',
+			'DELETE /rooms/{roomId}/bans/{playerId}',
 			'DELETE /rooms/{roomId}/interactionby/me/cheer',
 			'DELETE /rooms/{roomId}/interactionby/me/favorite',
 			'DELETE /rooms/{roomId}/subrooms/{subRoomId}',
@@ -1939,13 +2621,15 @@ describe('rooms endpoints', () => {
 			'GET /rooms/recommendations',
 			'GET /rooms/search',
 			'GET /rooms/visitedby/me',
+			'GET /rooms/visitedby/{playerId}',
 			'GET /rooms/{roomId}',
+			'GET /rooms/{roomId}/bans',
 			'GET /rooms/{roomId}/interactionby/me',
 			'GET /rooms/{roomId}/playerdata/me',
 			'GET /rooms/{roomId}/similar',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
-			'GET /roomserver/photon_access_token',
 			'GET /roomserver/rooms/createdby/me',
+			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
@@ -1963,6 +2647,7 @@ describe('rooms endpoints', () => {
 			'PUT /rooms/{roomId}/roles/{accountId}',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/accessibility',
 			'PUT /rooms/{roomId}/subrooms/{subRoomId}/modify',
+			'PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions',
 			'PUT /rooms/{roomId}/tags',
 			'PUT /rooms/{roomId}/warning',
 		])

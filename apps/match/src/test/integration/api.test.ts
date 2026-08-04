@@ -15,6 +15,7 @@ import {
 	getRoomInstance,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
+	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
@@ -83,15 +84,9 @@ const TEST_ROOMS = [
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
-	await env.DB.prepare(
-		`CREATE TABLE IF NOT EXISTS room (
-			data TEXT NOT NULL,
-			room_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.RoomId')) VIRTUAL,
-			name_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.Name'))) VIRTUAL,
-			creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL,
-			is_dorm INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsDorm')) VIRTUAL
-		)`
-	).run()
+	// The rooms worker's schema (room + interaction) — reading a room aggregates its
+	// cheer/favorite Stats from `interaction`, so both tables have to be here.
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Subrooms live in their own table now; seed each room and split its subrooms into it.
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const r of TEST_ROOMS) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
@@ -1246,6 +1241,70 @@ describe('auth-gated endpoints', () => {
 
 		// No token → 401.
 		expect((await follow(9801)).status).toBe(401)
+
+		// A ban on the room blocks the follow too: this path hands out a Photon room id
+		// without going through resolveRoomInstance, so it carries its own ban check —
+		// otherwise following a friend in would be a way around a ban.
+		await env.DB.prepare(
+			`INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)
+			 VALUES (2, 9800, 0, 1, '2026-01-01T00:00:00.000Z')`
+		).run()
+		try {
+			expect(await (await follow(9801, '9800')).json()).toEqual({
+				errorCode: 55,
+				roomInstance: null,
+			})
+		} finally {
+			await env.DB.prepare('DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9800')
+				.run()
+		}
+	})
+
+	test('POST /matchmake/room/:roomId refuses a player banned from the room', async () => {
+		const matchmake = async (sub: string) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+					method: 'POST',
+					headers: await bearer(sub),
+				})
+			).json()) as { errorCode: number; roomInstance: { roomInstanceId: number } | null }
+
+		// Not banned yet → a normal join.
+		expect((await matchmake('9700')).errorCode).toBe(0)
+
+		await env.DB.prepare(
+			`INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)
+			 VALUES (2, 9701, 0, 1, '2026-01-01T00:00:00.000Z')`
+		).run()
+
+		// The ban is the whole enforcement: no instance means no Photon room id, so there
+		// is nothing for the banned player to join. errorCode 55 rather than the opaque
+		// NoSuchRoom every other refusal answers — a banned player already knows the room
+		// exists, so the client can say why. Applies to the subroom path as well.
+		expect(await matchmake('9701')).toEqual({ errorCode: 55, roomInstance: null })
+		const sub = await exports.default.fetch(`${ORIGIN}/matchmake/room/2/2`, {
+			method: 'POST',
+			headers: await bearer('9701'),
+		})
+		expect(await sub.json()).toEqual({ errorCode: 55, roomInstance: null })
+
+		// Refused before any instance is created, and no presence was recorded for them.
+		expect(
+			await env.DB.prepare('SELECT 1 AS hit FROM presence WHERE account_id = 9701').first()
+		).toBeNull()
+
+		// The ban is per-room — another room is unaffected.
+		const other = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/room/77`, {
+				method: 'POST',
+				headers: await bearer('9701'),
+			})
+		).json()) as { errorCode: number }
+		expect(other.errorCode).toBe(0)
+
+		// Lifting the ban lets them in again.
+		await env.DB.prepare('DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9701').run()
+		expect((await matchmake('9701')).errorCode).toBe(0)
 	})
 
 	test('POST /matchmake/room/:id invites AdditionalPlayerIds (party) into the instance', async () => {

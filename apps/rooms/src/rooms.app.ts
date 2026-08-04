@@ -4,6 +4,8 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	Accessibility,
+	areFriends,
+	banPlayerFromRoom,
 	canManageRoom,
 	cloneRoom,
 	cloneSubRoom,
@@ -20,11 +22,13 @@ import {
 	getPresence,
 	getPublicRoomsByCreator,
 	getRecommendedRooms,
+	getRoomBans,
 	getRoomById,
 	getRoomByName,
 	getRoomsByCreator,
 	getRoomsByIds,
 	getSimilarRooms,
+	getSubRoomPermissions,
 	getSubRoomSaves,
 	getVisitedRooms,
 	modifySubRoom,
@@ -37,17 +41,24 @@ import {
 	setRoomImage,
 	setRoomName,
 	setRoomRole,
+	setSubRoomPermissions,
 	toggleCheer,
 	toggleFavorite,
 	toggleRoomTag,
+	unbanPlayerFromRoom,
 	updateRoomFields,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
+// The notification-type ids the hub carries (owned by the `notify` worker). Imported
+// as a value — the enum has no runtime dependencies.
+import { NotificationType } from '../../notify/src/notification-types'
 
 import {
 	AccessibilityRequest,
 	AUTHED,
+	bannedPlayerIdParam,
+	BanRequest,
 	CloneRoomRequest,
 	CloningRequest,
 	CreateSubRoomRequest,
@@ -63,13 +74,17 @@ import {
 	MissingLookupParam,
 	ModifySubRoomRequest,
 	NameRequest,
+	NOT_FRIENDS_RESPONSE,
 	PagedRooms,
 	pageParams,
 	PhotonAccessTokenDto,
 	PlayerDataDto,
+	playerIdParam,
 	PublishSaveRequest,
 	RestrictionsRequest,
 	RoleRequest,
+	RoomBanEnvelope,
+	RoomBanEntryDto,
 	RoomDto,
 	RoomEnvelope,
 	roomIdParam,
@@ -81,6 +96,7 @@ import {
 	stringQuery,
 	SubRoomAccessibilityRequest,
 	subRoomIdParam,
+	SubRoomPermissionsRequest,
 	SubRoomSavesPage,
 	TagRequest,
 	UNAUTHORIZED_EMPTY,
@@ -90,6 +106,7 @@ import {
 } from './openapi'
 
 import type { Context } from 'hono'
+import type { RoomBan, RoomPermission } from '@repo/domain'
 import type { App } from './context'
 
 /**
@@ -131,9 +148,14 @@ const DEFAULT_MAX_ROOMS_PER_ACCOUNT = 10
  * hardcoded moderator/dev accounts. */
 const MAKER_PEN_ACCOUNT_IDS = new Set([1, 2, 3])
 
-/** The slice of the shared presence row we read — the caller's current room instance. */
+/**
+ * The slice of the shared presence row we read — the caller's current room instance.
+ * `subRoomId` is what scopes the stored permission overrides: they belong to the subroom
+ * the player is standing in, not to the room.
+ */
 interface PresenceView {
 	roomInstanceId?: number
+	subRoomId?: number
 }
 
 /**
@@ -143,16 +165,26 @@ interface PresenceView {
  * they aren't in one). `PhotonAccessToken` stays empty — the reference server
  * signs it via `ClientSecurity`, whose secret/algorithm we don't have; our
  * Photon setup accepts an empty token.
+ *
+ * `overrides` are the permissions the room's creator saved on the subroom the caller is
+ * in (see `PUT …/subrooms/{subRoomId}/permissions`). They are matched against the
+ * defaults by (`Permission`, `Role`) — the same pair the client addresses an entry by —
+ * and win, so a subroom that revokes the Role 0 maker pen revokes it for a dev account
+ * standing in it as well.
  */
-function photonAccessToken(accountId: number, roomInstanceId: number | null) {
-	const perm = (Permission: string, Role: number, Override: boolean) => ({
+function photonAccessToken(
+	accountId: number,
+	roomInstanceId: number | null,
+	overrides: RoomPermission[] = []
+) {
+	const perm = (Permission: string, Role: number, Override: boolean): RoomPermission => ({
 		Override,
 		Permission,
 		Role,
 		Type: 0,
 		Value: 'True',
 	})
-	const permissions = [
+	const permissions: RoomPermission[] = [
 		perm('CAN_USE_ROOM_RESET_BUTTON', 0, true),
 		perm('CAN_USE_DELETE_ALL_BUTTON', 0, true),
 		perm('CAN_SAVE_INVENTIONS', 0, true),
@@ -165,8 +197,21 @@ function photonAccessToken(accountId: number, roomInstanceId: number | null) {
 		perm('CAN_SPAWN_INVENTIONS', 30, true),
 		perm('CAN_USE_PLAY_GIZMOS_TOGGLE', 30, true),
 	]
+
 	if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) {
 		permissions.unshift(perm('CAN_USE_MAKER_PEN', 0, true))
+	}
+
+	// The subroom's stored table wins, applied LAST and over the dev grant too: a
+	// (Permission, Role) the table already carries is replaced in place — so the order
+	// doesn't shift under the client, and no pair is ever listed twice with two values —
+	// and one it doesn't (e.g. CAN_INVITE) is appended.
+	for (const override of overrides) {
+		const i = permissions.findIndex(
+			(p) => p.Permission === override.Permission && p.Role === override.Role
+		)
+		if (i === -1) permissions.push(override)
+		else permissions[i] = override
 	}
 	return {
 		Permissions: permissions,
@@ -176,21 +221,43 @@ function photonAccessToken(accountId: number, roomInstanceId: number | null) {
 }
 
 /**
- * Photon access-token handler (served bare and under `/roomserver`). Auth-gated:
- * resolves the caller, reads their current room instance from the shared
- * `presence` table (see @repo/domain), and returns the permissions + token.
+ * Photon access-token handler. Auth-gated: resolves the caller, reads their current
+ * room instance from the shared `presence` table (see @repo/domain), and returns the
+ * permissions + token.
  */
 async function handlePhotonAccessToken(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
-	const presence = await getPresence<PresenceView>(c.env.DB, accountId)
-	const roomInstanceId = presence?.roomInstance?.roomInstanceId ?? null
-	return c.json(photonAccessToken(accountId, roomInstanceId))
+	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
+	// The permission overrides are the ones saved on the subroom the caller is standing in.
+	// A player in no instance — sitting in the lobby, or an instance predating subroom
+	// tracking — gets the default table untouched.
+	const overrides =
+		typeof instance?.subRoomId === 'number'
+			? await getSubRoomPermissions(c.env.DB, instance.subRoomId)
+			: []
+	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, overrides))
 }
 
 /** The Bearer token's account id (`sub`), or null when there's no valid token. */
 async function authedAccountId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+}
+
+/**
+ * Operator-granted elevated roles — the ones the auth worker stamps from an account's
+ * isDeveloper/isModerator flags (see the admin CLI). Same set the `notify` / `www`
+ * workers gate their admin surfaces on.
+ */
+const STAFF_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
+
+/**
+ * Whether the caller's token carries a staff role. Used alongside the per-room owner
+ * check for actions staff may take in a room they don't own.
+ */
+async function isStaff(c: Context<App>): Promise<boolean> {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	return roles?.some((role) => STAFF_ROLES.has(role)) ?? false
 }
 
 /** 401 for the auth-gated `*by/me` endpoints — no stub-account fallback. */
@@ -212,6 +279,59 @@ function parseAccessibility(value: unknown): number | undefined {
 		([name, ordinal]) => typeof ordinal === 'number' && name.toLowerCase() === raw.toLowerCase()
 	)
 	return named ? (named[1] as number) : undefined
+}
+
+/** Parse an integer from the number or numeric string a JSON body may carry. */
+function parseInt10(value: unknown): number | undefined {
+	if (typeof value === 'number') return Number.isFinite(value) ? Math.trunc(value) : undefined
+	if (typeof value !== 'string') return undefined
+	const n = Number.parseInt(value.trim(), 10)
+	return Number.isNaN(n) ? undefined : n
+}
+
+/**
+ * The client's `Value`, kept as the STRING it sends. Usually `"True"`/`"False"` — the
+ * True/False picker beside the override checkbox — but a permission whose UI is something
+ * else carries a different value, so nothing here interprets it. A JSON boolean or number
+ * is rendered the way the client would have written it.
+ */
+function permissionValue(value: unknown): string {
+	if (typeof value === 'string') return value
+	if (typeof value === 'boolean') return value ? 'True' : 'False'
+	if (typeof value === 'number') return String(value)
+	return ''
+}
+
+/**
+ * Parse the subroom-permissions PUT body: a JSON ARRAY of
+ * `{ Permission, Role, Override, Type, Value }` entries.
+ *
+ * `Override` is the client's checkbox, not data — see {@link setSubRoomPermissions}: true
+ * stores `Value` for that (`Permission`, `Role`), false clears any stored entry so the
+ * pair falls back to the default. It is carried through as sent.
+ *
+ * Entries without a permission name or a usable role are dropped rather than rejected —
+ * the client ignores the response either way, so half a table applied beats none.
+ */
+function parseRoomPermissions(body: unknown): RoomPermission[] {
+	if (!Array.isArray(body)) return []
+	const permissions: RoomPermission[] = []
+	for (const entry of body) {
+		if (typeof entry !== 'object' || entry === null) continue
+		const e = entry as Record<string, unknown>
+		const permission = typeof e.Permission === 'string' ? e.Permission.trim() : ''
+		const role = parseInt10(e.Role)
+		if (permission === '' || role === undefined) continue
+		permissions.push({
+			Permission: permission,
+			Role: role,
+			// Sent as a JSON boolean, unlike `Value` — accept the string form regardless.
+			Override: e.Override === true || String(e.Override).toLowerCase() === 'true',
+			Type: parseInt10(e.Type) ?? 0,
+			Value: permissionValue(e.Value),
+		})
+	}
+	return permissions
 }
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
@@ -251,6 +371,63 @@ async function pushRoomUpdate(
 	} catch (err) {
 		logger.error('failed to push RoomUpdate notification', {
 			playerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * `reportCategory` on a moderation frame. -1 is "Moderator" — the category for an
+ * action a person took rather than one the system inferred, which is what a room ban
+ * is. The rest of the enum, for reference: 2 Harassment, 3 Cheating, 5 AFK, 6 Misc,
+ * 7 Underage, 10 VoteKick, 100–104 CoC_*, 200 InappropriateClothing.
+ */
+const REPORT_CATEGORY_MODERATOR = -1
+
+/**
+ * Eject a player from the room they're in — a `ModerationKick` push (id 22), the frame
+ * the client acts on to remove someone. Sent on a ban: the row keeps them out of future
+ * matchmakes, this gets them out of the instance they're in right now.
+ *
+ * The payload is the client's moderation shape, camelCase, in wire order:
+ * `reportCategory`, `duration`, `gameSessionId`, `isHostKick`, `message`,
+ * `playerIdReporter`, `isBan`, `isVoiceModAutoban`. `duration` is 0 (a room ban has no
+ * expiry — it's lifted by DELETE, not by time) and `gameSessionId` is 0 (nothing here
+ * tracks one).
+ *
+ * `isHostKick` says the room's HOST ejected the player, as opposed to the room
+ * majority vote-kicking them. There is no vote-kick path yet, so the only false case
+ * here is a staff moderator acting in a room they don't host. `playerIdReporter` is
+ * whoever caused it — the host today, and the player who started the vote once
+ * vote-kicks exist (those will carry `reportCategory` 10 and `isHostKick` false).
+ *
+ * Like {@link pushRoomUpdate}, hub failures are logged and swallowed: the ban row has
+ * already committed, so a hub hiccup must not fail the request.
+ */
+async function pushRoomBan(
+	c: Context<App>,
+	ban: RoomBan,
+	roomName: string,
+	isHostKick: boolean
+): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			ban.BannedPlayerId,
+			NotificationType.ModerationKick,
+			{
+				reportCategory: REPORT_CATEGORY_MODERATOR,
+				duration: 0,
+				gameSessionId: 0,
+				isHostKick,
+				message: `You have been banned from ${roomName}.`,
+				playerIdReporter: ban.BannedByAccountId,
+				isBan: true,
+				isVoiceModAutoban: false,
+			}
+		)
+	} catch (err) {
+		logger.error('failed to push ModerationKick notification', {
+			playerId: ban.BannedPlayerId,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
@@ -303,6 +480,12 @@ function toSaveResponse(save: Record<string, unknown>) {
 function roomEnvelope(c: Context<App>, value: unknown, error = '') {
 	return c.json({ success: error === '', error, value })
 }
+
+/**
+ * The same envelope for the ban write, whose `value` is the BAN rather than the room —
+ * a ban isn't part of the room the client renders, so there is no updated room to send.
+ */
+const banEnvelope = roomEnvelope
 
 /** Rooms created/owned by the authed caller (shared by the createdby routes). */
 async function ownedRooms(c: Context<App>) {
@@ -410,19 +593,27 @@ const app = new Hono<App>()
 		}
 	)
 
-	// "Hot" rooms feed — public, non-dorm rooms ordered by engagement, optionally
-	// filtered to a single `tag` (e.g. `rro`). Paginated via skip/take (take
-	// defaults to 100). Returns `{ Results, TotalResults }` like search.
+	// "Hot" rooms feed — public, non-dorm rooms ordered by live player count (their
+	// instances' presence), then stored engagement, optionally filtered to a single
+	// `tag` (e.g. `rro`). `tag=new` is a pseudo-tag no room carries: it serves the
+	// player-made (non-RRO) rooms newest-first. Paginated via skip/take (take defaults
+	// to 100). Returns `{ Results, TotalResults }` like search.
 	.get(
 		'/rooms/hot',
 		describeRoute({
 			tags: ['Discovery'],
 			summary: 'The “hot” rooms feed',
 			description: [
-				'Public, non-dorm rooms ordered by engagement, optionally narrowed to a single `tag`',
-				'(the browse screen’s filter chips post one, e.g. `rro`).',
+				'Public, non-dorm rooms ordered by how many players are in them right now — live',
+				'presence summed across each room’s instances — falling back to stored engagement',
+				'for rooms nobody is in. Optionally narrowed to a single `tag` (the browse screen’s',
+				'filter chips post one, e.g. `rro`). The `new` chip is a pseudo-tag — no room carries',
+				'a `new` tag — and instead serves the player-made (non-RRO) rooms, newest first.',
 			].join(' '),
-			parameters: [stringQuery('tag', 'Restrict to rooms carrying this tag'), ...pageParams(100)],
+			parameters: [
+				stringQuery('tag', 'Restrict to rooms carrying this tag (or `new`, a pseudo-tag)'),
+				...pageParams(100),
+			],
 			responses: { 200: json(PagedRooms, 'The feed page') },
 		}),
 		async (c) => {
@@ -669,6 +860,45 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(await getVisitedRooms(c.env.DB, accountId, skip, take))
+		}
+	)
+
+	// Another player's visited rooms — what the client shows on a friend's profile.
+	// Auth-gated (401), and FRIENDS-ONLY: a valid token for someone who isn't that
+	// player and isn't a mutual friend of theirs is a 403, since where a player has
+	// been is not public. Registered after `visitedby/me` so the literal path wins.
+	// Paginated via skip/take (take defaults to 100) and, like `visitedby/me`, a bare
+	// array — the client's room-source loaders expect a plain list, not a page.
+	.get(
+		'/rooms/visitedby/:playerId{[0-9]+}',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'A friend’s visited rooms',
+			description: [
+				'The rooms another player has visited, as a bare array. Friends only: the caller must',
+				'be that player or a mutual friend of theirs (403 otherwise) — visit history is not',
+				'public.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [playerIdParam, ...pageParams(100)],
+			responses: {
+				200: json(RoomDto.array(), 'That player’s visited rooms'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: NOT_FRIENDS_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const playerId = Number.parseInt(c.req.param('playerId'), 10)
+			// Your own history is always readable (the client sometimes sends the id
+			// rather than `me`); anyone else's needs a mutual friendship.
+			if (playerId !== accountId && !(await areFriends(c.env.DB, accountId, playerId))) {
+				return c.body(null, 403)
+			}
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getVisitedRooms(c.env.DB, playerId, skip, take))
 		}
 	)
 
@@ -1199,6 +1429,179 @@ const app = new Hono<App>()
 			// (and the permissions it grants them).
 			await pushRoomUpdate(c, targetAccountId, updated)
 			return roomEnvelope(c, updated)
+		}
+	)
+
+	// A room's ban list — the owner's view of who they've banned. Same gate as issuing a
+	// ban: a ban list says who a room's owner has had trouble with, so it isn't public.
+	// Answers a BARE array (not the room-write envelope), newest ban first.
+	.get(
+		'/rooms/:roomId{[0-9]+}/bans',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'A room’s ban list',
+			description: [
+				'Everyone banned from the room, most recently banned first. Auth-gated, then gated',
+				'exactly like issuing a ban: the room’s creator or a co-owner, or an account whose',
+				'token carries the `developer` / `moderator` role. A ban list says who a room’s',
+				'owner has had trouble with, so it is not public.',
+				'',
+				'A bare array, NOT the `{ success, error, value }` envelope the ban write answers,',
+				'and the entries are camelCase with a different field set: no room id (the path',
+				'already says which room) and no ban mask. An unknown room is an empty list rather',
+				'than an error — it reads the same as a room nobody is banned from.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: {
+				200: json(RoomBanEntryDto.array(), 'The room’s bans, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			// No room → nothing banned. Same answer as a room with an empty ban list, so
+			// this doesn't become a way to probe which room ids exist.
+			if (!room) return c.json([])
+			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+
+			const bans = await getRoomBans(c.env.DB, roomId)
+			return c.json(
+				bans.map((ban) => ({
+					accountId: ban.BannedPlayerId,
+					bannedByAccountId: ban.BannedByAccountId,
+					banStartTime: ban.CreatedAt,
+				}))
+			)
+		}
+	)
+
+	// Ban a player from a room (form body `id` + `banMask`). Auth-gated (401), then
+	// gated to the room's owner/co-owner OR a staff token (403). One row per
+	// (room, player) — re-banning rewrites it, so the call is idempotent.
+	.post(
+		'/rooms/:roomId{[0-9]+}/bans',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Ban a player from a room',
+			description: [
+				'Records a ban in the `room_ban` table — one row per (room, player), so re-banning',
+				'someone already banned rewrites their row rather than adding a second. The row is',
+				'what the `match` worker checks: a banned player’s matchmake into this room is',
+				'refused with errorCode 55 and never gets a Photon room id.',
+				'',
+				'Gated to the room’s creator or a co-owner, OR to any account whose token carries the',
+				'`developer` / `moderator` role — a valid token from anyone else is a 403. Banning',
+				'yourself, or banning someone who can manage the room, is refused: otherwise a',
+				'co-owner could ban the owner out of their own room.',
+				'',
+				'`banMask` is stored verbatim and nothing interprets it — the client sends `0` and',
+				'what it selects is not known yet. It defaults to 0 when absent.',
+				'',
+				'The BANNED player (not the caller) gets a `ModerationKick` push (id 22) — the frame',
+				'the client acts on to eject someone — so a ban takes effect immediately rather than',
+				'only at their next matchmake. `isBan` is true, `duration` 0 (a room ban has no',
+				'expiry; it is lifted by DELETE, not by time) and `reportCategory` -1 (Moderator).',
+				'',
+				'`isHostKick` means the room’s HOST ejected them rather than the room majority',
+				'vote-kicking them; with no vote-kick path yet the only false case is a staff',
+				'moderator acting in a room they do not host. `playerIdReporter` is whoever caused',
+				'it — the host today, the player who started the vote once vote-kicks exist. The hub',
+				'queues the frame if they are offline.',
+				'',
+				'Answers the same lowercase `{ success, error, value }` envelope the room writes use,',
+				'but `value` is the BAN, not the room — a ban is not part of the room the client',
+				'renders. This shape is unverified against the real service.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(BanRequest, 'The player to ban'),
+			responses: {
+				200: json(RoomBanEnvelope, 'The stored ban, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return banEnvelope(c, null, 'This room does not exist!')
+
+			// The room's own owners, or a staffer acting across rooms. Roles are only
+			// looked up when the cheaper room check fails. The room's own owner IS the
+			// host, which is what the kick frame's `isHostKick` reports.
+			const isHostKick = canManageRoom(room, accountId)
+			if (!isHostKick && !(await isStaff(c))) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+			const bannedPlayerId = Number.parseInt(str(body.id), 10)
+			if (Number.isNaN(bannedPlayerId)) {
+				return banEnvelope(c, null, 'You must provide a valid player to ban!')
+			}
+			if (bannedPlayerId === accountId) return banEnvelope(c, null, 'You cannot ban yourself!')
+			// Without this a co-owner could ban the room's creator out of their own room.
+			if (canManageRoom(room, bannedPlayerId)) {
+				return banEnvelope(c, null, 'You cannot ban an owner of this room!')
+			}
+			// Absent or unparseable → 0, the value the client sends.
+			const banMask = Number.parseInt(str(body.banMask), 10) || 0
+
+			const ban = await banPlayerFromRoom(c.env.DB, roomId, bannedPlayerId, banMask, accountId)
+			// The banned player is told, not the caller — their client acts on the kick.
+			const roomName = typeof room.Name === 'string' ? room.Name : 'this room'
+			await pushRoomBan(c, ban, roomName, isHostKick)
+			return banEnvelope(c, ban)
+		}
+	)
+
+	// Lift a player's ban on a room. Same gate as issuing one: auth-gated (401), then the
+	// room's owner/co-owner OR a staff token (403).
+	.delete(
+		'/rooms/:roomId{[0-9]+}/bans/:playerId{[0-9]+}',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Unban a player from a room',
+			description: [
+				'Removes the player’s `room_ban` row, so they can matchmake into the room again.',
+				'Gated exactly like issuing a ban: the room’s creator or a co-owner, or an account',
+				'whose token carries the `developer` / `moderator` role.',
+				'',
+				'Unbanning someone who is not banned is a rejection (`success: false`), not a silent',
+				'success — the caller asked to undo something that was not there.',
+				'',
+				'Answers the same envelope as the ban write, with the REMOVED ban as `value`. No',
+				'notification is pushed: nothing tells a player their ban was lifted.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, bannedPlayerIdParam],
+			responses: {
+				200: json(RoomBanEnvelope, 'The removed ban, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return banEnvelope(c, null, 'This room does not exist!')
+			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+
+			const playerId = Number.parseInt(c.req.param('playerId'), 10)
+			const removed = await unbanPlayerFromRoom(c.env.DB, roomId, playerId)
+			if (!removed) return banEnvelope(c, null, 'This player is not banned from this room!')
+			return banEnvelope(c, removed)
 		}
 	)
 
@@ -1820,6 +2223,67 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Set a subroom's permission overrides — what each role may do in that subroom. The
+	// body is a JSON ARRAY of the entries to change, keyed by (Permission, Role): `Override`
+	// is the client's checkbox, so true stores the entry for that pair and false clears it
+	// back to the default. The stored table then overwrites the matching defaults in
+	// `GET /photon_access_token`. Auth-gated (401) and creator-only (403), like the other
+	// subroom mutations. Answers an EMPTY 200 — the client fires this and re-reads nothing,
+	// so there is no envelope to match.
+	.put(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/permissions',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'Set a subroom’s permissions',
+			description: [
+				'Stores the permission entries a room’s creator changed for one subroom — who may',
+				'save inventions, invite players, use the delete-all button, and so on. The body is a',
+				'JSON ARRAY; each entry is addressed by its (`Permission`, `Role`) pair, so re-sending',
+				'a pair overwrites the stored entry rather than adding a second, and pairs that were',
+				'never sent are left alone.',
+				'',
+				'`Override` is the checkbox the client draws beside each permission, not data:',
+				'`true` stores `Value` for that pair, and `false` means “fall back to the default”, so',
+				'it DELETES any stored entry. Nothing is stored with `Override: false`, and reads',
+				'always serve `true`. `Value` is a string — usually `True`/`False`, but it is kept',
+				'verbatim, since not every permission’s UI is a True/False picker.',
+				'',
+				'What this feeds is `GET /photon_access_token`: a stored entry replaces the default',
+				'with the same (`Permission`, `Role`) in the table the client applies when it spawns,',
+				'and one naming a pair the defaults don’t carry (e.g. `CAN_INVITE`) is added to it.',
+				'The overrides apply to the subroom the caller is standing in, resolved from presence.',
+				'',
+				'Creator-only — co-owners may build in a room but not decide what a role may do.',
+				'The response body is EMPTY: the client doesn’t read one.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam],
+			requestBody: jsonBody(SubRoomPermissionsRequest, 'The permission entries to set'),
+			responses: {
+				200: { description: 'Stored (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+				404: { description: 'No such room or subroom' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+
+			// Scoped through the room so a subroom id from another room can't be written.
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
+			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+
+			const permissions = parseRoomPermissions(await c.req.json().catch(() => null))
+			await setSubRoomPermissions(c.env.DB, subRoomId, permissions)
+			return c.body(null, 200)
+		}
+	)
+
 	// Clone a subroom into a new subroom of the same room (fresh SubRoomId, same
 	// scene/settings/data). Auth-gated (401) and owner-only. Notifies the owner and
 	// returns the updated ROOM in the `{ success, error, value }` envelope — NOT the new
@@ -2041,8 +2505,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Photon access token + room permissions the client needs to spawn into a
-	// room. The client calls it on the rooms host both bare and under `/roomserver`.
+	// Photon access token + room permissions the client needs to spawn into a room.
 	.get(
 		'/photon_access_token',
 		describeRoute({
@@ -2057,23 +2520,6 @@ const app = new Hono<App>()
 				'secret/algorithm we don’t have, and our Photon setup accepts an empty token. The',
 				'global (Role 0) maker pen is granted only to the hardcoded dev accounts.',
 			].join('\n'),
-			security: AUTHED,
-			responses: {
-				200: json(PhotonAccessTokenDto, 'The permissions and (empty) token'),
-				401: UNAUTHORIZED_RESPONSE,
-			},
-		}),
-		handlePhotonAccessToken
-	)
-	.get(
-		'/roomserver/photon_access_token',
-		describeRoute({
-			tags: ['Session'],
-			summary: 'Photon token + room permissions (legacy path)',
-			description: [
-				'Identical to `GET /photon_access_token` — the client calls it both bare and under the',
-				'`/roomserver` prefix, so both forms are registered.',
-			].join(' '),
 			security: AUTHED,
 			responses: {
 				200: json(PhotonAccessTokenDto, 'The permissions and (empty) token'),
