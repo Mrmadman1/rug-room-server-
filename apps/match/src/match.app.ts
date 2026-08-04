@@ -21,6 +21,7 @@ import {
 	getRoomByName,
 	getRoomInstance,
 	getRoomInstancesByRoom,
+	getRoomInstanceSummariesByRoom,
 	isClubMember,
 	isPlayerBannedFromRoom,
 	MessageType,
@@ -51,6 +52,7 @@ import {
 	NotifyDisconnectRequest,
 	PlayerDto,
 	RoomInstanceDto,
+	RoomInstanceSummaryDto,
 	StatusVisibilityRequest,
 	UNAUTHORIZED_RESPONSE,
 } from './openapi'
@@ -1258,16 +1260,20 @@ const app = new Hono<App>()
 
 	// The room's live instances — the owner's view of active sessions of their room.
 	// Auth-gated (401) and owner/co-owner-only (403): the caller must be the room's
-	// creator or hold a Creator/CoOwner role on it. Unknown room → 404. Returns the
-	// bare RoomInstance DTO array (empty when the room has no live instances).
+	// creator or hold a Creator/CoOwner role on it. Unknown room → 404. Returns a
+	// summary per instance (empty when the room has no live instances) — id, subroom,
+	// fullness, creation time and who's currently in it — not the client's
+	// RoomInstance DTO: this is a management listing, so it answers "who's in there"
+	// and withholds the connection details of a session the owner isn't joining.
 	.get(
 		'/room/:roomId{[0-9]+}/instances',
 		describeRoute({
 			tags: ['Room instance'],
 			summary: 'A room’s live instances',
 			description: [
-				'The owner’s view of active sessions of their room. Auth-gated and gated to the',
-				'room’s creator or a co-owner (403 otherwise). Unknown room → 404.',
+				'The owner’s view of active sessions of their room — each instance with the',
+				'players currently in it. Auth-gated and gated to the room’s creator or a',
+				'co-owner (403 otherwise). Unknown room → 404.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -1280,7 +1286,7 @@ const app = new Hono<App>()
 				},
 			],
 			responses: {
-				200: json(RoomInstanceDto.array(), 'Live instances (empty when none)'),
+				200: json(RoomInstanceSummaryDto.array(), 'Live instances (empty when none)'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
 				404: { description: 'No such room (empty body)' },
@@ -1297,7 +1303,7 @@ const app = new Hono<App>()
 			// same owner-or-co-owner gate the rooms worker uses for room-admin actions.
 			if (!canManageRoom(room, id)) return c.body(null, 403)
 
-			return c.json(await getRoomInstancesByRoom(c.env.DB, roomId))
+			return c.json(await getRoomInstanceSummariesByRoom(c.env.DB, roomId))
 		}
 	)
 

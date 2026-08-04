@@ -175,6 +175,35 @@ export async function countPlayersByRoom(
 }
 
 /**
+ * Who is standing in each of a room's instances right now, keyed by instance id —
+ * one grouped query rather than a lookup per instance, so the owner's instance list
+ * stays a single read. Reads only unexpired presence; instances nobody is in are
+ * simply absent from the map (callers default to an empty list), and lobby
+ * (null-instance) presence is excluded.
+ */
+export async function getPlayerIdsByRoomInstance(
+	db: D1Database,
+	roomId: number,
+	now = nowSeconds()
+): Promise<Map<number, number[]>> {
+	const { results } = await db
+		.prepare(
+			`SELECT room_instance_id AS instanceId, account_id AS accountId FROM presence
+			 WHERE room_id = ?1 AND expires_at > ?2 AND room_instance_id IS NOT NULL
+			 ORDER BY account_id`
+		)
+		.bind(roomId, now)
+		.all<{ instanceId: number; accountId: number }>()
+	const out = new Map<number, number[]>()
+	for (const r of results) {
+		const players = out.get(r.instanceId)
+		if (players) players.push(r.accountId)
+		else out.set(r.instanceId, [r.accountId])
+	}
+	return out
+}
+
+/**
  * The room instances that expired presence rows still point at — the instances a
  * player was in when they stopped heartbeating (a crash or a hard quit, where no
  * matchmake ever moved them out). Their head-count has really dropped, so callers

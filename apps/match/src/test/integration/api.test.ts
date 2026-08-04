@@ -984,9 +984,31 @@ describe('auth-gated endpoints', () => {
 			headers: await bearer('42'),
 		})
 		expect(res.status).toBe(200)
-		const instances = (await res.json()) as Array<{ roomId: number; roomInstanceId: number }>
+		const instances = (await res.json()) as Array<{
+			roomInstanceId: number
+			roomId: number
+			subRoomId: number
+			isFull: boolean
+			createdAt: string
+			playerIds: number[]
+		}>
 		expect(instances.length).toBeGreaterThanOrEqual(1)
 		expect(instances.every((i) => i.roomId === 3)).toBe(true)
+
+		// The summary projection: id/subroom/fullness/createdAt plus who's in there —
+		// and none of the client DTO's connection fields.
+		const instance = instances.find((i) => i.playerIds.includes(42))
+		expect(instance).toBeDefined()
+		expect(Object.keys(instance!).sort()).toEqual([
+			'createdAt',
+			'isFull',
+			'playerIds',
+			'roomId',
+			'roomInstanceId',
+			'subRoomId',
+		])
+		expect(instance!.isFull).toBe(false)
+		expect(Number.isNaN(Date.parse(instance!.createdAt))).toBe(false)
 
 		// The co-owner (account 43, Role 30) may view the instances too.
 		const coOwner = await exports.default.fetch(`${ORIGIN}/room/3/instances`, {

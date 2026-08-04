@@ -12,7 +12,7 @@
  * the client DTO (`toDto`).
  */
 
-import { countPlayersInInstance } from './presence-db'
+import { countPlayersInInstance, getPlayerIdsByRoomInstance } from './presence-db'
 
 /** Schema DDL (mirror of migrations/0004_room_instance.sql). */
 export const ROOM_INSTANCE_SCHEMA_DDL: string[] = [
@@ -67,6 +67,22 @@ export interface RoomInstanceDto {
 	EncryptVoiceChat: boolean
 	matchmakingPolicy: number
 	createdAt: string
+}
+
+/**
+ * The owner's view of one live instance of their room (`match`:
+ * `GET /room/:roomId/instances`). Deliberately NOT the client `RoomInstanceDto`:
+ * it's a management listing, so it carries who is in there (`playerIds`, from live
+ * presence) and drops the connection details (photon ids, data blob, room code) an
+ * owner has no business reading for a session they aren't in.
+ */
+export interface RoomInstanceSummary {
+	roomInstanceId: number
+	roomId: number
+	subRoomId: number
+	isFull: boolean
+	createdAt: string
+	playerIds: number[]
 }
 
 /** The full stored instance — the DTO plus the JsonIgnore fields (in the blob). */
@@ -291,4 +307,35 @@ export async function getRoomInstancesByRoom(
 		.bind(roomId)
 		.all<{ data: string }>()
 	return results.map((r) => toDto(parse(r.data)))
+}
+
+/**
+ * A room's instances as the owner's management listing sees them — the
+ * {@link RoomInstanceSummary} projection, each with the players currently standing
+ * in it. Presence is read once for the whole room (one grouped query), so this stays
+ * two reads regardless of how many instances are live; an instance nobody is in
+ * (everyone timed out, or it was just created) gets an empty `playerIds`.
+ */
+export async function getRoomInstanceSummariesByRoom(
+	db: D1Database,
+	roomId: number
+): Promise<RoomInstanceSummary[]> {
+	const [{ results }, playersByInstance] = await Promise.all([
+		db
+			.prepare('SELECT data FROM room_instance WHERE room_id = ?1 ORDER BY id')
+			.bind(roomId)
+			.all<{ data: string }>(),
+		getPlayerIdsByRoomInstance(db, roomId),
+	])
+	return results.map((r) => {
+		const s = parse(r.data)
+		return {
+			roomInstanceId: s.roomInstanceId,
+			roomId: s.roomId,
+			subRoomId: s.subRoomId,
+			isFull: s.isFull,
+			createdAt: s.createdAt,
+			playerIds: playersByInstance.get(s.roomInstanceId) ?? [],
+		}
+	})
 }
