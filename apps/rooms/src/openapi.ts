@@ -505,7 +505,7 @@ export const RestrictionsRequest = z.object({
 	supportsJuniors: z.string().optional().describe('`True` / `False`'),
 })
 
-/** `PUT /rooms/{roomId}/loadscreen` — appends one screen to the list. */
+/** `PUT /rooms/{roomId}/loadscreen` — the posted screen replaces the whole list. */
 export const LoadScreenRequest = z.object({
 	imageName: z.string().describe('A key from the storage upload'),
 	title: z.string().optional(),

@@ -1258,7 +1258,7 @@ describe('rooms endpoints', () => {
 		expect(typeof room.SupportsMobile).toBe('boolean')
 	})
 
-	it('PUT /rooms/:id/loadscreen appends a load screen (auth-gated, owner/co-owner-only)', async () => {
+	it('PUT /rooms/:id/loadscreen replaces the load screen (auth-gated, owner/co-owner-only)', async () => {
 		const screensOf = async (): Promise<Array<Record<string, unknown>>> => {
 			const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
 				LoadScreens?: Array<Record<string, unknown>>
@@ -1278,10 +1278,8 @@ describe('rooms endpoints', () => {
 			success: false,
 		})
 
-		const before = (await screensOf()).length
-
-		// Owner adds one (imageName + title + subtitle) — appended, and the success
-		// envelope carries the updated room.
+		// Owner sets one (imageName + title + subtitle) — the success envelope carries the
+		// updated room, and the posted screen is the ONLY entry.
 		const added = await envOf(
 			await putForm(
 				'/rooms/2/loadscreen',
@@ -1290,18 +1288,17 @@ describe('rooms endpoints', () => {
 			)
 		)
 		expect(added).toMatchObject({ success: true })
-		expect(added.value?.LoadScreens as unknown[]).toContainEqual({
-			ImageName: 'sharecamera/2026-07-15/abc.jpg',
-			Title: 'asdf',
-			Subtitle: 'sdf',
-		})
-		expect(await screensOf()).toHaveLength(before + 1)
+		expect(added.value?.LoadScreens).toEqual([
+			{ ImageName: 'sharecamera/2026-07-15/abc.jpg', Title: 'asdf', Subtitle: 'sdf' },
+		])
+		expect(await screensOf()).toHaveLength(1)
 
-		// A second call appends rather than replacing; title/subtitle default to empty.
+		// A second call REPLACES rather than appending (the client renders one screen, so
+		// an appended one would sit unreachable behind the old); title/subtitle default to
+		// empty when omitted.
 		const co = await envOf(await putForm('/rooms/2/loadscreen', { imageName: 'second.jpg' }, '2'))
 		expect(co).toMatchObject({ success: true })
-		expect(await screensOf()).toHaveLength(before + 2)
-		expect(await screensOf()).toContainEqual({ ImageName: 'second.jpg', Title: '', Subtitle: '' })
+		expect(await screensOf()).toEqual([{ ImageName: 'second.jpg', Title: '', Subtitle: '' }])
 	})
 
 	it('PUT /rooms/:id/accessibility sets the room-level Accessibility (auth-gated, owner/co-owner-only)', async () => {

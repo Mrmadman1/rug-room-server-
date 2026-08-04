@@ -70,6 +70,11 @@ inconsistency here without checking the client first.
 - A club's `AdditionalImages` (`clubs`) is an array of whole `SavedImage` records, not
   image names — a bare string array fails the client's parser ("expected '{'"). The list
   is packed: removing an image shifts the rest up, never leaving a blank slot.
+- A room's `LoadScreens` (`rooms`: `PUT /rooms/:id/loadscreen`) is an array — the
+  client's parser wants one — but the client renders only the FIRST entry and only ever
+  posts one. So the endpoint REPLACES the list rather than appending: an appended screen
+  sits unreachable behind the old one and setting a load screen looks like it did
+  nothing. Keep the array shape for eventual multi-screen support.
 - Endpoints the client re-renders from must return the updated entity, not
   `{ error, success, value: null }` — e.g. `clubs` `PUT /club/:id/clubhouse` left the old
   clubhouse on screen until it answered the full details envelope.

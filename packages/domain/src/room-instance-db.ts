@@ -223,6 +223,35 @@ export async function setRoomInstanceInProgress(
 }
 
 /**
+ * Flip an instance's `isPrivate` flag, rewriting the JSON blob (the generated
+ * `is_private` column follows it). Returns the updated DTO, or null when the
+ * instance doesn't exist.
+ *
+ * Marking an instance private is what closes it to strangers: {@link
+ * getJoinableInstance} only ever reuses instances with `is_private = 0`, so a public
+ * matchmake stops landing new players here the moment this is set. Everyone already
+ * inside stays — this shuts the door, it doesn't clear the room.
+ */
+export async function setRoomInstancePrivate(
+	db: D1Database,
+	id: number,
+	isPrivate: boolean
+): Promise<RoomInstanceDto | null> {
+	const row = await db
+		.prepare('SELECT data FROM room_instance WHERE id = ?1')
+		.bind(id)
+		.first<{ data: string }>()
+	if (!row) return null
+	const stored = parse(row.data)
+	stored.isPrivate = isPrivate
+	await db
+		.prepare('UPDATE room_instance SET data = ?1 WHERE id = ?2')
+		.bind(JSON.stringify(stored), id)
+		.run()
+	return toDto(stored)
+}
+
+/**
  * Recompute an instance's `isFull` flag from live match presence: full once the
  * number of players currently present in the instance reaches its `maxCapacity`
  * (capacity 0 — unset — is never full). Rewrites the JSON blob (the generated
