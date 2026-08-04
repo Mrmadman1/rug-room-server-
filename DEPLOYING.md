@@ -43,10 +43,12 @@ services but would require small code changes.
 
 ## Prerequisites
 
-- node (modern)
-- pnpm
-- bun
-- jq/awk/sed
+**You must have all these requirements or RecFlare deployment will fail!**
+
+- node 24 (https://nodejs.org)
+- pnpm (install with `npm install -g pnpm`)
+- bun (https://bun.sh)
+- jq/awk/sed (on Windows try `winget jq` etc.)
 - A Cloudflare account with a zone (domain) you control, for deploying.
 
 Cloudflare's free plan is good enough for testing (100k worker requests/day) but the
@@ -65,6 +67,8 @@ We use [Just](https://github.com/casey/just) for convenience. This will install 
 just install
 ```
 
+You do not have to use `just` but you will have to run things manually with `pnpm`/`bun`.
+
 **Configure your custom domain:**
 
 Create a new .env file from the template:
@@ -77,11 +81,11 @@ Edit `.env` and set `RECFLARE_DOMAIN` to your domain (or declare it with `export
 
 (Optional) - per-app subdomain overrides come from
 `RECFLARE_SUBDOMAINS` (a JSON object, e.g. `'{"playersettings":"settings"}'`). This would be used
-if you wanted to merge two services together.
+if you wanted to merge two services together e.g. send `datacollection` calls to `api`.
 
 **Create the storage resources:**
 
-The workers bind Cloudflare storage primitive. Create them once against your
+The workers bind Cloudflare storage primitives. Create them once against your
 Cloudflare account, then record the IDs in `.env`. The committed `wrangler.jsonc`
 files carry `"local"` placeholders; the real IDs are spliced in at deploy time, so
 nothing in version control needs editing. Authenticate wrangler first
