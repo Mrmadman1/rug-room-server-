@@ -130,7 +130,34 @@ export const BuyItemResponse = z.object({
 	BalanceType: z.int().describe('-2 = account-wide'),
 })
 
-/** buyItem error body (`{ error }`), returned on 400/404/409. */
+/**
+ * `GET /api/storefronts/v2/buyInvention` — the purchase result. Two envelopes side by
+ * side: the balance update (shaped like buyItem's, except `Balance` is the RESULTING
+ * total, not the change, and `Data` is a single invention rather than a gift-drop list)
+ * and the invention envelope the invention endpoints already serve.
+ */
+export const BuyInventionResponse = z.object({
+	BalanceUpdateResponse: z.object({
+		Balance: z.int().describe('The resulting balance — NOT the change, unlike buyItem'),
+		BalanceType: z.int().describe('-2 = account-wide'),
+		CurrencyType: z.int().describe('2 = RecCenterTokens'),
+		BalanceUpdates: z.array(
+			z.object({
+				UpdateResponse: z.int(),
+				Data: JsonObject.describe('The bought invention (`RRInvention`)'),
+			})
+		),
+	}),
+	InventionResponse: z
+		.object({
+			Status: z.int(),
+			Invention: JsonObject,
+			InventionVersion: JsonObject,
+		})
+		.describe('The same envelope `POST /api/inventions/v6/save` returns'),
+})
+
+/** buyItem / buyInvention error body (`{ error }`), returned on 400/402/403/404/409. */
 export const ErrorResponse = z.object({ error: z.string() })
 
 // ---- Request schemas -------------------------------------------------------

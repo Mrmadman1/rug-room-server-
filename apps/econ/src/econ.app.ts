@@ -6,6 +6,10 @@ import { consumeGift, createGift, getGift, getPendingGifts } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+// Invention storage (owned by the `api` worker, on this same `recflare` database).
+// Imported directly rather than copied: these are plain D1 helpers with no bindings of
+// their own, and buyInvention has to read the very rows `api` writes.
+import { getInventionById, toSaveResult } from '../../api/src/inventions-db'
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported
 // as a value — the enum has no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
@@ -17,6 +21,7 @@ import weeklyChallenge from '../static/weekly-challenge.json'
 import { getAvatar, setAvatar } from './avatar-db'
 import {
 	ALL_PLATFORMS,
+	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
 	getBalance,
 	isSpendable,
@@ -30,10 +35,12 @@ import {
 } from './consumables-db'
 import { getEquipment, grantEquipment, setEquipmentFavorited } from './equipment-db'
 import { getInventory, grantItem } from './inventory-db'
+import { grantInvention, ownsInvention } from './inventory-invention-db'
 import {
 	AUTHED,
 	AvatarV2Dto,
 	BalanceEntry,
+	BuyInventionResponse,
 	BuyItemRequest,
 	BuyItemResponse,
 	ChallengeProgressRequest,
@@ -69,7 +76,8 @@ import type { Outfit } from './outfit-db'
 /**
  * Economy Worker. Hosts the avatar/economy endpoints the game client calls on
  * the `econ` service (these are separate from the main `api` worker). Balances,
- * inventory, consumables, saved outfits, avatars and gift boxes are D1-backed;
+ * inventory (avatar items, equipment, bought inventions), consumables, saved outfits,
+ * avatars and gift boxes are D1-backed;
  * storefront catalogs are static assets (`sf{N}.json`) served via the ASSETS
  * binding. Some routes are still empty-list stubs (room keys, wishlist, …).
  *
@@ -1160,6 +1168,114 @@ const app = new Hono<App>({ strict: false })
 				Balance: -price.Price,
 				CurrencyType: currencyType,
 				BalanceType: ALL_PLATFORMS,
+			})
+		}
+	)
+
+	// Buy an invention. [Authorize]. A GET, despite being a purchase — the client sends
+	// `?inventionId=…&requestedPrice=…` with no body, so that's what we answer.
+	//
+	// Only FREE inventions can be bought for now: we look the invention up by id and
+	// confirm its stored `Price` — both against the price the client rendered (a
+	// mismatch is a stale or tampered client, 409) and against 0 (a priced invention is
+	// 402, since nothing here debits the buyer or pays the creator yet). That keeps the
+	// path from ever moving currency while the payout half is unimplemented.
+	//
+	// Ownership is recorded in `inventory_invention`; the creator is not sold their own
+	// invention (they own it already, via CreatorPlayerId) and a re-buy is a 409 rather
+	// than a second row. The invention's `NumDownloads` counter is deliberately NOT
+	// bumped: that column lives on the `invention` table the `api` worker owns, and this
+	// worker only reads it.
+	.get(
+		'/api/storefronts/v2/buyInvention',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Buy an invention',
+			description: [
+				'Looks the invention up by id, confirms the client’s `requestedPrice` still matches',
+				'its stored `Price`, records ownership in `inventory_invention`, and returns the',
+				'invention alongside the (unchanged) balance. Only FREE inventions are sellable for',
+				'now — a priced one is 402. A GET because that is how the client sends it.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'inventionId',
+					in: 'query',
+					required: true,
+					description: 'Invention id; missing or non-numeric is 400',
+					schema: { type: 'integer' },
+				},
+				{
+					name: 'requestedPrice',
+					in: 'query',
+					required: false,
+					description: 'The price the client rendered; a mismatch is 409. Defaults to 0',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(BuyInventionResponse, 'The purchase result (invention + balance)'),
+				400: json(ErrorResponse, 'Missing/non-numeric inventionId, or buying your own'),
+				401: UNAUTHORIZED_RESPONSE,
+				402: json(ErrorResponse, 'The invention is not free (unsupported for now)'),
+				403: json(ErrorResponse, 'The invention is not published, so it is not for sale'),
+				404: json(ErrorResponse, 'No such invention'),
+				409: json(ErrorResponse, 'Already owned, or the price has changed'),
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const inventionId = Number.parseInt(c.req.query('inventionId') ?? '', 10)
+			if (Number.isNaN(inventionId)) return c.json({ error: 'inventionId is required' }, 400)
+			// Absent/non-numeric requestedPrice reads as 0 — the only price we sell at anyway,
+			// so the confirmation below still has something to compare against.
+			const requestedPrice = Number.parseInt(c.req.query('requestedPrice') ?? '0', 10) || 0
+
+			const invention = await getInventionById(c.env.DB, inventionId)
+			if (invention === null) return c.json({ error: 'Invention not found' }, 404)
+			// An unpublished invention is a draft: it isn't on sale, not even for free.
+			if (!invention.IsPublished) return c.json({ error: 'Invention is not for sale' }, 403)
+			if (invention.CreatorPlayerId === id) {
+				return c.json({ error: 'Cannot buy your own invention' }, 400)
+			}
+			if (await ownsInvention(c.env.DB, id, inventionId)) {
+				return c.json({ error: 'Already owned' }, 409)
+			}
+
+			// Confirm the price twice: against what the client rendered, then against the only
+			// price we can actually settle (free).
+			if (invention.Price !== requestedPrice) {
+				return c.json({ error: 'Price has changed' }, 409)
+			}
+			if (invention.Price !== 0) {
+				return c.json({ error: 'Only free inventions can be bought right now' }, 402)
+			}
+
+			await grantInvention(c.env.DB, id, inventionId)
+
+			// Nothing was debited, so this is the buyer's balance as it stands (a first read
+			// seeds their starting grant, as everywhere else). Unlike buyItem — whose `Balance`
+			// is the change applied — the reference server answers this one with the RESULTING
+			// total, so no StorefrontBalanceUpdate push is needed either: nothing changed.
+			const balance = await getBalance(
+				c.env.DB,
+				id,
+				CurrencyType.RecCenterTokens,
+				intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			)
+			return c.json({
+				BalanceUpdateResponse: {
+					Balance: balance,
+					BalanceType: ALL_PLATFORMS,
+					CurrencyType: CurrencyType.RecCenterTokens,
+					BalanceUpdates: [{ UpdateResponse: 0, Data: invention }],
+				},
+				// The same `{ Status, Invention, InventionVersion }` envelope the invention
+				// save/read endpoints serve — the client re-renders the invention from it.
+				InventionResponse: toSaveResult(invention),
 			})
 		}
 	)

@@ -6,6 +6,9 @@ import '../../econ.app'
 
 import { RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain'
 
+// The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
+// is built here too (see the same cross-worker import in econ.app.ts).
+import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
 import { SCHEMA_DDL } from '../../avatar-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -17,6 +20,7 @@ import {
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
+import { getOwnedInventionIds, INVENTORY_INVENTION_SCHEMA_DDL } from '../../inventory-invention-db'
 import { OUTFIT_SCHEMA_DDL } from '../../outfit-db'
 
 import type { Env } from '../../context'
@@ -39,10 +43,75 @@ beforeAll(async () => {
 	for (const stmt of CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of EQUIPMENT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of RECEIVED_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 42, username: 'Tester', displayName: 'Tester' }))
 		.run()
+	for (const invention of SEEDED_INVENTIONS) {
+		await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+			.bind(JSON.stringify(invention))
+			.run()
+	}
 })
+
+/**
+ * Inventions the buyInvention tests buy (or fail to buy). Only the fields that path
+ * reads are meaningful — id, creator, published flag and price — but the record is
+ * shaped like a real stored `RRInvention` so the response envelope is realistic.
+ */
+function invention(
+	inventionId: number,
+	overrides: { CreatorPlayerId?: number; IsPublished?: boolean; Price?: number } = {}
+) {
+	return {
+		InventionId: inventionId,
+		ReplicationId: `replication-${inventionId}`,
+		CreatorPlayerId: 999,
+		Name: `Invention ${inventionId}`,
+		Description: 'A test invention',
+		ImageName: '',
+		CurrentVersionNumber: 1,
+		CurrentVersion: {
+			InventionId: inventionId,
+			ReplicationId: `version-${inventionId}`,
+			VersionNumber: 1,
+			BlobName: `invention-${inventionId}.inv`,
+			BlobHash: null,
+			InstantiationCost: 0,
+			LightsCost: 0,
+			ChipsCost: 0,
+			CloudVariablesCost: 0,
+			AICost: 0,
+		},
+		Accessibility: 0,
+		IsPublished: true,
+		IsFeatured: false,
+		ModifiedAt: '2026-01-01T00:00:00.000Z',
+		CreatedAt: '2026-01-01T00:00:00.000Z',
+		FirstPublishedAt: '2026-01-01T00:00:00.000Z',
+		CreationRoomId: 0,
+		NumPlayersHaveUsedInRoom: 0,
+		NumDownloads: 0,
+		CheerCount: 0,
+		CreatorPermission: 100,
+		GeneralPermission: 20,
+		IsAGInvention: false,
+		IsCertifiedInvention: false,
+		Price: 0,
+		AllowTrial: true,
+		HideFromPlayer: false,
+		ReferencedInventions: [],
+		...overrides,
+	}
+}
+
+const SEEDED_INVENTIONS = [
+	invention(8), // free, published, someone else's — the sellable one
+	invention(9, { Price: 250 }), // priced: not sellable while only free is supported
+	invention(10, { IsPublished: false }), // a draft, not on sale even at 0
+	invention(11, { CreatorPlayerId: 60 }), // account 60's own invention
+]
 
 /**
  * A real outfit as the client posts it to /api/avatar/v3/saved/set — kept verbatim
@@ -920,6 +989,76 @@ describe('econ endpoints', () => {
 		expect(list.every((i) => i.FriendlyName !== 'Bowtie (White)')).toBe(true)
 	})
 
+	// buyInvention is a GET with query params — that is how the client sends it.
+	const buyInvention = async (sub: string, inventionId: number, requestedPrice = 0) =>
+		exports.default.fetch(
+			`${ORIGIN}/api/storefronts/v2/buyInvention?inventionId=${inventionId}&requestedPrice=${requestedPrice}`,
+			{ headers: await bearer(sub) }
+		)
+
+	test('GET /api/storefronts/v2/buyInvention 401s without a token', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/storefronts/v2/buyInvention?inventionId=8&requestedPrice=0`
+		)
+		expect(res.status).toBe(401)
+	})
+
+	test('GET /api/storefronts/v2/buyInvention records ownership of a free invention', async () => {
+		const res = await buyInvention('50', 8)
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			BalanceUpdateResponse: {
+				Balance: number
+				BalanceType: number
+				CurrencyType: number
+				BalanceUpdates: Array<{ UpdateResponse: number; Data: { InventionId: number } }>
+			}
+			InventionResponse: {
+				Status: number
+				Invention: { InventionId: number; Name: string }
+				InventionVersion: { InventionId: number; VersionNumber: number }
+			}
+		}
+		// Nothing was debited, so `Balance` is the resulting total — the untouched starting
+		// grant — not a change, unlike buyItem's.
+		expect(body.BalanceUpdateResponse.Balance).toBe(DEFAULT_STARTING_TOKENS)
+		expect(body.BalanceUpdateResponse.CurrencyType).toBe(CurrencyType.RecCenterTokens)
+		expect(body.BalanceUpdateResponse.BalanceType).toBe(-2)
+		expect(body.BalanceUpdateResponse.BalanceUpdates[0].Data.InventionId).toBe(8)
+		expect(body.InventionResponse.Status).toBe(0)
+		expect(body.InventionResponse.Invention.Name).toBe('Invention 8')
+		expect(body.InventionResponse.InventionVersion.VersionNumber).toBe(1)
+
+		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
+
+		// Owning an invention is boolean: buying it again is a conflict, not a second row.
+		expect((await buyInvention('50', 8)).status).toBe(409)
+		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
+	})
+
+	test('GET /api/storefronts/v2/buyInvention refuses anything but a free invention', async () => {
+		// Invention 9 costs 250. Sending the price the client rendered is a 402 (nothing
+		// here can settle a paid purchase yet); sending 0 for it is a stale/tampered price.
+		expect((await buyInvention('51', 9, 250)).status).toBe(402)
+		expect((await buyInvention('51', 9, 0)).status).toBe(409)
+		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([])
+	})
+
+	test('GET /api/storefronts/v2/buyInvention rejects drafts, self-buys and unknown ids', async () => {
+		// Unpublished — a draft is not on sale, free or not.
+		expect((await buyInvention('52', 10)).status).toBe(403)
+		// Account 60 created invention 11; a creator already owns it.
+		expect((await buyInvention('60', 11)).status).toBe(400)
+		expect((await buyInvention('52', 9999)).status).toBe(404)
+		// Missing/non-numeric inventionId.
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyInvention`, {
+			headers: await bearer('52'),
+		})
+		expect(res.status).toBe(400)
+		expect(await getOwnedInventionIds(env.DB, 52)).toEqual([])
+		expect(await getOwnedInventionIds(env.DB, 60)).toEqual([])
+	})
+
 	test('POST /api/avatar/v2/gifts/consume opens the box the way the client sends it', async () => {
 		// Buy an item for account 24, then consume the box the way the client does: on the
 		// econ host, with a form body (`Id=..&UnlockedLevel=..`).
@@ -1182,6 +1321,7 @@ describe('econ endpoints', () => {
 			'GET /api/roomkeys/v1/mine',
 			'GET /api/roomkeys/v1/room',
 			'GET /api/storefronts/v1/adcarouselitems',
+			'GET /api/storefronts/v2/buyInvention',
 			'GET /api/storefronts/v3/giftdropstore/{id}',
 			'GET /api/storefronts/v4/balance/{currencyType}',
 			'GET /econ/customAvatarItems/v1/owned',
