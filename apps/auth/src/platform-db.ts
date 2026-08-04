@@ -39,22 +39,30 @@ export const PLATFORM_SCHEMA_DDL: string[] = [
 ]
 
 /**
- * The one-time backfill 0007 runs after creating the table: every identity already
- * bound to an account becomes a link, so nobody loses their cached login at deploy.
- * Exported so a test can run exactly the statement the migration does.
+ * The one-time backfill 0007 ran after creating the table: every identity already bound
+ * to an account became a link, so nobody lost their cached login at deploy. It has run;
+ * this exists so a test can still exercise it, which is the only coverage that legacy
+ * blob-bound accounts get a link at all.
  *
  * `platform` is COALESCEd to 0 because nothing ever defaulted that field — an account
  * can carry a platformId with no platform recorded, and back when Steam was the only
  * verifiable platform an unset one *was* Steam.
+ *
+ * NOT byte-identical to the migration any more, deliberately. 0007 selected the
+ * `account.platform_id` generated column; 0008 drops it, so that text is unrunnable
+ * against the head schema the tests build. This selects the blob directly instead —
+ * the same values, since the dropped column was DEFINED as
+ * `json_extract(data, '$.platformId')`. 0007 is left exactly as it ran on prod.
  */
 export const PLATFORM_BACKFILL_SQL = `INSERT OR IGNORE INTO platform_account (account_id, platform, platform_id, linked_at)
 	SELECT
 		account_id,
 		COALESCE(json_extract(data, '$.platform'), 0),
-		platform_id,
+		json_extract(data, '$.platformId'),
 		COALESCE(json_extract(data, '$.createdAt'), '1970-01-01T00:00:00Z')
 	FROM account
-	WHERE platform_id IS NOT NULL AND platform_id <> ''`
+	WHERE json_extract(data, '$.platformId') IS NOT NULL
+		AND json_extract(data, '$.platformId') <> ''`
 
 /** One account ↔ platform identity link. */
 export interface PlatformLink {

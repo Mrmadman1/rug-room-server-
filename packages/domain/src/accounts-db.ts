@@ -11,18 +11,20 @@
  * it from `@repo/domain` (each uses the subset it needs).
  */
 
-/** Schema DDL (mirror of migrations 0001_accounts + 0002_avatar, sans seed INSERTs). */
+/**
+ * Schema DDL — the head schema, i.e. what the table looks like after every migration
+ * (0001_accounts + 0002_avatar, sans seed INSERTs; 0004 added a `platform_id` generated
+ * column and 0008 dropped it again, so it appears here in neither form).
+ */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS account (
 		data TEXT NOT NULL,
 		avatar TEXT,
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
-		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
-		platform_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.platformId')) VIRTUAL
+		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_accounts_username_lower ON account (username_lower)`,
-	`CREATE INDEX IF NOT EXISTS idx_accounts_platform_id ON account (platform_id)`,
 ]
 
 /** Client-facing account shape (camelCase, exactly as the client's AccountDTO). */
@@ -225,8 +227,9 @@ export async function searchAccounts(
  *
  * Reads `deviceId` straight out of the JSON blob, so this is a table scan — no
  * generated column, no migration. Fine at our account count and for the occasional
- * linkup lookup this exists for; if it ever gets hot, promote `deviceId` to an
- * indexed generated column the way `platformId` is (see the 0004 migration).
+ * linkup lookup this exists for; if it ever gets hot, promote `deviceId` to an indexed
+ * generated column (migration 0004 did that for `platformId`, and 0008 undid it once
+ * nothing queried it — that pair is the recipe both ways).
  *
  * The device id is unverified client input, so treat a match as a *hint* (these
  * accounts share a device) and never as proof of identity.

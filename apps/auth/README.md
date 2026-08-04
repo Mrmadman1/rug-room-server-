@@ -98,7 +98,10 @@ cached login.
 
 The account blob keeps `platform`/`platformId` as the account's **primary** identity
 (the first one linked). It feeds the account DTO and a refreshed token's claims, and
-nothing authorizes off it.
+nothing authorizes off it. It is no longer indexed: migration 0008 drops the
+`account.platform_id` generated column that 0004 added, since leaving a queryable copy
+of one identity per account invites exactly the picker/grant disagreement above. Look
+identities up in `platform_account`.
 
 ## Signup caps
 
