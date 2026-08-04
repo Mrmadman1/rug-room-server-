@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
+import { getAccountsByIds } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 
 import { authedId, unauthorized } from '../http'
@@ -11,13 +12,16 @@ import {
 	intQuery,
 	json,
 	JsonArray,
+	MutualFriendDto,
 	RelationshipDto,
 	UNAUTHORIZED_RESPONSE,
 } from '../openapi'
 import {
 	acceptFriendRequest,
 	addFriend,
+	getMutualFriendIds,
 	getRelationshipsForPlayer,
+	MUTUAL_FRIENDS_LIMIT,
 	removeFriend,
 	sendFriendRequest,
 	setRelationshipFlag,
@@ -196,6 +200,57 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			return c.json(await getRelationshipsForPlayer(c.env.DB, id))
+		}
+	)
+
+	// The friends the caller and another player have in common. Unlike the other
+	// relationship routes this answers account cards, not relationships — it's what the
+	// client shows on someone else's profile.
+	.get(
+		'/api/relationships/mutualfriends',
+		describeRoute({
+			tags: ['Social'],
+			summary: 'Friends in common with another player',
+			description:
+				'The accounts the caller and `id` are both friends with — a bare array, ascending ' +
+				`by account id and capped at ${MUTUAL_FRIENDS_LIMIT}. Only real friendships count; ` +
+				'pending requests on either side are ignored.\n\n' +
+				'Answers an empty array rather than an error for the degenerate cases: no target ' +
+				'id, an id of 0 or below, or the caller asking for mutuals with themselves. ' +
+				'Mutual ids with no account row are dropped, so the list can be shorter than the ' +
+				'intersection.\n\n' +
+				'Each entry is a trimmed account card. `ProfileImage` is an empty string, never ' +
+				'null, when the account has no image.',
+			security: AUTHED,
+			parameters: [intQuery('id', 'The other player')],
+			responses: {
+				200: json(MutualFriendDto.array(), 'The shared friends; empty when there are none'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const raw = c.req.query('id')
+			const otherId = raw === undefined ? Number.NaN : Number.parseInt(raw, 10)
+			// Nothing to intersect: no/garbage id, a non-positive one, or the caller
+			// themselves. An empty list, not an error — this feeds a profile panel.
+			if (Number.isNaN(otherId) || otherId <= 0 || otherId === id) return c.json([])
+
+			const mutualIds = await getMutualFriendIds(c.env.DB, id, otherId)
+			const accounts = await getAccountsByIds(c.env.DB, mutualIds)
+			return c.json(
+				accounts
+					.map((a) => ({
+						AccountId: a.accountId,
+						Username: a.username,
+						DisplayName: a.displayName,
+						ProfileImage: a.profileImage ?? '',
+					}))
+					// getAccountsByIds doesn't promise an order; keep the ascending one.
+					.sort((a, b) => a.AccountId - b.AccountId)
+			)
 		}
 	)
 

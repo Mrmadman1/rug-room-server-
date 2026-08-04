@@ -2103,6 +2103,98 @@ describe('relationships', () => {
 	})
 })
 
+describe('mutual friends', () => {
+	// High, distinct ids so the friendships seeded here don't collide with the
+	// relationship tests above.
+	const CALLER = 800
+	const OTHER = 801
+
+	type Card = { AccountId: number; Username: string; DisplayName: string; ProfileImage: string }
+
+	const mutuals = async (query: string, sub = String(CALLER)): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}/api/relationships/mutualfriends${query}`, {
+			headers: await bearer(sub),
+		})
+
+	beforeAll(async () => {
+		const rel = (a: number, b: number, type = 3) =>
+			env.DB.prepare(
+				'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
+			).bind(a, b, type)
+		// 804 has no profileImage key at all — the projection must still answer a
+		// string. 806 is deliberately given no account row.
+		const account = (id: number, extra: Record<string, unknown>) =>
+			env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)').bind(
+				JSON.stringify({ accountId: id, username: `P${id}`, displayName: `Player ${id}`, ...extra })
+			)
+
+		await env.DB.batch([
+			account(CALLER, { profileImage: 'p800.jpg' }),
+			account(OTHER, { profileImage: 'p801.jpg' }),
+			account(802, { profileImage: 'p802.jpg' }),
+			account(803, { profileImage: 'p803.jpg' }),
+			account(804, {}),
+			// Seeded 804-first so the ascending order of the answer is the code's doing,
+			// not the insertion order's.
+			rel(CALLER, 804),
+			rel(802, CALLER), // friendship recorded from the other direction
+			rel(CALLER, 803),
+			rel(CALLER, 806),
+			rel(OTHER, 804), // shared → in the answer
+			rel(OTHER, 802), // shared → in the answer
+			rel(803, OTHER, 1), // only a pending request → NOT a friend of OTHER
+			rel(OTHER, 806), // shared, but 806 has no account row → dropped
+		])
+	})
+
+	test('GET /api/relationships/mutualfriends returns the shared friends', async () => {
+		const res = await mutuals(`?id=${OTHER}`)
+		expect(res.status).toBe(200)
+		const cards = (await res.json()) as Card[]
+		// 803 is only a pending request on OTHER's side, and 806 has no account row.
+		expect(cards.map((p) => p.AccountId)).toEqual([802, 804])
+		expect(cards[0]).toEqual({
+			AccountId: 802,
+			Username: 'P802',
+			DisplayName: 'Player 802',
+			ProfileImage: 'p802.jpg',
+		})
+		// No stored image → an empty string, never null/undefined.
+		expect(cards[1]?.ProfileImage).toBe('')
+	})
+
+	// The degenerate cases answer an empty list rather than an error — this feeds a
+	// profile panel, which would otherwise have nothing to render.
+	// `?id=` is the only accepted form — `?playerId=` reads as no id at all.
+	test('GET /api/relationships/mutualfriends answers [] for a missing/self/bad id', async () => {
+		for (const query of ['', '?id=0', '?id=-5', '?id=abc', `?id=${CALLER}`, `?playerId=${OTHER}`]) {
+			const res = await mutuals(query)
+			expect(res.status, query).toBe(200)
+			expect(await res.json(), query).toEqual([])
+		}
+	})
+
+	// Symmetric: 802 and 803 aren't friends with each other, but both are friends with
+	// 800, so 800 is what they have in common.
+	test('GET /api/relationships/mutualfriends works between two other players', async () => {
+		const cards = (await (await mutuals('?id=803', '802')).json()) as Card[]
+		expect(cards.map((p) => p.AccountId)).toEqual([CALLER])
+	})
+
+	test('GET /api/relationships/mutualfriends answers [] with nothing in common', async () => {
+		// 809 has no relationships at all.
+		const cards = (await (await mutuals('?id=809', '802')).json()) as Card[]
+		expect(cards).toEqual([])
+	})
+
+	test('GET /api/relationships/mutualfriends is auth-gated', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/relationships/mutualfriends?id=${OTHER}`
+		)
+		expect(res.status).toBe(401)
+	})
+})
+
 describe('openapi', () => {
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
@@ -2181,6 +2273,7 @@ describe('openapi', () => {
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/quickPlay/v1/getandclear',
+			'GET /api/relationships/mutualfriends',
 			'GET /api/relationships/v1/favorite',
 			'GET /api/relationships/v1/ignore',
 			'GET /api/relationships/v1/mute',

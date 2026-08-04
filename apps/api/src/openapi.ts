@@ -163,6 +163,17 @@ export const RelationshipDto = z.object({
 /** The `{ Success, Message }` ack the flag toggles answer with. */
 export const AckResponse = z.object({ Success: z.boolean(), Message: z.string() })
 
+/**
+ * One entry of `GET /api/relationships/mutualfriends` — a friend both players share.
+ * A trimmed account card, not a relationship: no relationship type or flags.
+ */
+export const MutualFriendDto = z.object({
+	AccountId: z.int(),
+	Username: z.string(),
+	DisplayName: z.string(),
+	ProfileImage: z.string().describe('The image name; an empty string when the account has none'),
+})
+
 // ---- Progression -----------------------------------------------------------
 
 /**
