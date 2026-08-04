@@ -14,6 +14,7 @@ import '../../api.app'
 import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
+import { getReportsAgainst, SCHEMA_DDL as REPORTS_SCHEMA_DDL } from '../../reports-db'
 
 import type { Env } from '../../context'
 import type { SavedImage } from '../../images-db'
@@ -81,6 +82,9 @@ beforeAll(async () => {
 
 	// Inventions table (owned by the api worker) — invention save/mine use it.
 	for (const stmt of INVENTIONS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Reports table (owned by the api worker) — player reports are recorded here.
+	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -1099,6 +1103,88 @@ describe('auth-gated endpoints', () => {
 	})
 })
 
+describe('player reports', () => {
+	const submit = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+		exports.default.fetch(`${ORIGIN}/api/PlayerReporting/v3/create`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+
+	test('POST /api/PlayerReporting/v3/create records the report', async () => {
+		const res = await submit(
+			{
+				PlayerIdReported: '205',
+				ReportCategory: '100',
+				Details: 'ya know',
+				HeightReporter: '1.64',
+				HeightReported: '1.65',
+				RoomId: '58',
+				RoomInstanceType: 'Public',
+			},
+			await bearer()
+		)
+		expect(res.status).toBe(200)
+		// `error` is an empty string, not null — the real service's envelope.
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const [row] = await getReportsAgainst(env.DB, 205)
+		expect(row).toMatchObject({
+			// The reporter is the token's subject, not a body field.
+			reporter_player_id: 42,
+			reported_player_id: 205,
+			report_category: 100,
+			details: 'ya know',
+			height_reporter: 1.64,
+			height_reported: 1.65,
+			room_id: 58,
+			room_instance_type: 'Public',
+		})
+		expect(row?.created_at).toBeTruthy()
+	})
+
+	// Everything but the reported player is optional — a report raised outside a room
+	// carries no RoomId, and 0 means "no room" rather than room zero.
+	test('POST /api/PlayerReporting/v3/create stores absent fields as null', async () => {
+		const res = await submit({ PlayerIdReported: '206', RoomId: '0' }, await bearer())
+		expect(res.status).toBe(200)
+
+		const [row] = await getReportsAgainst(env.DB, 206)
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 206,
+			report_category: 0,
+			details: null,
+			height_reporter: null,
+			height_reported: null,
+			room_id: null,
+			room_instance_type: null,
+		})
+	})
+
+	// Append-only: a second report against the same player is a second row.
+	test('POST /api/PlayerReporting/v3/create appends rather than dedupes', async () => {
+		await submit({ PlayerIdReported: '207', Details: 'first' }, await bearer())
+		await submit({ PlayerIdReported: '207', Details: 'second' }, await bearer())
+		const rows = await getReportsAgainst(env.DB, 207)
+		expect(rows).toHaveLength(2)
+		// Newest first.
+		expect(rows.map((r) => r.details)).toEqual(['second', 'first'])
+	})
+
+	test('POST /api/PlayerReporting/v3/create 401s without a bearer token', async () => {
+		const res = await submit({ PlayerIdReported: '205' })
+		expect(res.status).toBe(401)
+	})
+
+	test('POST /api/PlayerReporting/v3/create 400s without a reported player', async () => {
+		const res = await submit({ Details: 'ya know' }, await bearer())
+		expect(res.status).toBe(400)
+		// Same envelope as the success branch — the client parses only one shape.
+		expect(await res.json()).toEqual({ success: false, error: 'PlayerIdReported is required' })
+	})
+})
+
 describe('rooms', () => {
 	test('POST /api/rooms/v1/verifyRole checks creator + room roles', async () => {
 		const verify = async (fields: Record<string, string>, sub?: string): Promise<boolean> => {
@@ -2016,6 +2102,7 @@ describe('openapi', () => {
 			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
 			'POST /api/PlayerReporting/v1/deviceId',
 			'POST /api/PlayerReporting/v1/hile',
+			'POST /api/PlayerReporting/v3/create',
 			'POST /api/avatar/v2/gifts/generate',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',

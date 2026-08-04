@@ -1,16 +1,51 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
+import { authedId, unauthorized } from '../http'
 import {
+	AUTHED,
 	BareBoolean,
+	CreateReportRequest,
 	DeviceIdRequest,
 	form,
 	json,
 	JsonArray,
 	ModerationBlockDetails,
+	ReportCreateResponse,
+	UNAUTHORIZED_RESPONSE,
 } from '../openapi'
+import { createReport } from '../reports-db'
 
+import type { Context } from 'hono'
 import type { App } from '../context'
+
+/**
+ * Read one field of the report submission. The client posts it form-encoded, but the
+ * same names also arrive as a query string on some builds, so both are accepted.
+ */
+function reportField(
+	body: Record<string, unknown>,
+	c: Context<App>,
+	name: string
+): string | undefined {
+	const raw = body[name]
+	if (typeof raw === 'string' && raw !== '') return raw
+	return c.req.query(name) || undefined
+}
+
+/** Parse a field as an integer, or null when absent / not a number. */
+const asInt = (v: string | undefined): number | null => {
+	if (v === undefined) return null
+	const n = Number.parseInt(v, 10)
+	return Number.isNaN(n) ? null : n
+}
+
+/** Parse a field as a float (the reported heights), or null when absent / not a number. */
+const asFloat = (v: string | undefined): number | null => {
+	if (v === undefined) return null
+	const n = Number.parseFloat(v)
+	return Number.isNaN(n) ? null : n
+}
 
 // ---- Player reporting ------------------------------------------------------
 export const moderationRoutes = new Hono<App>({ strict: false })
@@ -67,6 +102,61 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 			responses: { 200: json(BareBoolean, 'A bare JSON `false`') },
 		}),
 		(c) => c.json(false)
+	)
+
+	// The report the client actually submits. Auth-gated: the reporter is taken from
+	// the bearer token rather than the body, so a report can't be filed as someone else.
+	.post(
+		'/api/PlayerReporting/v3/create',
+		describeRoute({
+			tags: ['Moderation'],
+			summary: 'Submit a player report',
+			description:
+				'Records a player report in the `report` table — an append-only log; nothing ' +
+				'dedupes or acts on the rows yet, and `moderationBlockDetails` still answers ' +
+				'“not blocked” unconditionally.\n\n' +
+				'The reporter is the caller (from the bearer token), NOT a body field. Only ' +
+				'`PlayerIdReported` is required; the client omits whatever it has no value for ' +
+				'(a report raised outside a room carries no `RoomId`), and those are stored as ' +
+				'NULL. `ReportCategory` and `RoomInstanceType` are stored verbatim — neither ' +
+				'enum is mapped here. A `RoomId` of 0 or below means “no room”.\n\n' +
+				'Answers the real service’s `{ success, error }` envelope, where `error` is an ' +
+				'empty string rather than null. The rejected branch uses the same envelope so ' +
+				'the client only ever parses one shape.',
+			security: AUTHED,
+			requestBody: form(CreateReportRequest, 'The report'),
+			responses: {
+				200: json(ReportCreateResponse, '`{ success: true, error: "" }`'),
+				400: json(ReportCreateResponse, 'No `PlayerIdReported` in the request'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const reporterId = await authedId(c)
+			if (reporterId === null) return unauthorized(c)
+
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const reportedPlayerId = asInt(reportField(body, c, 'PlayerIdReported'))
+			if (reportedPlayerId === null) {
+				return c.json({ success: false, error: 'PlayerIdReported is required' }, 400)
+			}
+
+			// 0 / -1 are the client's "no room" values — store null rather than a bogus id.
+			const roomId = asInt(reportField(body, c, 'RoomId'))
+
+			await createReport(c.env.DB, {
+				reporterPlayerId: reporterId,
+				reportedPlayerId,
+				reportCategory: asInt(reportField(body, c, 'ReportCategory')) ?? 0,
+				details: reportField(body, c, 'Details') ?? null,
+				heightReporter: asFloat(reportField(body, c, 'HeightReporter')),
+				heightReported: asFloat(reportField(body, c, 'HeightReported')),
+				roomId: roomId !== null && roomId > 0 ? roomId : null,
+				roomInstanceType: reportField(body, c, 'RoomInstanceType') ?? null,
+			})
+
+			return c.json({ success: true, error: '' })
+		}
 	)
 
 	// The client reporting its device id (form-encoded `oldDeviceId`, `newDeviceId`,

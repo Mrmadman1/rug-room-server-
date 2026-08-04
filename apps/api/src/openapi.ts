@@ -411,6 +411,39 @@ export const ModerationBlockDetails = z.object({
 	TimeoutStartedAt: z.string().nullable(),
 })
 
+/**
+ * `POST /api/PlayerReporting/v3/create` form body — a player report. Everything is a
+ * string on the wire (it's form-encoded); only `PlayerIdReported` is required. The
+ * reporter is NOT in the body — it's taken from the bearer token.
+ */
+export const CreateReportRequest = z.object({
+	PlayerIdReported: z.string().describe('Account id of the player being reported'),
+	ReportCategory: z
+		.string()
+		.optional()
+		.describe('The reason picked in the report UI, e.g. `100`. Stored verbatim; unmapped'),
+	Details: z.string().optional().describe('The free-text description the reporter typed'),
+	HeightReporter: z
+		.string()
+		.optional()
+		.describe('Reporter’s player height in metres at report time, e.g. `1.64`'),
+	HeightReported: z.string().optional().describe('Reported player’s height in metres'),
+	RoomId: z.string().optional().describe('Room the report was raised in, if any'),
+	RoomInstanceType: z
+		.string()
+		.optional()
+		.describe('Instance type name, e.g. `Public`. Stored verbatim'),
+})
+
+/**
+ * The `{ success, error }` envelope `POST /api/PlayerReporting/v3/create` answers with —
+ * `error` is an empty string on success, never null.
+ */
+export const ReportCreateResponse = z.object({
+	success: z.boolean(),
+	error: z.string().describe('Empty string when the report was recorded'),
+})
+
 /** `POST /api/PlayerReporting/v1/deviceId` form body — the id rotation the client reports. */
 export const DeviceIdRequest = z.object({
 	oldDeviceId: z.string().optional().describe('The id the client thinks we hold'),
