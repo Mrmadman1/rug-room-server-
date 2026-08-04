@@ -29,6 +29,7 @@ import {
 	RoomInstanceType,
 	setPresence,
 	setRoomInstanceInProgress,
+	setRoomInstancePrivate,
 	subRoomDataBlob,
 } from '@repo/domain'
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
@@ -1013,6 +1014,93 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Join one SPECIFIC live instance by id (`/matchmake/instance/{roomInstanceId}`) —
+	// the action behind the owner's instance listing (`GET /room/{roomId}/instances`),
+	// where they pick a session of their room and drop into it. Unlike every other
+	// matchmake this targets a fixed instance: nothing is reused, nothing is created,
+	// and a full or in-progress instance is still entered (moderating a full instance
+	// is the point). OWNER-ONLY, gated with the same creator-or-co-owner check as the
+	// listing — the Photon room id is the join coordinate, so an open version of this
+	// would let anyone warp into any private session by guessing an id. Registered
+	// before the `/matchmake/room/…` routes so `instance` isn't read as a room name.
+	.post(
+		'/matchmake/instance/:instanceId{[0-9]+}',
+		describeRoute({
+			tags: ['Navigation'],
+			summary: 'Join a specific instance (owner only)',
+			description: [
+				'Places the caller into one specific live instance of their own room, picked by id',
+				'from the owner’s instance listing. Gated to the room’s creator or a co-owner.',
+				'Unlike the other matchmakes this never reuses or creates an instance, and enters',
+				'even a full or in-progress one. Returns errorCode 20 with a null instance when the',
+				'instance or its room is gone, or the caller doesn’t manage that room; errorCode 55',
+				'when banned.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'instanceId',
+					in: 'path',
+					required: true,
+					description: 'Room instance id (digits only)',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			responses: {
+				200: json(
+					MatchmakeResponse,
+					'The instance (or a null instance with errorCode 20 / 55 when it can’t be joined)'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const instanceId = Number.parseInt(c.req.param('instanceId'), 10)
+			const stored = await getRoomInstance(c.env.DB, instanceId)
+			// One opaque refusal for "no such instance", "no such room" and "not yours":
+			// a distinct code for the last would confirm which instance ids are live.
+			if (!stored) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			const room = await getRoomById(c.env.DB, stored.roomId)
+			if (!room) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			if (!canManageRoom(room, id)) {
+				logger.info('instance matchmake refused: not the room’s owner', {
+					roomInstanceId: instanceId,
+					roomId: stored.roomId,
+					accountId: id,
+				})
+				return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			}
+
+			// Like the follow-a-friend path, this hands out a Photon room id without going
+			// through resolveRoomInstance, so the room's bans are checked here too. An owner
+			// can't ban themselves out of their own room in practice, but a co-owner can be
+			// banned, and a ban must beat every route that yields join coordinates.
+			if (await isPlayerBannedFromRoom(c.env.DB, stored.roomId, id)) {
+				logger.info('instance matchmake refused: player banned from room', {
+					roomId: stored.roomId,
+					id,
+				})
+				return c.json({ errorCode: BANNED_FROM_ROOM, roomInstance: null })
+			}
+
+			// Rebuild the wire instance from the room (fresh scene + published save) keyed to
+			// this instance's own id and Photon room, so the owner lands in exactly the
+			// session they picked rather than a new one alongside it.
+			const instance = roomInstanceFromRoom(
+				room,
+				stored.isPrivate,
+				stored.roomInstanceId,
+				stored.photonRoomId,
+				stored.subRoomId
+			)
+			await enterRoom(c, id, instance)
+			return c.json({ errorCode: 0, roomInstance: instance })
+		}
+	)
+
 	// Matchmake into a specific subroom of a room (`/matchmake/room/{roomId}/{subRoomId}`
 	// — the client uses this to enter a room's other scenes). The subroom decides the
 	// scene the client loads and which instances are joinable, so it must be carried
@@ -1221,16 +1309,20 @@ const app = new Hono<App>()
 		(c) => c.body(null, 200)
 	)
 
-	// The room owner flips the instance's in-progress flag once the session starts
-	// (e.g. a game round begins). Body is a form post: `inProgress=True|False`.
+	// The instance's in-progress flag, flipped when a session starts (e.g. a game round
+	// begins). Deliberately NOT owner-gated, unlike the other room-instance mutations:
+	// this is set by whoever in the room starts the game, not by the room's owner — a
+	// gate here would break game starts for everyone else. Body is a form post:
+	// `inProgress=True|False`.
 	.put(
 		'/roominstance/:id/inprogress',
 		describeRoute({
 			tags: ['Room instance'],
 			summary: 'Set instance in-progress flag',
 			description: [
-				'The room owner flips the instance’s in-progress flag when a session starts (e.g. a',
-				'round begins). Body is `inProgress=True|False`.',
+				'Flips the instance’s in-progress flag when a session starts (e.g. a round begins).',
+				'Set by whoever in the room starts the game — any authenticated player, not just the',
+				'room’s owner. Body is `inProgress=True|False`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(InProgressRequest, 'The inProgress flag'),
@@ -1254,6 +1346,56 @@ const app = new Hono<App>()
 
 			const instance = await setRoomInstanceInProgress(c.env.DB, instanceId, inProgress)
 			if (!instance) return c.body(null, 404)
+			return c.body(null, 200)
+		}
+	)
+
+	// Close a live instance to strangers (`/roominstance/{id}/markprivate`) — the owner
+	// makes the session they're running private, so public matchmaking stops feeding new
+	// players into it (getJoinableInstance only reuses non-private instances). Everyone
+	// already inside stays put; this shuts the door rather than clearing the room.
+	// OWNER-ONLY (same creator-or-co-owner gate as the instance listing): whether a
+	// session is open is the room owner's call, not a passer-by's. Generic empty ack.
+	.post(
+		'/roominstance/:id/markprivate',
+		describeRoute({
+			tags: ['Room instance'],
+			summary: 'Mark an instance private (owner only)',
+			description: [
+				'Marks a live instance private, so public matchmaking stops placing new players',
+				'into it. Players already inside are unaffected. Auth-gated and gated to the',
+				'instance’s room’s creator or a co-owner (403 otherwise). Empty ack.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'id',
+					in: 'path',
+					required: true,
+					description: 'Room instance id',
+					schema: { type: 'string' },
+				},
+			],
+			responses: {
+				200: EMPTY_OK,
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				404: { description: 'Non-numeric id or no such instance (empty body)' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const instanceId = Number.parseInt(c.req.param('id'), 10)
+			if (Number.isNaN(instanceId)) return c.body(null, 404)
+
+			const stored = await getRoomInstance(c.env.DB, instanceId)
+			if (!stored) return c.body(null, 404)
+			const room = await getRoomById(c.env.DB, stored.roomId)
+			if (!room || !canManageRoom(room, id)) return c.body(null, 403)
+
+			await setRoomInstancePrivate(c.env.DB, instanceId, true)
 			return c.body(null, 200)
 		}
 	)

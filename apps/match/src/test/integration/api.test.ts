@@ -1018,6 +1018,141 @@ describe('auth-gated endpoints', () => {
 		expect((await coOwner.json()) as unknown[]).toHaveLength(instances.length)
 	})
 
+	test('POST /matchmake/instance/:id joins that exact instance, owner-only', async () => {
+		// A player with no role on room 3 spins up an instance of it, which the room's
+		// owner should then be able to drop into by id.
+		const spawn = await exports.default.fetch(`${ORIGIN}/matchmake/room/3`, {
+			method: 'POST',
+			headers: await bearer('43'),
+		})
+		const spawned = (await spawn.json()) as {
+			roomInstance: { roomInstanceId: number; photonRoomId: string }
+		}
+		const instanceId = spawned.roomInstance.roomInstanceId
+
+		// No token → 401.
+		expect(
+			(await exports.default.fetch(`${ORIGIN}/matchmake/instance/${instanceId}`, { method: 'POST' }))
+				.status
+		).toBe(401)
+
+		// Authed but not the room's owner or co-owner → the opaque NoSuchRoom refusal,
+		// so instance ids can't be probed for live private sessions.
+		const stranger = await exports.default.fetch(`${ORIGIN}/matchmake/instance/${instanceId}`, {
+			method: 'POST',
+			headers: await bearer('999'),
+		})
+		expect(stranger.status).toBe(200)
+		expect(await stranger.json()).toEqual({ errorCode: 20, roomInstance: null })
+
+		// Unknown instance → same refusal.
+		const unknown = await exports.default.fetch(`${ORIGIN}/matchmake/instance/9999999`, {
+			method: 'POST',
+			headers: await bearer('42'),
+		})
+		expect(await unknown.json()).toEqual({ errorCode: 20, roomInstance: null })
+
+		// Park the owner somewhere else first, so this is a real transition.
+		await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, {
+			method: 'POST',
+			headers: await bearer('42'),
+		})
+
+		// The owner lands in that exact instance — same id AND same Photon room as the
+		// player already in it, which is what makes it the same session.
+		const joined = await exports.default.fetch(`${ORIGIN}/matchmake/instance/${instanceId}`, {
+			method: 'POST',
+			headers: await bearer('42'),
+		})
+		expect(joined.status).toBe(200)
+		const body = (await joined.json()) as {
+			errorCode: number
+			roomInstance: { roomInstanceId: number; photonRoomId: string; roomId: number }
+		}
+		expect(body.errorCode).toBe(0)
+		expect(body.roomInstance.roomInstanceId).toBe(instanceId)
+		expect(body.roomInstance.photonRoomId).toBe(spawned.roomInstance.photonRoomId)
+		expect(body.roomInstance.roomId).toBe(3)
+
+		// It's now the owner's presence, and the listing shows both of them in there.
+		const listed = (await (
+			await exports.default.fetch(`${ORIGIN}/room/3/instances`, { headers: await bearer('42') })
+		).json()) as Array<{ roomInstanceId: number; playerIds: number[] }>
+		const target = listed.find((i) => i.roomInstanceId === instanceId)
+		expect(target?.playerIds).toEqual([42, 43])
+	})
+
+	test('POST /roominstance/:id/markprivate closes the instance, owner-only', async () => {
+		// Room 77 subroom 34 — its own instance, so marking it private can't affect the
+		// instances the other tests matchmake into.
+		const spawn = await exports.default.fetch(`${ORIGIN}/matchmake/room/77/34`, {
+			method: 'POST',
+			headers: await bearer('42'),
+		})
+		const { roomInstance } = (await spawn.json()) as { roomInstance: { roomInstanceId: number } }
+		const instanceId = roomInstance.roomInstanceId
+
+		// No token → 401.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/roominstance/${instanceId}/markprivate`, {
+					method: 'POST',
+				})
+			).status
+		).toBe(401)
+
+		// Unknown instance → 404.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/roominstance/9999999/markprivate`, {
+					method: 'POST',
+					headers: await bearer('42'),
+				})
+			).status
+		).toBe(404)
+
+		// Room 77 has no creator and no roles, so nobody manages it → 403 even for 42.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/roominstance/${instanceId}/markprivate`, {
+					method: 'POST',
+					headers: await bearer('42'),
+				})
+			).status
+		).toBe(403)
+
+		// Room 3 is account 42's, so its instances are theirs to close.
+		const owned = await exports.default.fetch(`${ORIGIN}/matchmake/room/3`, {
+			method: 'POST',
+			headers: await bearer('43'),
+		})
+		const ownedId = ((await owned.json()) as { roomInstance: { roomInstanceId: number } })
+			.roomInstance.roomInstanceId
+		const marked = await exports.default.fetch(`${ORIGIN}/roominstance/${ownedId}/markprivate`, {
+			method: 'POST',
+			headers: await bearer('42'),
+		})
+		expect(marked.status).toBe(200)
+		expect(await marked.text()).toBe('')
+
+		// Closed to strangers: a public matchmake into room 3 no longer reuses it, so a
+		// new player lands in a different instance.
+		const after = await exports.default.fetch(`${ORIGIN}/matchmake/room/3`, {
+			method: 'POST',
+			headers: await bearer('999'),
+		})
+		const afterId = ((await after.json()) as { roomInstance: { roomInstanceId: number } })
+			.roomInstance.roomInstanceId
+		expect(afterId).not.toBe(ownedId)
+
+		// The player already inside is untouched — this shuts the door, it doesn't clear
+		// the room.
+		const listed = (await (
+			await exports.default.fetch(`${ORIGIN}/room/3/instances`, { headers: await bearer('42') })
+		).json()) as Array<{ roomInstanceId: number; playerIds: number[] }>
+		expect(listed.find((i) => i.roomInstanceId === ownedId)?.playerIds).toContain(43)
+	})
+
 	test('POST /invite pushes a game-invite MessageReceived to the target', async () => {
 		// The notify DO is stubbed to record every notifyPlayer call (see vitest.config).
 		type Sent = {
@@ -1420,6 +1555,7 @@ describe('auth-gated endpoints', () => {
 			'POST /invite',
 			'POST /matchmake/club/{clubId}',
 			'POST /matchmake/dorm',
+			'POST /matchmake/instance/{instanceId}',
 			'POST /matchmake/player/{playerId}',
 			'POST /matchmake/room/{roomId}',
 			'POST /matchmake/room/{roomId}/{subRoomId}',
@@ -1428,6 +1564,7 @@ describe('auth-gated endpoints', () => {
 			'POST /player/login',
 			'POST /player/logout',
 			'POST /player/notifydisconnect',
+			'POST /roominstance/{id}/markprivate',
 			'POST /roominstance/{id}/reportjoinresult',
 			'PUT /player/gameserverregionpings',
 			'PUT /player/photonregionpings',
