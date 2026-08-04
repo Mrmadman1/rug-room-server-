@@ -22,6 +22,7 @@ import {
 	getRoomInstance,
 	getRoomInstancesByRoom,
 	isClubMember,
+	isPlayerBannedFromRoom,
 	MessageType,
 	refreshInstanceFullness,
 	RoomInstanceType,
@@ -479,7 +480,8 @@ async function inviteParty(
 /**
  * Resolve a room by `:room` path segment (numeric id or name) from D1, then find a
  * joinable instance of it (public matchmakes reuse one via the `room_instance`
- * table) or create a new one. Returns null when the room isn't found.
+ * table) or create a new one. Returns null when the room isn't found, or when the
+ * caller is banned from it.
  */
 async function resolveRoomInstance(
 	c: Context<App>,
@@ -495,6 +497,17 @@ async function resolveRoomInstance(
 	if (!room) return null
 
 	const f = instanceFieldsFromRoom(room, subRoomId)
+
+	// A banned player never gets an instance. This is the whole enforcement of a room
+	// ban: the Photon room id only ever reaches a player through a matchmake, so
+	// refusing here means they have no coordinates to join or interact with. Handled
+	// before any instance is created or reused so a ban can't spawn one. The caller sees
+	// the same opaque NO_SUCH_ROOM every other refusal answers.
+	if (await isPlayerBannedFromRoom(c.env.DB, f.roomId, ownerId)) {
+		logger.info('matchmake refused: player banned from room', { roomId: f.roomId, ownerId })
+		return null
+	}
+
 	// Never place the player back into the instance they're already in: the client
 	// keys the room transition off a changing `roomInstanceId`, so re-matchmaking into
 	// your current instance (e.g. the only public instance of a room you're already in)
@@ -960,6 +973,14 @@ const app = new Hono<App>()
 			const targetPresence = await getPresence<RoomInstance>(c.env.DB, targetId)
 			const instance = targetPresence?.roomInstance ?? null
 			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+
+			// This path hands out a Photon room id without going through
+			// resolveRoomInstance, so the room's bans have to be checked here too —
+			// otherwise following a friend in is a way around a ban.
+			if (await isPlayerBannedFromRoom(c.env.DB, instance.roomId, id)) {
+				logger.info('follow refused: player banned from room', { roomId: instance.roomId, id })
+				return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			}
 
 			// Join that same instance (same id + Photon room) and store it as the caller's
 			// presence, so the heartbeat replays it and their own friend fan-out fires.

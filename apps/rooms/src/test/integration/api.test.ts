@@ -13,6 +13,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { NotificationType } from '../../../../notify/src/notification-types'
 import importRooms from '../../../static/ImportRooms.json'
 
 import type { Env } from '../../context'
@@ -31,10 +32,12 @@ function b64url(input: ArrayBuffer | string): string {
 	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
-async function bearer(sub: string): Promise<Record<string, string>> {
+// `roles` mints the `role` claim the auth worker stamps from an account's flags; left
+// off, the token carries none — what a plain player's looks like to the role gates.
+async function bearer(sub: string, roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...(roles && { role: roles }) })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -736,6 +739,21 @@ describe('rooms endpoints', () => {
 		}
 	})
 
+	const postForm = async (
+		path: string,
+		fields: Record<string, string>,
+		sub?: string,
+		roles?: string[]
+	) =>
+		SELF.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: {
+				...(sub ? await bearer(sub, roles) : {}),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams(fields).toString(),
+		})
+
 	const putForm = async (path: string, fields: Record<string, string>, sub?: string) =>
 		SELF.fetch(`${ORIGIN}${path}`, {
 			method: 'PUT',
@@ -921,6 +939,146 @@ describe('rooms endpoints', () => {
 		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 5, Role: 10 }))
 		// The seeded co-owner (account 2) is left intact.
 		expect(roles).toContainEqual(expect.objectContaining({ AccountId: 2, Role: 30 }))
+	})
+
+	it('POST /rooms/:id/bans is gated to the room’s owners or staff, and persists', async () => {
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		const bansOf = async (roomId: number) =>
+			(
+				await env.DB.prepare(
+					'SELECT banned_player_id, ban_mask, banned_by_account_id FROM room_ban WHERE room_id = ?1'
+				)
+					.bind(roomId)
+					.all<{ banned_player_id: number; ban_mask: number; banned_by_account_id: number }>()
+			).results
+
+		// No token → 401 (auth gate).
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '205' })).status).toBe(401)
+		// A valid token, no role on the room and no staff role → 403.
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '205' }, '999')).status).toBe(403)
+		// Unknown room → failure envelope.
+		expect(
+			await envOf(await postForm('/rooms/99999/bans', { banMask: '0', id: '205' }, '1'))
+		).toMatchObject({ success: false, error: 'This room does not exist!' })
+
+		// The owner bans player 205 — the real client body.
+		const ok = await postForm('/rooms/2/bans', { banMask: '0', id: '205' }, '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({
+			success: true,
+			error: '',
+			value: { RoomId: 2, BannedPlayerId: 205, BanMask: 0, BannedByAccountId: 1 },
+		})
+		expect(await bansOf(2)).toEqual([
+			{ banned_player_id: 205, ban_mask: 0, banned_by_account_id: 1 },
+		])
+
+		// Re-banning rewrites the one row rather than appending a second.
+		expect((await postForm('/rooms/2/bans', { banMask: '7', id: '205' }, '2')).status).toBe(200)
+		expect(await bansOf(2)).toEqual([
+			{ banned_player_id: 205, ban_mask: 7, banned_by_account_id: 2 },
+		])
+
+		// A staff token bans in a room they have no role on.
+		const byStaff = await postForm('/rooms/2/bans', { id: '206' }, '999', [
+			'gameClient',
+			'moderator',
+		])
+		expect(byStaff.status).toBe(200)
+		// banMask defaults to 0 when the field is absent.
+		expect(await envOf(byStaff)).toMatchObject({ value: { BannedPlayerId: 206, BanMask: 0 } })
+
+		// Refusals: no id, yourself, and an owner of the room (a co-owner must not be
+		// able to ban the creator out of their own room).
+		expect(await envOf(await postForm('/rooms/2/bans', { id: 'nope' }, '1'))).toMatchObject({
+			success: false,
+			value: null,
+		})
+		expect(await envOf(await postForm('/rooms/2/bans', { id: '1' }, '1'))).toMatchObject({
+			success: false,
+			error: 'You cannot ban yourself!',
+		})
+		expect(await envOf(await postForm('/rooms/2/bans', { id: '1' }, '2'))).toMatchObject({
+			success: false,
+			error: 'You cannot ban an owner of this room!',
+		})
+		// Nothing was written by any of the refusals.
+		expect(await bansOf(2)).toHaveLength(2)
+	})
+
+	it('POST /rooms/:id/bans notifies the banned player', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: { RoomId: number } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '207' }, '1')).status).toBe(200)
+
+		const sent = (await (await hub().fetch('http://do/all')).json()) as Sent[]
+		// Pushed to the BANNED player, not the caller. Asserted against the enum rather
+		// than a literal — the hub's ids are the notify worker's to change.
+		expect(sent).toEqual([
+			{
+				playerId: 207,
+				notificationType: NotificationType.ModerationRoomBan,
+				data: {
+					RoomId: 2,
+					BannedPlayerId: 207,
+					BanMask: 0,
+					BannedByAccountId: 1,
+					CreatedAt: expect.any(String),
+				},
+			},
+		])
+	})
+
+	it('DELETE /rooms/:id/bans/:playerId lifts a ban, under the same gate', async () => {
+		const del = async (path: string, sub?: string, roles?: string[]) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method: 'DELETE',
+				headers: sub ? await bearer(sub, roles) : {},
+			})
+		const isBanned = async (roomId: number, playerId: number) =>
+			(await env.DB.prepare(
+				'SELECT 1 AS hit FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2'
+			)
+				.bind(roomId, playerId)
+				.first()) !== null
+
+		// Two bans to lift: one removed by the owner, one by a staffer.
+		expect((await postForm('/rooms/2/bans', { id: '305' }, '1')).status).toBe(200)
+		expect((await postForm('/rooms/2/bans', { id: '306' }, '1')).status).toBe(200)
+
+		// No token → 401; a valid token with no room role and no staff role → 403.
+		expect((await del('/rooms/2/bans/305')).status).toBe(401)
+		expect((await del('/rooms/2/bans/305', '999')).status).toBe(403)
+		expect(await isBanned(2, 305)).toBe(true)
+
+		// Unknown room → failure envelope.
+		expect(await envOf(await del('/rooms/99999/bans/305', '1'))).toMatchObject({
+			success: false,
+			error: 'This room does not exist!',
+		})
+
+		// The owner lifts it; the removed ban comes back as `value`.
+		const ok = await del('/rooms/2/bans/305', '1')
+		expect(ok.status).toBe(200)
+		expect(await envOf(ok)).toMatchObject({
+			success: true,
+			error: '',
+			value: { RoomId: 2, BannedPlayerId: 305 },
+		})
+		expect(await isBanned(2, 305)).toBe(false)
+
+		// Unbanning someone who isn't banned is a rejection, not a silent success.
+		expect(await envOf(await del('/rooms/2/bans/305', '1'))).toMatchObject({
+			success: false,
+			error: 'This player is not banned from this room!',
+			value: null,
+		})
+
+		// A staff token may lift a ban in a room they have no role on.
+		expect((await del('/rooms/2/bans/306', '999', ['gameClient', 'developer'])).status).toBe(200)
+		expect(await isBanned(2, 306)).toBe(false)
 	})
 
 	it('PUT /rooms/:id/warning is auth-gated, owner/co-owner-only, and persists', async () => {
@@ -2391,6 +2549,7 @@ describe('rooms endpoints', () => {
 		)
 		expect([...documented].sort()).toEqual([
 			'DELETE /rooms/{roomId}',
+			'DELETE /rooms/{roomId}/bans/{playerId}',
 			'DELETE /rooms/{roomId}/interactionby/me/cheer',
 			'DELETE /rooms/{roomId}/interactionby/me/favorite',
 			'DELETE /rooms/{roomId}/subrooms/{subRoomId}',
@@ -2415,6 +2574,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/similar',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
 			'GET /roomserver/rooms/createdby/me',
+			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',

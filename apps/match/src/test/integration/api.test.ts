@@ -1241,6 +1241,69 @@ describe('auth-gated endpoints', () => {
 
 		// No token → 401.
 		expect((await follow(9801)).status).toBe(401)
+
+		// A ban on the room blocks the follow too: this path hands out a Photon room id
+		// without going through resolveRoomInstance, so it carries its own ban check —
+		// otherwise following a friend in would be a way around a ban.
+		await env.DB.prepare(
+			`INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)
+			 VALUES (2, 9800, 0, 1, '2026-01-01T00:00:00.000Z')`
+		).run()
+		try {
+			expect(await (await follow(9801, '9800')).json()).toEqual({
+				errorCode: 20,
+				roomInstance: null,
+			})
+		} finally {
+			await env.DB.prepare('DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9800')
+				.run()
+		}
+	})
+
+	test('POST /matchmake/room/:roomId refuses a player banned from the room', async () => {
+		const matchmake = async (sub: string) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+					method: 'POST',
+					headers: await bearer(sub),
+				})
+			).json()) as { errorCode: number; roomInstance: { roomInstanceId: number } | null }
+
+		// Not banned yet → a normal join.
+		expect((await matchmake('9700')).errorCode).toBe(0)
+
+		await env.DB.prepare(
+			`INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)
+			 VALUES (2, 9701, 0, 1, '2026-01-01T00:00:00.000Z')`
+		).run()
+
+		// The ban is the whole enforcement: no instance means no Photon room id, so there
+		// is nothing for the banned player to join. Same opaque NoSuchRoom as any other
+		// refusal, and it applies to the subroom path as well.
+		expect(await matchmake('9701')).toEqual({ errorCode: 20, roomInstance: null })
+		const sub = await exports.default.fetch(`${ORIGIN}/matchmake/room/2/2`, {
+			method: 'POST',
+			headers: await bearer('9701'),
+		})
+		expect(await sub.json()).toEqual({ errorCode: 20, roomInstance: null })
+
+		// Refused before any instance is created, and no presence was recorded for them.
+		expect(
+			await env.DB.prepare('SELECT 1 AS hit FROM presence WHERE account_id = 9701').first()
+		).toBeNull()
+
+		// The ban is per-room — another room is unaffected.
+		const other = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/room/77`, {
+				method: 'POST',
+				headers: await bearer('9701'),
+			})
+		).json()) as { errorCode: number }
+		expect(other.errorCode).toBe(0)
+
+		// Lifting the ban lets them in again.
+		await env.DB.prepare('DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9701').run()
+		expect((await matchmake('9701')).errorCode).toBe(0)
 	})
 
 	test('POST /matchmake/room/:id invites AdditionalPlayerIds (party) into the instance', async () => {

@@ -43,6 +43,23 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		last_visited_at TEXT,
 		PRIMARY KEY (player_id, room_id)
 	)`,
+	// Per-room player bans (migrations/0010_room_ban.sql). One row per (room, player),
+	// so re-banning someone already banned updates their row rather than appending.
+	// `ban_mask` is the client's `banMask` field kept verbatim — its meaning isn't known
+	// yet (the client sends 0), so nothing interprets it.
+	//
+	// Deliberately NOT in the room's `data` blob: that blob is served to the client
+	// verbatim as the room, and a ban list is not something every reader of a room
+	// should receive.
+	`CREATE TABLE IF NOT EXISTS room_ban (
+		room_id INTEGER NOT NULL,
+		banned_player_id INTEGER NOT NULL,
+		ban_mask INTEGER NOT NULL DEFAULT 0,
+		banned_by_account_id INTEGER NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (room_id, banned_player_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_room_ban_player ON room_ban (banned_player_id)`,
 ]
 
 /**
@@ -134,6 +151,96 @@ export function canManageRoom(room: Room, accountId: number): boolean {
 	if (room.CreatorAccountId === accountId) return true
 	const roles = Array.isArray(room.Roles) ? (room.Roles as RoomRole[]) : []
 	return roles.some((r) => r.AccountId === accountId && MANAGE_ROLES.has(r.Role))
+}
+
+/** A player banned from a room (a `room_ban` row). */
+export interface RoomBan {
+	RoomId: number
+	BannedPlayerId: number
+	/** The client's `banMask`, stored verbatim — its meaning isn't known yet. */
+	BanMask: number
+	BannedByAccountId: number
+	CreatedAt: string
+}
+
+interface RoomBanRow {
+	room_id: number
+	banned_player_id: number
+	ban_mask: number
+	banned_by_account_id: number
+	created_at: string
+}
+
+const toRoomBan = (row: RoomBanRow): RoomBan => ({
+	RoomId: row.room_id,
+	BannedPlayerId: row.banned_player_id,
+	BanMask: row.ban_mask,
+	BannedByAccountId: row.banned_by_account_id,
+	CreatedAt: row.created_at,
+})
+
+/**
+ * Ban a player from a room, returning the stored ban. One row per (room, player):
+ * re-banning someone already banned rewrites their row with the new mask and issuer
+ * rather than appending a second one, so the call is idempotent.
+ */
+export async function banPlayerFromRoom(
+	db: D1Database,
+	roomId: number,
+	bannedPlayerId: number,
+	banMask: number,
+	bannedByAccountId: number
+): Promise<RoomBan> {
+	const row = await db
+		.prepare(
+			`INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)
+			 VALUES (?1, ?2, ?3, ?4, ?5)
+			 ON CONFLICT(room_id, banned_player_id) DO UPDATE SET
+				 ban_mask = ?3, banned_by_account_id = ?4, created_at = ?5
+			 RETURNING *`
+		)
+		.bind(roomId, bannedPlayerId, banMask, bannedByAccountId, new Date().toISOString())
+		.first<RoomBanRow>()
+	// RETURNING always yields the upserted row.
+	return toRoomBan(row!)
+}
+
+/**
+ * Lift a player's ban on a room, returning the ban that was removed — or null when
+ * they weren't banned, which lets the caller tell a real unban from a no-op.
+ */
+export async function unbanPlayerFromRoom(
+	db: D1Database,
+	roomId: number,
+	bannedPlayerId: number
+): Promise<RoomBan | null> {
+	const row = await db
+		.prepare('DELETE FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2 RETURNING *')
+		.bind(roomId, bannedPlayerId)
+		.first<RoomBanRow>()
+	return row ? toRoomBan(row) : null
+}
+
+/** Everyone banned from a room, most recently banned first. */
+export async function getRoomBans(db: D1Database, roomId: number): Promise<RoomBan[]> {
+	const { results } = await db
+		.prepare('SELECT * FROM room_ban WHERE room_id = ?1 ORDER BY created_at DESC')
+		.bind(roomId)
+		.all<RoomBanRow>()
+	return results.map(toRoomBan)
+}
+
+/** Whether a player is banned from a room. */
+export async function isPlayerBannedFromRoom(
+	db: D1Database,
+	roomId: number,
+	playerId: number
+): Promise<boolean> {
+	const row = await db
+		.prepare('SELECT 1 AS hit FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2')
+		.bind(roomId, playerId)
+		.first<{ hit: number }>()
+	return row !== null
 }
 
 /**

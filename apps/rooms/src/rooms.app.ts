@@ -5,6 +5,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import {
 	Accessibility,
 	areFriends,
+	banPlayerFromRoom,
 	canManageRoom,
 	cloneRoom,
 	cloneSubRoom,
@@ -43,14 +44,20 @@ import {
 	toggleCheer,
 	toggleFavorite,
 	toggleRoomTag,
+	unbanPlayerFromRoom,
 	updateRoomFields,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
+// The notification-type ids the hub carries (owned by the `notify` worker). Imported
+// as a value — the enum has no runtime dependencies.
+import { NotificationType } from '../../notify/src/notification-types'
 
 import {
 	AccessibilityRequest,
 	AUTHED,
+	bannedPlayerIdParam,
+	BanRequest,
 	CloneRoomRequest,
 	CloningRequest,
 	CreateSubRoomRequest,
@@ -75,6 +82,7 @@ import {
 	PublishSaveRequest,
 	RestrictionsRequest,
 	RoleRequest,
+	RoomBanEnvelope,
 	RoomDto,
 	RoomEnvelope,
 	roomIdParam,
@@ -96,7 +104,7 @@ import {
 } from './openapi'
 
 import type { Context } from 'hono'
-import type { RoomPermission } from '@repo/domain'
+import type { RoomBan, RoomPermission } from '@repo/domain'
 import type { App } from './context'
 
 /**
@@ -234,6 +242,22 @@ async function authedAccountId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
+/**
+ * Operator-granted elevated roles — the ones the auth worker stamps from an account's
+ * isDeveloper/isModerator flags (see the admin CLI). Same set the `notify` / `www`
+ * workers gate their admin surfaces on.
+ */
+const STAFF_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
+
+/**
+ * Whether the caller's token carries a staff role. Used alongside the per-room owner
+ * check for actions staff may take in a room they don't own.
+ */
+async function isStaff(c: Context<App>): Promise<boolean> {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	return roles?.some((role) => STAFF_ROLES.has(role)) ?? false
+}
+
 /** 401 for the auth-gated `*by/me` endpoints — no stub-account fallback. */
 function unauthorized(c: Context<App>) {
 	return c.json({ error: 'Unauthorized' }, 401)
@@ -351,6 +375,26 @@ async function pushRoomUpdate(
 }
 
 /**
+ * Tell a player they've been banned from a room — a `ModerationRoomBan` push carrying
+ * the ban. Like {@link pushRoomUpdate}, hub failures are logged and swallowed: the ban
+ * row has already committed, so a hub hiccup must not fail the request.
+ */
+async function pushRoomBan(c: Context<App>, ban: RoomBan): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			ban.BannedPlayerId,
+			NotificationType.ModerationRoomBan,
+			{ ...ban }
+		)
+	} catch (err) {
+		logger.error('failed to push ModerationRoomBan notification', {
+			playerId: ban.BannedPlayerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
  * Room-mutation result envelope: `{ Success, Value, ErrorId, Error }`, always
  * HTTP 200 (the client reads `Success`). `ErrorId`/`Error` are null on success.
  */
@@ -397,6 +441,12 @@ function toSaveResponse(save: Record<string, unknown>) {
 function roomEnvelope(c: Context<App>, value: unknown, error = '') {
 	return c.json({ success: error === '', error, value })
 }
+
+/**
+ * The same envelope for the ban write, whose `value` is the BAN rather than the room —
+ * a ban isn't part of the room the client renders, so there is no updated room to send.
+ */
+const banEnvelope = roomEnvelope
 
 /** Rooms created/owned by the authed caller (shared by the createdby routes). */
 async function ownedRooms(c: Context<App>) {
@@ -1340,6 +1390,119 @@ const app = new Hono<App>()
 			// (and the permissions it grants them).
 			await pushRoomUpdate(c, targetAccountId, updated)
 			return roomEnvelope(c, updated)
+		}
+	)
+
+	// Ban a player from a room (form body `id` + `banMask`). Auth-gated (401), then
+	// gated to the room's owner/co-owner OR a staff token (403). One row per
+	// (room, player) — re-banning rewrites it, so the call is idempotent.
+	.post(
+		'/rooms/:roomId{[0-9]+}/bans',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Ban a player from a room',
+			description: [
+				'Records a ban in the `room_ban` table — one row per (room, player), so re-banning',
+				'someone already banned rewrites their row rather than adding a second. Nothing',
+				'enforces the ban yet: matchmaking does not consult this table, so a banned player',
+				'can still join. This is the record only.',
+				'',
+				'Gated to the room’s creator or a co-owner, OR to any account whose token carries the',
+				'`developer` / `moderator` role — a valid token from anyone else is a 403. Banning',
+				'yourself, or banning someone who can manage the room, is refused: otherwise a',
+				'co-owner could ban the owner out of their own room.',
+				'',
+				'`banMask` is stored verbatim and nothing interprets it — the client sends `0` and',
+				'what it selects is not known yet. It defaults to 0 when absent.',
+				'',
+				'The BANNED player (not the caller) gets a `ModerationRoomBan` push carrying the ban,',
+				'so their client can act on it; the hub queues it if they are offline.',
+				'',
+				'Answers the same lowercase `{ success, error, value }` envelope the room writes use,',
+				'but `value` is the BAN, not the room — a ban is not part of the room the client',
+				'renders. This shape is unverified against the real service.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(BanRequest, 'The player to ban'),
+			responses: {
+				200: json(RoomBanEnvelope, 'The stored ban, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return banEnvelope(c, null, 'This room does not exist!')
+
+			// The room's own owners, or a staffer acting across rooms. Roles are only
+			// looked up when the cheaper room check fails.
+			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+			const bannedPlayerId = Number.parseInt(str(body.id), 10)
+			if (Number.isNaN(bannedPlayerId)) {
+				return banEnvelope(c, null, 'You must provide a valid player to ban!')
+			}
+			if (bannedPlayerId === accountId) return banEnvelope(c, null, 'You cannot ban yourself!')
+			// Without this a co-owner could ban the room's creator out of their own room.
+			if (canManageRoom(room, bannedPlayerId)) {
+				return banEnvelope(c, null, 'You cannot ban an owner of this room!')
+			}
+			// Absent or unparseable → 0, the value the client sends.
+			const banMask = Number.parseInt(str(body.banMask), 10) || 0
+
+			const ban = await banPlayerFromRoom(c.env.DB, roomId, bannedPlayerId, banMask, accountId)
+			// The banned player is told, not the caller — their client acts on the ban.
+			await pushRoomBan(c, ban)
+			return banEnvelope(c, ban)
+		}
+	)
+
+	// Lift a player's ban on a room. Same gate as issuing one: auth-gated (401), then the
+	// room's owner/co-owner OR a staff token (403).
+	.delete(
+		'/rooms/:roomId{[0-9]+}/bans/:playerId{[0-9]+}',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Unban a player from a room',
+			description: [
+				'Removes the player’s `room_ban` row, so they can matchmake into the room again.',
+				'Gated exactly like issuing a ban: the room’s creator or a co-owner, or an account',
+				'whose token carries the `developer` / `moderator` role.',
+				'',
+				'Unbanning someone who is not banned is a rejection (`success: false`), not a silent',
+				'success — the caller asked to undo something that was not there.',
+				'',
+				'Answers the same envelope as the ban write, with the REMOVED ban as `value`. No',
+				'notification is pushed: nothing tells a player their ban was lifted.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, bannedPlayerIdParam],
+			responses: {
+				200: json(RoomBanEnvelope, 'The removed ban, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return banEnvelope(c, null, 'This room does not exist!')
+			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+
+			const playerId = Number.parseInt(c.req.param('playerId'), 10)
+			const removed = await unbanPlayerFromRoom(c.env.DB, roomId, playerId)
+			if (!removed) return banEnvelope(c, null, 'This player is not banned from this room!')
+			return banEnvelope(c, removed)
 		}
 	)
 

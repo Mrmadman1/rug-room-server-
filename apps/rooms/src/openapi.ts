@@ -92,6 +92,9 @@ export const subRoomIdParam = idParam('subRoomId', 'Subroom id (globally unique,
 /** The `:playerId` path parameter (an account id). */
 export const playerIdParam = idParam('playerId', 'The account whose list to read')
 
+/** The `:playerId` path parameter on the unban route. */
+export const bannedPlayerIdParam = idParam('playerId', 'The banned account to unban')
+
 /** An optional string query parameter. */
 export function stringQuery(name: string, description: string): OpenAPIV3_1.ParameterObject {
 	return { name, in: 'query', required: false, description, schema: { type: 'string' } }
@@ -439,6 +442,31 @@ export const ImageRequest = z.object({
 /** `PUT /rooms/{roomId}/roles/{accountId}`. */
 export const RoleRequest = z.object({
 	role: z.string().describe('The role tier: 10 Host, 20 Moderator, 30 CoOwner, 255 Creator'),
+})
+
+/** `POST /rooms/{roomId}/bans` — the player to ban from the room. */
+export const BanRequest = z.object({
+	id: z.string().describe('Account id of the player to ban'),
+	banMask: z
+		.string()
+		.optional()
+		.describe('Stored verbatim; meaning unknown — the client sends `0`. Defaults to 0'),
+})
+
+/** A stored room ban — what `POST /rooms/{roomId}/bans` answers in `value`. */
+export const RoomBanDto = z.object({
+	RoomId: z.int(),
+	BannedPlayerId: z.int(),
+	BanMask: z.int(),
+	BannedByAccountId: z.int().describe('Who issued the ban'),
+	CreatedAt: z.string(),
+})
+
+/** The envelope the ban write answers — same shape as the room writes, `value` is the ban. */
+export const RoomBanEnvelope = z.object({
+	success: z.boolean(),
+	error: z.string().describe('Empty on success'),
+	value: RoomBanDto.nullable().describe('Null on a rejection'),
 })
 
 /** `PUT /rooms/{roomId}/warning`. */
