@@ -97,6 +97,16 @@ export const BareString = z.string()
 /** The `{ error }` body the 400 / 403 branches return. */
 export const ErrorResponse = z.object({ error: z.string() })
 
+/**
+ * The `{ success, error }` envelope the report / warning writes and the message send
+ * answer with — `error` is an empty string on success, never null, and the rejected
+ * branches use the same shape so there is only one thing to parse.
+ */
+export const SuccessErrorEnvelope = z.object({
+	success: z.boolean(),
+	error: z.string().describe('Empty string when the call succeeded'),
+})
+
 // ---- Config ----------------------------------------------------------------
 
 /** `GET /api/config/v1/amplitude` — analytics keys (all disabled on this server). */
@@ -158,6 +168,20 @@ export const RelationshipDto = z.object({
 	Favorited: z.int().describe('0/1 — the caller‘s own flag'),
 	Ignored: z.int().describe('0/1 — the caller‘s own flag'),
 	Muted: z.int().describe('0/1 — the caller‘s own flag'),
+})
+
+/**
+ * `POST /api/messages/v2/send` form body — a message sent to another player. Everything
+ * is a string on the wire (it's form-encoded). The sender is NOT in the body — it's
+ * taken from the bearer token.
+ */
+export const SendMessageRequest = z.object({
+	ToPlayerId: z.string().describe('Account id of the recipient'),
+	Type: z
+		.string()
+		.optional()
+		.describe('The Message-model type, e.g. `10`. Passed through unmapped; defaults to 0'),
+	Data: z.string().optional().describe('The message payload; often empty'),
 })
 
 /** The `{ Success, Message }` ack the flag toggles answer with. */
@@ -444,15 +468,6 @@ export const CreateReportRequest = z.object({
 		.string()
 		.optional()
 		.describe('Instance type name, e.g. `Public`. Stored verbatim'),
-})
-
-/**
- * The `{ success, error }` envelope the report / warning writes answer with — `error`
- * is an empty string on success, never null.
- */
-export const ReportCreateResponse = z.object({
-	success: z.boolean(),
-	error: z.string().describe('Empty string when the record was written'),
 })
 
 /**

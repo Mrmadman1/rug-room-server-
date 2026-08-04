@@ -12,7 +12,7 @@ import {
 	json,
 	JsonArray,
 	ModerationBlockDetails,
-	ReportCreateResponse,
+	SuccessErrorEnvelope,
 	UNAUTHORIZED_RESPONSE,
 } from '../openapi'
 import { createReport } from '../reports-db'
@@ -136,8 +136,8 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 			security: AUTHED,
 			requestBody: form(CreateReportRequest, 'The report'),
 			responses: {
-				200: json(ReportCreateResponse, '`{ success: true, error: "" }`'),
-				400: json(ReportCreateResponse, 'No `PlayerIdReported` in the request'),
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				400: json(SuccessErrorEnvelope, 'No `PlayerIdReported` in the request'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -194,10 +194,10 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 			security: AUTHED,
 			requestBody: form(CreateWarningRequest, 'The warning'),
 			responses: {
-				200: json(ReportCreateResponse, '`{ success: true, error: "" }`'),
-				400: json(ReportCreateResponse, 'No `WarnedPlayerId` in the request'),
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				400: json(SuccessErrorEnvelope, 'No `WarnedPlayerId` in the request'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: json(ReportCreateResponse, 'A valid token with neither staff role'),
+				403: json(SuccessErrorEnvelope, 'A valid token with neither staff role'),
 			},
 		}),
 		async (c) => {

@@ -2103,6 +2103,70 @@ describe('relationships', () => {
 	})
 })
 
+describe('messages', () => {
+	// The notify DO is stubbed to record every notifyPlayer call (see vitest.config).
+	type Sent = {
+		playerId: number
+		notificationType: number
+		data: { FromPlayerId: number; ToPlayerId: number; Type: number; Data: string }
+	}
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	const pushed = async (): Promise<Sent[]> =>
+		(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+	const send = async (fields: Record<string, string>, headers?: Record<string, string>) => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		return exports.default.fetch(`${ORIGIN}/api/messages/v2/send`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+	}
+
+	// NotificationType.MessageReceived — the same frame the Coach broadcast uses.
+	const MESSAGE_RECEIVED = 2
+
+	test('POST /api/messages/v2/send pushes MessageReceived to the recipient', async () => {
+		const res = await send({ ToPlayerId: '2', Type: '10', Data: '' }, await bearer('42'))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		expect(await pushed()).toEqual([
+			{
+				// Delivered to the recipient, not the sender.
+				playerId: 2,
+				notificationType: MESSAGE_RECEIVED,
+				// FromPlayerId is the token's subject, not a body field.
+				data: { FromPlayerId: 42, ToPlayerId: 2, Type: 10, Data: '' },
+			},
+		])
+	})
+
+	test('POST /api/messages/v2/send defaults Type and Data when omitted', async () => {
+		const res = await send({ ToPlayerId: '2' }, await bearer('42'))
+		expect(res.status).toBe(200)
+		expect((await pushed())[0]?.data).toEqual({
+			FromPlayerId: 42,
+			ToPlayerId: 2,
+			Type: 0,
+			Data: '',
+		})
+	})
+
+	test('POST /api/messages/v2/send 400s without a recipient, pushing nothing', async () => {
+		const res = await send({ Type: '10' }, await bearer('42'))
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ success: false, error: 'ToPlayerId is required' })
+		expect(await pushed()).toEqual([])
+	})
+
+	test('POST /api/messages/v2/send is auth-gated', async () => {
+		const res = await send({ ToPlayerId: '2' })
+		expect(res.status).toBe(401)
+		expect(await pushed()).toEqual([])
+	})
+})
+
 describe('mutual friends', () => {
 	// High, distinct ids so the friendships seeded here don't collide with the
 	// relationship tests above.
@@ -2301,6 +2365,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v6/save',
+			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
 			'POST /api/players/v1/progression/bulk',
