@@ -457,10 +457,19 @@ export const PlayerEventRequest = PlayerEventDto.partial().extend({
 		.describe('The event’s fields, if nested rather than posted at the top level'),
 })
 
+/** `POST /api/playerevents/v1/respond` JSON body — how the caller is answering. */
+export const PlayerEventRespondRequest = z.object({
+	PlayerEventId: z.int(),
+	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
+})
+
 /** `GET /api/playerevents/v1/all` — the caller's created events and RSVPs. */
 export const PlayerEventsAll = z.object({
 	Created: z.array(PlayerEventDto).describe('Events the caller created, soonest first'),
-	Responses: JsonArray.describe('Events the caller RSVP’d to — always empty, no RSVP storage'),
+	Responses: JsonArray.describe(
+		'Events the caller RSVP’d to — always empty; RSVPs are stored, but this field’s ' +
+			'entry shape has not been observed yet'
+	),
 })
 
 /** `GET /api/playerevents/v1/club/:clubId` — the paged single-club event feed. */

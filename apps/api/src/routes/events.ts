@@ -13,8 +13,10 @@ import {
 	getEventsByCreator,
 	getEventsByIds,
 	getLiveEvents,
+	isEventResponseType,
 	parseEventBody,
 	searchEvents,
+	setEventResponse,
 	toEventNotification,
 	toEventResult,
 	updateEvent,
@@ -29,6 +31,7 @@ import {
 	pageParams,
 	PlayerEventDto,
 	PlayerEventRequest,
+	PlayerEventRespondRequest,
 	PlayerEventResultDto,
 	PlayerEventsAll,
 	PlayerEventsPage,
@@ -86,8 +89,13 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			summary: 'The caller’s player events',
 			description:
 				'Events the player created and events they have RSVP’d to. `Created` is served ' +
-				'from the event table, soonest first. `Responses` is always empty — nothing ' +
-				'records an RSVP yet.',
+				'from the event table, soonest first.\n\n' +
+				'`Responses` is still always empty. RSVPs ARE stored now (see ' +
+				'`/api/playerevents/v1/respond` and the `event_attendee` table) — what isn’t known ' +
+				'is the shape this field wants: whether an entry is a bare event like `Created`, ' +
+				'or the event plus the answer, which is the useful thing to render. Serving the ' +
+				'wrong one renders nothing rather than erroring, so it stays empty until a real ' +
+				'response is observed.',
 			security: AUTHED,
 			responses: {
 				200: json(PlayerEventsAll, 'The caller’s created events, and an empty RSVP list'),
@@ -248,6 +256,54 @@ export const eventRoutes = new Hono<App>({ strict: false })
 		async (c) => c.json(await getEventsByIds(c.env.DB, queryIds(c)))
 	)
 
+	// RSVP. One row per player per event, so responding again replaces the previous
+	// answer rather than stacking up. Note this is the v1 path while create/update are
+	// v2 — that's how the client calls them.
+	.post(
+		'/api/playerevents/v1/respond',
+		describeRoute({
+			tags: ['Events'],
+			summary: 'Answer a player event',
+			description:
+				'Records how the caller is answering an event — `Type` is 0 Going, 1 Interested, ' +
+				'2 Can’t go. Responding again replaces the previous answer; there is one row per ' +
+				'player per event, and a decline is recorded rather than deleted so the client can ' +
+				'show a player what they said.\n\n' +
+				'Only Going counts toward the event’s `AttendeeCount`, which is recomputed from ' +
+				'the RSVP table on every response. Anyone may respond, the creator included — ' +
+				'they are already Going from create, and nothing stops them declining their own ' +
+				'event. Answers the same `{ Result, TagModifyResult, PlayerEvent }` envelope the ' +
+				'v2 writes do, carrying the event with its updated count, so the client can ' +
+				're-render from the response.\n\n' +
+				'A body with no usable `PlayerEventId`, or a `Type` outside 0–2, is a 400; an ' +
+				'unknown event is a 404.',
+			security: AUTHED,
+			requestBody: jsonBody(PlayerEventRespondRequest, 'The event and the answer'),
+			responses: {
+				200: json(PlayerEventResultDto, 'The event, with its updated attendee count'),
+				400: { description: 'Missing `PlayerEventId` or an unknown `Type` (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such event (empty body)' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = await c.req
+				.json<{ PlayerEventId?: unknown; Type?: unknown }>()
+				.catch(() => ({}) as { PlayerEventId?: unknown; Type?: unknown })
+			const eventId = Number(body.PlayerEventId)
+			const type = Number(body.Type)
+			// Both are rejected rather than defaulted: an unrecognized answer stored as
+			// Going would silently inflate the count.
+			if (!Number.isInteger(eventId) || !isEventResponseType(type)) return c.body(null, 400)
+
+			const updated = await setEventResponse(c.env.DB, eventId, id, type)
+			return updated === null ? c.body(null, 404) : c.json(toEventResult(updated))
+		}
+	)
+
 	// Create. The creator comes from the bearer token, never the body — posting someone
 	// else's `CreatorPlayerId` doesn't make it theirs.
 	.post(
@@ -260,9 +316,10 @@ export const eventRoutes = new Hono<App>({ strict: false })
 				'body; the id is assigned here. Lenient about the rest, like the other writes ' +
 				'here — a missing name becomes “Untitled Event” and a missing time window becomes ' +
 				'an hour from now, rather than an error the client can’t render.\n\n' +
-				'`AttendeeCount` starts at 1 (the creator attends their own event) and `State` at ' +
-				'0. Answers the `{ Result, TagModifyResult, PlayerEvent }` envelope — NOT the bare ' +
-				'event the read endpoints serve.\n\n' +
+				'`State` starts at 0, and the creator is recorded as Going in the RSVP table — ' +
+				'which is what makes `AttendeeCount` start at 1, since that count is derived from ' +
+				'the table. Answers the `{ Result, TagModifyResult, PlayerEvent }` envelope — NOT ' +
+				'the bare event the read endpoints serve.\n\n' +
 				'Also pushes a `PlayerEventCreated` (80) hub notification to the creator, carrying ' +
 				'the event in its camelCase notification projection. A hub failure is logged and ' +
 				'swallowed — the event is already stored by then.',

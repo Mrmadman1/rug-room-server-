@@ -11,7 +11,12 @@ import {
 
 import '../../api.app'
 
-import { SCHEMA_DDL as EVENTS_SCHEMA_DDL } from '../../events-db'
+import {
+	countGoing,
+	SCHEMA_DDL as EVENTS_SCHEMA_DDL,
+	getEventAttendees,
+	getEventResponse,
+} from '../../events-db'
 import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
@@ -2554,6 +2559,67 @@ describe('player events', () => {
 		expect(theirs.Created.map((e) => e.PlayerEventId)).toEqual([liveEvent.PlayerEventId])
 	})
 
+	test('POST /api/playerevents/v1/respond records an RSVP and recounts attendees', async () => {
+		const respond = async (body: unknown, sub = '42'): Promise<Response> =>
+			post('/api/playerevents/v1/respond', body, sub)
+
+		const event = await create({ RoomId: 3, Name: 'RSVP Test', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		// The creator is Going from create, which is where the initial 1 comes from.
+		expect(event.AttendeeCount).toBe(1)
+		expect(await countGoing(env.DB, id)).toBe(1)
+
+		// 43 says Going → 2 attendees, and the envelope carries the updated event.
+		const res = await respond({ PlayerEventId: id, Type: 0 }, '43')
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as PlayerEventResult
+		expect(body.Result).toBe(0)
+		expect(body.PlayerEvent.AttendeeCount).toBe(2)
+		expect(await getEventResponse(env.DB, id, 43)).toMatchObject({
+			event_id: id,
+			player_id: 43,
+			status: 0,
+		})
+
+		// Changing the answer REPLACES it — one row per player, not a second RSVP.
+		const changed = await respond({ PlayerEventId: id, Type: 2 }, '43')
+		expect(((await changed.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(1)
+		expect(await getEventResponse(env.DB, id, 43)).toMatchObject({ player_id: 43, status: 2 })
+		expect((await getEventAttendees(env.DB, id)).map((a) => a.player_id)).toEqual([42, 43])
+
+		// Interested is a maybe — recorded, but not counted.
+		await respond({ PlayerEventId: id, Type: 1 }, '43')
+		expect(await countGoing(env.DB, id)).toBe(1)
+
+		// And the count sticks on the stored event, not just the response.
+		const fetched = (await (await get(`/api/playerevents/v1/${id}`)).json()) as PlayerEvent
+		expect(fetched.AttendeeCount).toBe(1)
+	})
+
+	test('POST /api/playerevents/v1/respond rejects a bad body, an unknown event and no token', async () => {
+		const event = await create({ RoomId: 3, Name: 'Guarded' })
+
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/respond`, {
+					method: 'POST',
+					body: JSON.stringify({ PlayerEventId: event.PlayerEventId, Type: 0 }),
+				})
+			).status
+		).toBe(401)
+
+		// An unrecognized Type is rejected rather than defaulted — stored as Going it
+		// would silently inflate the count.
+		expect((await post('/api/playerevents/v1/respond', { PlayerEventId: 1, Type: 7 })).status).toBe(
+			400
+		)
+		expect((await post('/api/playerevents/v1/respond', { Type: 0 })).status).toBe(400)
+		expect((await post('/api/playerevents/v1/respond', {})).status).toBe(400)
+		expect(
+			(await post('/api/playerevents/v1/respond', { PlayerEventId: 999999, Type: 0 })).status
+		).toBe(404)
+	})
+
 	test('POST /api/playerevents/v2/:eventId edits only what the body carries, creator-only', async () => {
 		const event = await create({
 			RoomId: 5,
@@ -2725,6 +2791,7 @@ describe('openapi', () => {
 			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
+			'POST /api/playerevents/v1/respond',
 			'POST /api/playerevents/v2',
 			'POST /api/playerevents/v2/{eventId}',
 			'POST /api/players/v1/progression/bulk',

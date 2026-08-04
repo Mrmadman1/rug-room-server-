@@ -4,16 +4,23 @@
  * are SQLite generated (virtual) columns extracted from that JSON — the same
  * JSON-blob pattern the image/invention/rooms/accounts tables use.
  *
- * The `api` worker owns this schema/migration (migrations/0006_event.sql, applied
- * under its own `migrations_table` so it doesn't clash with the other workers'
- * migrations on the shared database).
+ * The `api` worker owns this schema/migration (migrations/0006_event.sql and
+ * 0007_event_attendee.sql, applied under its own `migrations_table` so they don't
+ * clash with the other workers' migrations on the shared database).
  *
  * The stored record IS the DTO: every read endpoint serves the blob verbatim, so the
  * field set and casing here are exactly what the client parses. Timestamps are
  * normalized to `2020-11-29T22:00:00Z` (no fractional seconds) to match.
+ *
+ * RSVPs live alongside in `event_attendee`, one row per player per event. That one is
+ * genuinely columnar (like the relationship/report tables), so it's a normal
+ * relational table rather than a JSON blob.
  */
 
-/** Schema DDL (mirror of migrations/0006_event.sql, sans seed rows). */
+/**
+ * Schema DDL (mirror of migrations/0006_event.sql + 0007_event_attendee.sql, sans any
+ * seed rows).
+ */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS event (
 		data TEXT NOT NULL,
@@ -28,7 +35,45 @@ export const SCHEMA_DDL: string[] = [
 	`CREATE INDEX IF NOT EXISTS idx_event_creator ON event (creator_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_club ON event (club_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_start ON event (start_time)`,
+	`CREATE TABLE IF NOT EXISTS event_attendee (
+		event_id INTEGER NOT NULL,
+		player_id INTEGER NOT NULL,
+		status INTEGER NOT NULL,
+		responded_at TEXT NOT NULL,
+		PRIMARY KEY (event_id, player_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_event_attendee_player ON event_attendee (player_id)`,
 ]
+
+/**
+ * How a player answered an event invitation — the `Type` on
+ * `POST /api/playerevents/v1/respond`, stored as `event_attendee.status`.
+ *
+ * Only `going` counts toward an event's `AttendeeCount`: interested is a maybe, and
+ * declining is recorded rather than deleted so the client can show the player their own
+ * answer (and so changing your mind is an update, not an insert).
+ */
+export const EVENT_RESPONSE = {
+	going: 0,
+	interested: 1,
+	cantGo: 2,
+} as const
+
+/** The response types, for validating an incoming `Type`. */
+const EVENT_RESPONSE_VALUES: number[] = Object.values(EVENT_RESPONSE)
+
+/** Whether a number is one of the three response types. */
+export function isEventResponseType(value: number): boolean {
+	return EVENT_RESPONSE_VALUES.includes(value)
+}
+
+/** One player's answer to one event. */
+export interface EventAttendeeRow {
+	event_id: number
+	player_id: number
+	status: number
+	responded_at: string
+}
 
 /**
  * A scheduled player event (Rec Room's `PlayerEvent`) — a room, a window of time and
@@ -266,9 +311,12 @@ const DEFAULT_DURATION_MS = 60 * 60 * 1000
  *
  * Lenient about what the body carries, like the other writes here: an event with no
  * name or no time window is defaulted rather than rejected, because a rejection the
- * client can't render is worse than a placeholder the creator can edit. `AttendeeCount`
- * starts at 1 — the creator is attending their own event — and `State` at 0
- * (scheduled). The creator comes from the bearer token, never the body.
+ * client can't render is worse than a placeholder the creator can edit. `State` starts
+ * at 0 (scheduled). The creator comes from the bearer token, never the body.
+ *
+ * The creator is recorded as Going in `event_attendee`, which is what makes
+ * `AttendeeCount` start at 1: the count is derived from that table, so the creator
+ * needs a row there for the number to stay right once other players respond.
  */
 export async function createEvent(
 	db: D1Database,
@@ -300,8 +348,81 @@ export async function createEvent(
 		DefaultBroadcastPermissions: input.defaultBroadcastPermissions ?? 0,
 		CanRequestBroadcastPermissions: input.canRequestBroadcastPermissions ?? 0,
 	}
-	await db.prepare('INSERT INTO event (data) VALUES (?1)').bind(JSON.stringify(event)).run()
+	await db.batch([
+		db.prepare('INSERT INTO event (data) VALUES (?1)').bind(JSON.stringify(event)),
+		db
+			.prepare(
+				`INSERT INTO event_attendee (event_id, player_id, status, responded_at)
+				 VALUES (?1, ?2, ?3, ?4)`
+			)
+			.bind(event.PlayerEventId, creatorPlayerId, EVENT_RESPONSE.going, eventTime(now)),
+	])
 	return event
+}
+
+/**
+ * Record a player's answer to an event, replacing whatever they said before — one row
+ * per player per event, so changing your mind is an update rather than a second RSVP.
+ * The event's `AttendeeCount` is recomputed from the table afterwards.
+ *
+ * Returns the updated event, or null when there's no such event. Anyone who can see an
+ * event may respond to it, the creator included (they're already Going from create, and
+ * nothing stops them declining their own event).
+ */
+export async function setEventResponse(
+	db: D1Database,
+	eventId: number,
+	playerId: number,
+	status: number
+): Promise<PlayerEvent | null> {
+	const event = await getEventById(db, eventId)
+	if (event === null) return null
+
+	await db
+		.prepare(
+			`INSERT INTO event_attendee (event_id, player_id, status, responded_at)
+			 VALUES (?1, ?2, ?3, ?4)
+			 ON CONFLICT (event_id, player_id) DO UPDATE SET status = ?3, responded_at = ?4`
+		)
+		.bind(eventId, playerId, status, eventTime(Date.now()))
+		.run()
+
+	const updated: PlayerEvent = { ...event, AttendeeCount: await countGoing(db, eventId) }
+	await writeEvent(db, updated)
+	return updated
+}
+
+/** How many players said they're Going — an event's `AttendeeCount`. */
+export async function countGoing(db: D1Database, eventId: number): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS going FROM event_attendee WHERE event_id = ?1 AND status = ?2')
+		.bind(eventId, EVENT_RESPONSE.going)
+		.first<{ going: number }>()
+	return row?.going ?? 0
+}
+
+/** One player's answer to one event, or null when they haven't responded. */
+export async function getEventResponse(
+	db: D1Database,
+	eventId: number,
+	playerId: number
+): Promise<EventAttendeeRow | null> {
+	return db
+		.prepare('SELECT * FROM event_attendee WHERE event_id = ?1 AND player_id = ?2')
+		.bind(eventId, playerId)
+		.first<EventAttendeeRow>()
+}
+
+/** Everyone who answered an event, in the order they responded. Backs a future guest list. */
+export async function getEventAttendees(
+	db: D1Database,
+	eventId: number
+): Promise<EventAttendeeRow[]> {
+	const { results } = await db
+		.prepare('SELECT * FROM event_attendee WHERE event_id = ?1 ORDER BY responded_at, player_id')
+		.bind(eventId)
+		.all<EventAttendeeRow>()
+	return results
 }
 
 /** Overwrite an event's stored blob in place. */
