@@ -73,19 +73,29 @@ export type PlatformType = (typeof PlatformType)[keyof typeof PlatformType]
  * see the platform-auth notes on `POST /connect/token`.
  */
 export const PlatformTypeSchema = z
-	.union([z.literal(-1), z.int().min(0).max(Math.max(...Object.values(PlatformType)))])
+	.union([
+		z.literal(-1),
+		z
+			.int()
+			.min(0)
+			.max(Math.max(...Object.values(PlatformType))),
+	])
 	.describe(
 		Object.entries(PlatformType)
 			.map(([name, value]) => `${value} ${name}`)
 			.join(', ')
 	)
 
-/** One entry on the client's login screen, from `toCachedLogin`. */
+/**
+ * One entry on the client's login screen, from `toCachedLogin` — an account ↔ platform
+ * identity LINK, not an account. An account linked to two platforms yields one entry in
+ * each of their pickers, each reporting the identity that picker was asked about.
+ */
 export const CachedLogin = z.object({
 	platform: PlatformTypeSchema,
 	platformId: z
 		.string()
-		.describe('Platform-native id (a SteamID64 for Steam, a user id for Meta); "" if unlinked'),
+		.describe('The linked platform-native id — a SteamID64 for Steam, a user id for Meta'),
 	accountId: z.int().describe('Post this back as `account_id` on a cached_login grant'),
 	lastLoginTime: z.iso.datetime().describe("Falls back to the account's createdAt"),
 	requirePassword: z
@@ -141,8 +151,9 @@ export const TokenRequest = z.object({
 		.string()
 		.optional()
 		.describe(
-			'Platform proof, required for cached_login and platform create_account. Steam: ' +
-				'`{"Ticket":"<hex>","AppId":…}`. Meta: `{"Nonce":…,"AppId":…,"Source":…}`'
+			'Platform proof, required for cached_login and platform create_account, and used to ' +
+				'link the identity on a password grant. Steam: `{"Ticket":"<hex>","AppId":…}`. ' +
+				'Meta: `{"Nonce":…,"AppId":…,"Source":…}`'
 		),
 	refresh_token: z.string().optional().describe('Required on a refresh_token grant'),
 	device_id: z

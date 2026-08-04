@@ -14,7 +14,12 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
-import { isLinkedToPlatformIdentity } from '../../auth.app'
+import {
+	getLinksForAccount,
+	linkPlatformIdentity,
+	PLATFORM_BACKFILL_SQL,
+	PLATFORM_SCHEMA_DDL,
+} from '../../platform-db'
 import { REFRESH_SCHEMA_DDL } from '../../refresh-db'
 
 import type { Env } from '../../context'
@@ -51,6 +56,9 @@ beforeAll(async () => {
 	metaSecretId = await adminSecretsStore(env.META_APP_SECRET).create(META_APP_SECRET)
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of REFRESH_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Platform identity links — one account can hold several (a PC and a headset), and
+	// this table is what both the picker and the cached_login grant read.
+	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (owned by the rooms worker) — signup seeds the Orientation row.
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
@@ -135,6 +143,19 @@ async function metaLogin(
 	} finally {
 		globalThis.fetch = realFetch
 	}
+}
+
+/** GET a JSON route on the worker and parse the body as `T`. */
+async function getJson<T>(path: string): Promise<T> {
+	const res = await exports.default.fetch(`${ORIGIN}${path}`)
+	return (await res.json()) as T
+}
+
+/** The picker entries a platform identity yields, as the client sees them. */
+function cachedLogins(platform: number, id: string) {
+	return getJson<Array<Record<string, unknown> & { accountId: number; platform: number }>>(
+		`/cachedlogin/forplatformid/${platform}/${id}`
+	)
 }
 
 /** The `platform_auth` payload a Meta client posts, as observed from a live login. */
@@ -251,10 +272,7 @@ describe('auth worker routes', () => {
 		// cached-login picker offer it, and the cached_login grant accept it.
 		const payload = decodePayload(res.json.access_token as string)
 		const accountId = Number(payload.sub)
-		const lookup = await exports.default.fetch(
-			`${ORIGIN}/cachedlogin/forplatformid/1/${META_USER_ID}`
-		)
-		const linked = (await lookup.json()) as Array<Record<string, unknown>>
+		const linked = await cachedLogins(1, META_USER_ID)
 		expect(linked).toContainEqual(
 			expect.objectContaining({ accountId, platform: 1, platformId: META_USER_ID })
 		)
@@ -285,6 +303,7 @@ describe('auth worker routes', () => {
 				})
 			)
 			.run()
+		await linkPlatformIdentity(env.DB, 5150, 1, userId)
 		const res = await metaLogin(
 			`grant_type=cached_login&account_id=5150&platform=1&platform_id=${userId}` +
 				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
@@ -298,8 +317,8 @@ describe('auth worker routes', () => {
 
 	test('a Meta user id cannot log into an account it is not linked to', async () => {
 		// The Meta account seeded above, claimed by a different (but genuinely proven)
-		// Meta user. Even with a nonce Meta vouches for, the identity has to match the
-		// account's stored one.
+		// Meta user. Even with a nonce Meta vouches for, the identity has to be one the
+		// account is actually linked to.
 		const res = await metaLogin(
 			`grant_type=cached_login&account_id=5150&platform=1&platform_id=${META_USER_ID}` +
 				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
@@ -345,6 +364,7 @@ describe('auth worker routes', () => {
 				})
 			)
 			.run()
+		await linkPlatformIdentity(env.DB, 31380, 0, steamId)
 		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/0/${steamId}`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([
@@ -358,32 +378,69 @@ describe('auth worker routes', () => {
 		])
 	})
 
-	test('a Steam-linked account with no stored `platform` field still cached-logs in', async () => {
-		// Regression: nothing defaults an account's `platform` (see defaultAccount), so a
-		// Steam-linked account can carry a platformId with no platform. The picker offered
-		// such an account (it treats a missing platform as Steam) while the cached_login
-		// grant rejected it — "no linked account for this platform identity" forever.
-		// Both now run the same check.
+	test('one account, a Steam and a Meta identity: both pickers offer it', async () => {
+		// The point of the link table. The same account is reachable from the PC and from
+		// the headset, and each picker reports the identity IT was asked about — that's
+		// what the client posts back on the cached_login grant.
+		const steamId = '76561197962463777'
+		const metaId = '27061366730207777'
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 6200,
+					username: 'CrossPlatform',
+					platform: 0,
+					platformId: steamId,
+					lastLoginTime: '2026-08-01T10:00:00.000Z',
+				})
+			)
+			.run()
+		await linkPlatformIdentity(env.DB, 6200, 0, steamId)
+		await linkPlatformIdentity(env.DB, 6200, 1, metaId)
+
+		const onSteam = await cachedLogins(0, steamId)
+		const onMeta = await cachedLogins(1, metaId)
+
+		expect(onSteam).toEqual([
+			expect.objectContaining({ accountId: 6200, platform: 0, platformId: steamId }),
+		])
+		expect(onMeta).toEqual([
+			expect.objectContaining({ accountId: 6200, platform: 1, platformId: metaId }),
+		])
+
+		// And the grant accepts both, without a password.
+		const viaMeta = await metaLogin(
+			`grant_type=cached_login&account_id=6200&platform=1&platform_id=${metaId}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+			true
+		)
+		expect(viaMeta.status).toBe(200)
+		expect(decodePayload(viaMeta.json.access_token as string).sub).toBe('6200')
+	})
+
+	test('the picker and the cached_login grant read the same table', async () => {
+		// Regression: the picker used to derive links from the account blob (treating a
+		// missing `platform` as Steam) while the grant ran its own check, so the client
+		// could be handed an account_id that answered "no linked account" forever. Both
+		// now read platform_account, which is why an account with a stale blob identity
+		// is NOT offered — and, since it isn't offered, never rejected either.
 		const steamId = '76561197962463211'
-		const account = { platformId: steamId } // no `platform` field
-
-		// The grant now accepts it — this is what was returning invalid_grant.
-		expect(isLinkedToPlatformIdentity(account, 0, steamId)).toBe(true)
-
-		// The identity is still the credential: another SteamID, an account with no
-		// platform identity, and an account bound to a different platform are all refused.
-		expect(isLinkedToPlatformIdentity(account, 0, '76561197962463299')).toBe(false)
-		expect(isLinkedToPlatformIdentity({}, 0, steamId)).toBe(false)
-		expect(isLinkedToPlatformIdentity({ ...account, platform: 3 }, 0, steamId)).toBe(false)
-
-		// And the picker offers exactly the accounts the grant accepts.
 		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 			.bind(JSON.stringify({ accountId: 8, username: 'SteamOnly', platformId: steamId }))
 			.run()
-		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/0/${steamId}`)
-		const offered = (await res.json()) as Array<{ accountId: number; platform: number }>
-		expect(offered.map((a) => a.accountId)).toContain(8)
-		expect(offered.find((a) => a.accountId === 8)?.platform).toBe(0)
+
+		// No link row yet: not offered.
+		const before = await cachedLogins(0, steamId)
+		expect(before.map((a) => a.accountId)).not.toContain(8)
+
+		// The 0007 backfill is what gives accounts like this one — bound before the link
+		// table existed, and carrying no `platform` field at all — their link.
+		await env.DB.prepare(PLATFORM_BACKFILL_SQL).run()
+
+		const after = await cachedLogins(0, steamId)
+		expect(after.map((a) => a.accountId)).toContain(8)
+		// COALESCEd to Steam, which is what an unset platform meant.
+		expect(after.find((a) => a.accountId === 8)?.platform).toBe(0)
 	})
 
 	test('POST /connect/token issues a bearer token with role/scope claims', async () => {
@@ -718,6 +775,137 @@ describe('auth worker routes', () => {
 		expect(payload.sub).toBe('43')
 		expect(payload.platform).toBe(0)
 		expect(payload.platform_id).toBe('steam-123')
+	})
+
+	// A password login is how a player who already has an account signs in on a NEW
+	// device. The client posts its platform proof alongside the password, and linking
+	// the two is what turns the next launch on that device into a cached login.
+	describe('password grant links the platform identity it proves', () => {
+		/** Seed an account with LOGIN_PASSWORD set and no platform identity at all. */
+		async function seedPasswordAccount(id: number, username: string) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId: id,
+						username,
+						passwordHash: await hashPassword(LOGIN_PASSWORD),
+					})
+				)
+				.run()
+		}
+
+		test('a verified Meta login on an existing account links it, and cached login follows', async () => {
+			// Exactly the client's flow: an account made elsewhere, signed into on a headset
+			// with username + password, with the Meta nonce riding along.
+			await seedPasswordAccount(7100, 'djdevin')
+			const metaId = '27061366730201234'
+			const login = await metaLogin(
+				`grant_type=password&username=djdevin&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=${metaId}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true
+			)
+			expect(login.status).toBe(200)
+			expect(decodePayload(login.json.access_token as string).sub).toBe('7100')
+			// The nonce was validated against the id being linked — an unproven id is never
+			// linked, since a link is a password-free way into the account.
+			expect(login.graphCalls[0].get('user_id')).toBe(metaId)
+
+			// The headset now gets a cached login: offered by the picker…
+			const offered = await cachedLogins(1, metaId)
+			expect(offered.map((a) => a.accountId)).toContain(7100)
+
+			// …and accepted by the grant, with no password.
+			const cached = await metaLogin(
+				`grant_type=cached_login&account_id=7100&platform=1&platform_id=${metaId}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true
+			)
+			expect(cached.status).toBe(200)
+		})
+
+		test('the first identity linked becomes the account primary; later ones just link', async () => {
+			await seedPasswordAccount(7101, 'multiplatform')
+			const metaId = '27061366730205678'
+			await metaLogin(
+				`grant_type=password&username=multiplatform&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=${metaId}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true
+			)
+			// The blob's primary identity was empty, so the first link fills it in — this is
+			// what the account DTO and the refresh grant's claims report.
+			const account = (await env.DB.prepare(
+				'SELECT data FROM account WHERE account_id = 7101'
+			).first<{ data: string }>())!
+			expect(JSON.parse(account.data)).toMatchObject({ platform: 1, platformId: metaId })
+
+			// A second identity on another platform links without disturbing the primary.
+			await linkPlatformIdentity(env.DB, 7101, 0, '76561197962465678')
+			const links = await getLinksForAccount(env.DB, 7101)
+			expect(links.map((l) => [l.platform, l.platformId])).toEqual([
+				[1, metaId],
+				[0, '76561197962465678'],
+			])
+		})
+
+		test('an unverified platform_auth logs in but links nothing', async () => {
+			// The password already proved who this is, so the login stands — but a link is a
+			// password-free way in, and this identity was never proven, so none is written.
+			await seedPasswordAccount(7102, 'unproven')
+			const metaId = '27061366730209876'
+			const login = await metaLogin(
+				`grant_type=password&username=unproven&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=${metaId}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				false // Meta rejects the nonce
+			)
+			expect(login.status).toBe(200)
+			expect(await getLinksForAccount(env.DB, 7102)).toEqual([])
+		})
+
+		test('a login with no platform_auth links nothing and asks Meta nothing', async () => {
+			await seedPasswordAccount(7103, 'noproof')
+			const login = await metaLogin(
+				`grant_type=password&username=noproof&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=27061366730204321`,
+				true
+			)
+			expect(login.status).toBe(200)
+			expect(login.graphCalls).toHaveLength(0)
+			expect(await getLinksForAccount(env.DB, 7103)).toEqual([])
+		})
+
+		test('linking obeys the per-identity account cap, without failing the login', async () => {
+			// Otherwise the signup cap would be trivially bypassable: create accounts with a
+			// password, then link the capped identity into all of them.
+			const metaId = '27061366730203333'
+			for (let i = 0; i < 3; i++) await linkPlatformIdentity(env.DB, 8000 + i, 1, metaId)
+
+			await seedPasswordAccount(8100, 'overcap')
+			const login = await metaLogin(
+				`grant_type=password&username=overcap&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=${metaId}` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true
+			)
+			// The password was valid, so the player is logged in — they just don't get a
+			// cached login on this account.
+			expect(login.status).toBe(200)
+			expect(await getLinksForAccount(env.DB, 8100)).toEqual([])
+		})
+
+		test('re-logging in on the same device does not duplicate the link', async () => {
+			await seedPasswordAccount(7104, 'repeatlogin')
+			const metaId = '27061366730207654'
+			const body =
+				`grant_type=password&username=repeatlogin&password=${LOGIN_PASSWORD}` +
+				`&platform=1&platform_id=${metaId}` +
+				`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`
+			await metaLogin(body, true)
+			await metaLogin(body, true)
+			expect(await getLinksForAccount(env.DB, 7104)).toHaveLength(1)
+		})
 	})
 
 	test('POST /connect/token refresh_token is single-use (rejected on reuse)', async () => {
