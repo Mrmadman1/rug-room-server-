@@ -6,6 +6,12 @@ export type Env = SharedHonoEnv & {
 	DB: D1Database
 	/** R2 bucket holding the served image objects, keyed by filename. */
 	IMAGES: R2Bucket
+	/**
+	 * Shared `recflare-cdn` bucket. Only its `image/` prefix is read here: images
+	 * uploaded through the `storage` worker are stored extensionless under
+	 * `image/<date>/<uuid>` and requested from this worker by the bare name.
+	 */
+	CDN_ASSETS: R2Bucket
 	/** Static assets (fallback images) served from `static/`. */
 	ASSETS: Fetcher
 	/**
