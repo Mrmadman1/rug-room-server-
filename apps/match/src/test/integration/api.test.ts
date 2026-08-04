@@ -1251,7 +1251,7 @@ describe('auth-gated endpoints', () => {
 		).run()
 		try {
 			expect(await (await follow(9801, '9800')).json()).toEqual({
-				errorCode: 20,
+				errorCode: 55,
 				roomInstance: null,
 			})
 		} finally {
@@ -1278,14 +1278,15 @@ describe('auth-gated endpoints', () => {
 		).run()
 
 		// The ban is the whole enforcement: no instance means no Photon room id, so there
-		// is nothing for the banned player to join. Same opaque NoSuchRoom as any other
-		// refusal, and it applies to the subroom path as well.
-		expect(await matchmake('9701')).toEqual({ errorCode: 20, roomInstance: null })
+		// is nothing for the banned player to join. errorCode 55 rather than the opaque
+		// NoSuchRoom every other refusal answers — a banned player already knows the room
+		// exists, so the client can say why. Applies to the subroom path as well.
+		expect(await matchmake('9701')).toEqual({ errorCode: 55, roomInstance: null })
 		const sub = await exports.default.fetch(`${ORIGIN}/matchmake/room/2/2`, {
 			method: 'POST',
 			headers: await bearer('9701'),
 		})
-		expect(await sub.json()).toEqual({ errorCode: 20, roomInstance: null })
+		expect(await sub.json()).toEqual({ errorCode: 55, roomInstance: null })
 
 		// Refused before any instance is created, and no presence was recorded for them.
 		expect(

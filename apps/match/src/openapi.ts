@@ -128,7 +128,9 @@ export const PlayerDto = z.object({
  * a non-zero code (e.g. 20 NoSuchRoom) comes with `roomInstance: null`.
  */
 export const MatchmakeResponse = z.object({
-	errorCode: z.int().describe('0 = success; 20 = NoSuchRoom'),
+	errorCode: z
+		.int()
+		.describe('0 = success; 20 = NoSuchRoom; 55 = banned from the room (the one non-opaque code)'),
 	roomInstance: RoomInstanceDto.nullable(),
 })
 

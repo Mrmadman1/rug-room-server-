@@ -22,6 +22,7 @@ import {
 	getPresence,
 	getPublicRoomsByCreator,
 	getRecommendedRooms,
+	getRoomBans,
 	getRoomById,
 	getRoomByName,
 	getRoomsByCreator,
@@ -83,6 +84,7 @@ import {
 	RestrictionsRequest,
 	RoleRequest,
 	RoomBanEnvelope,
+	RoomBanEntryDto,
 	RoomDto,
 	RoomEnvelope,
 	roomIdParam,
@@ -375,19 +377,56 @@ async function pushRoomUpdate(
 }
 
 /**
- * Tell a player they've been banned from a room — a `ModerationRoomBan` push carrying
- * the ban. Like {@link pushRoomUpdate}, hub failures are logged and swallowed: the ban
- * row has already committed, so a hub hiccup must not fail the request.
+ * `reportCategory` on a moderation frame. -1 is "Moderator" — the category for an
+ * action a person took rather than one the system inferred, which is what a room ban
+ * is. The rest of the enum, for reference: 2 Harassment, 3 Cheating, 5 AFK, 6 Misc,
+ * 7 Underage, 10 VoteKick, 100–104 CoC_*, 200 InappropriateClothing.
  */
-async function pushRoomBan(c: Context<App>, ban: RoomBan): Promise<void> {
+const REPORT_CATEGORY_MODERATOR = -1
+
+/**
+ * Eject a player from the room they're in — a `ModerationKick` push (id 22), the frame
+ * the client acts on to remove someone. Sent on a ban: the row keeps them out of future
+ * matchmakes, this gets them out of the instance they're in right now.
+ *
+ * The payload is the client's moderation shape, camelCase, in wire order:
+ * `reportCategory`, `duration`, `gameSessionId`, `isHostKick`, `message`,
+ * `playerIdReporter`, `isBan`, `isVoiceModAutoban`. `duration` is 0 (a room ban has no
+ * expiry — it's lifted by DELETE, not by time) and `gameSessionId` is 0 (nothing here
+ * tracks one).
+ *
+ * `isHostKick` says the room's HOST ejected the player, as opposed to the room
+ * majority vote-kicking them. There is no vote-kick path yet, so the only false case
+ * here is a staff moderator acting in a room they don't host. `playerIdReporter` is
+ * whoever caused it — the host today, and the player who started the vote once
+ * vote-kicks exist (those will carry `reportCategory` 10 and `isHostKick` false).
+ *
+ * Like {@link pushRoomUpdate}, hub failures are logged and swallowed: the ban row has
+ * already committed, so a hub hiccup must not fail the request.
+ */
+async function pushRoomBan(
+	c: Context<App>,
+	ban: RoomBan,
+	roomName: string,
+	isHostKick: boolean
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			ban.BannedPlayerId,
-			NotificationType.ModerationRoomBan,
-			{ ...ban }
+			NotificationType.ModerationKick,
+			{
+				reportCategory: REPORT_CATEGORY_MODERATOR,
+				duration: 0,
+				gameSessionId: 0,
+				isHostKick,
+				message: `You have been banned from ${roomName}.`,
+				playerIdReporter: ban.BannedByAccountId,
+				isBan: true,
+				isVoiceModAutoban: false,
+			}
 		)
 	} catch (err) {
-		logger.error('failed to push ModerationRoomBan notification', {
+		logger.error('failed to push ModerationKick notification', {
 			playerId: ban.BannedPlayerId,
 			error: err instanceof Error ? err.message : String(err),
 		})
@@ -1393,6 +1432,55 @@ const app = new Hono<App>()
 		}
 	)
 
+	// A room's ban list — the owner's view of who they've banned. Same gate as issuing a
+	// ban: a ban list says who a room's owner has had trouble with, so it isn't public.
+	// Answers a BARE array (not the room-write envelope), newest ban first.
+	.get(
+		'/rooms/:roomId{[0-9]+}/bans',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'A room’s ban list',
+			description: [
+				'Everyone banned from the room, most recently banned first. Auth-gated, then gated',
+				'exactly like issuing a ban: the room’s creator or a co-owner, or an account whose',
+				'token carries the `developer` / `moderator` role. A ban list says who a room’s',
+				'owner has had trouble with, so it is not public.',
+				'',
+				'A bare array, NOT the `{ success, error, value }` envelope the ban write answers,',
+				'and the entries are camelCase with a different field set: no room id (the path',
+				'already says which room) and no ban mask. An unknown room is an empty list rather',
+				'than an error — it reads the same as a room nobody is banned from.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			responses: {
+				200: json(RoomBanEntryDto.array(), 'The room’s bans, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			// No room → nothing banned. Same answer as a room with an empty ban list, so
+			// this doesn't become a way to probe which room ids exist.
+			if (!room) return c.json([])
+			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+
+			const bans = await getRoomBans(c.env.DB, roomId)
+			return c.json(
+				bans.map((ban) => ({
+					accountId: ban.BannedPlayerId,
+					bannedByAccountId: ban.BannedByAccountId,
+					banStartTime: ban.CreatedAt,
+				}))
+			)
+		}
+	)
+
 	// Ban a player from a room (form body `id` + `banMask`). Auth-gated (401), then
 	// gated to the room's owner/co-owner OR a staff token (403). One row per
 	// (room, player) — re-banning rewrites it, so the call is idempotent.
@@ -1403,9 +1491,9 @@ const app = new Hono<App>()
 			summary: 'Ban a player from a room',
 			description: [
 				'Records a ban in the `room_ban` table — one row per (room, player), so re-banning',
-				'someone already banned rewrites their row rather than adding a second. Nothing',
-				'enforces the ban yet: matchmaking does not consult this table, so a banned player',
-				'can still join. This is the record only.',
+				'someone already banned rewrites their row rather than adding a second. The row is',
+				'what the `match` worker checks: a banned player’s matchmake into this room is',
+				'refused with errorCode 55 and never gets a Photon room id.',
 				'',
 				'Gated to the room’s creator or a co-owner, OR to any account whose token carries the',
 				'`developer` / `moderator` role — a valid token from anyone else is a 403. Banning',
@@ -1415,8 +1503,16 @@ const app = new Hono<App>()
 				'`banMask` is stored verbatim and nothing interprets it — the client sends `0` and',
 				'what it selects is not known yet. It defaults to 0 when absent.',
 				'',
-				'The BANNED player (not the caller) gets a `ModerationRoomBan` push carrying the ban,',
-				'so their client can act on it; the hub queues it if they are offline.',
+				'The BANNED player (not the caller) gets a `ModerationKick` push (id 22) — the frame',
+				'the client acts on to eject someone — so a ban takes effect immediately rather than',
+				'only at their next matchmake. `isBan` is true, `duration` 0 (a room ban has no',
+				'expiry; it is lifted by DELETE, not by time) and `reportCategory` -1 (Moderator).',
+				'',
+				'`isHostKick` means the room’s HOST ejected them rather than the room majority',
+				'vote-kicking them; with no vote-kick path yet the only false case is a staff',
+				'moderator acting in a room they do not host. `playerIdReporter` is whoever caused',
+				'it — the host today, the player who started the vote once vote-kicks exist. The hub',
+				'queues the frame if they are offline.',
 				'',
 				'Answers the same lowercase `{ success, error, value }` envelope the room writes use,',
 				'but `value` is the BAN, not the room — a ban is not part of the room the client',
@@ -1440,8 +1536,10 @@ const app = new Hono<App>()
 			if (!room) return banEnvelope(c, null, 'This room does not exist!')
 
 			// The room's own owners, or a staffer acting across rooms. Roles are only
-			// looked up when the cheaper room check fails.
-			if (!canManageRoom(room, accountId) && !(await isStaff(c))) return c.body(null, 403)
+			// looked up when the cheaper room check fails. The room's own owner IS the
+			// host, which is what the kick frame's `isHostKick` reports.
+			const isHostKick = canManageRoom(room, accountId)
+			if (!isHostKick && !(await isStaff(c))) return c.body(null, 403)
 
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -1458,8 +1556,9 @@ const app = new Hono<App>()
 			const banMask = Number.parseInt(str(body.banMask), 10) || 0
 
 			const ban = await banPlayerFromRoom(c.env.DB, roomId, bannedPlayerId, banMask, accountId)
-			// The banned player is told, not the caller — their client acts on the ban.
-			await pushRoomBan(c, ban)
+			// The banned player is told, not the caller — their client acts on the kick.
+			const roomName = typeof room.Name === 'string' ? room.Name : 'this room'
+			await pushRoomBan(c, ban, roomName, isHostKick)
 			return banEnvelope(c, ban)
 		}
 	)

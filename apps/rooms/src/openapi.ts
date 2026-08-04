@@ -462,6 +462,17 @@ export const RoomBanDto = z.object({
 	CreatedAt: z.string(),
 })
 
+/**
+ * One entry of `GET /rooms/{roomId}/bans` — the client's ban-list shape. camelCase and
+ * a different field set from the {@link RoomBanDto} the write answers: no room id (the
+ * path already says which room) and no ban mask.
+ */
+export const RoomBanEntryDto = z.object({
+	accountId: z.int().describe('The banned player'),
+	bannedByAccountId: z.int().describe('Who issued the ban'),
+	banStartTime: z.string().describe('ISO 8601 UTC, when the ban was issued'),
+})
+
 /** The envelope the ban write answers — same shape as the room writes, `value` is the ban. */
 export const RoomBanEnvelope = z.object({
 	success: z.boolean(),

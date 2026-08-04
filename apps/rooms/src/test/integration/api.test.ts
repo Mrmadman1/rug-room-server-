@@ -1006,29 +1006,83 @@ describe('rooms endpoints', () => {
 		expect(await bansOf(2)).toHaveLength(2)
 	})
 
-	it('POST /rooms/:id/bans notifies the banned player', async () => {
-		type Sent = { playerId: number; notificationType: string | number; data: { RoomId: number } }
+	it('POST /rooms/:id/bans kicks the banned player', async () => {
+		type Sent = { playerId: number; notificationType: string | number; data: unknown }
 		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
-		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const sentSince = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
 
+		// The room's current name, read rather than hardcoded — earlier tests rename it.
+		const { Name } = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { Name: string }
+
+		await hub().fetch('http://do/all', { method: 'DELETE' })
 		expect((await postForm('/rooms/2/bans', { banMask: '0', id: '207' }, '1')).status).toBe(200)
 
-		const sent = (await (await hub().fetch('http://do/all')).json()) as Sent[]
-		// Pushed to the BANNED player, not the caller. Asserted against the enum rather
-		// than a literal — the hub's ids are the notify worker's to change.
-		expect(sent).toEqual([
+		// A ModerationKick (id 22) to the BANNED player, not the caller — it ejects them
+		// from the instance they're in now; the row keeps them out of future matchmakes.
+		// Asserted against the enum rather than a literal: the ids are notify's to change.
+		expect(await sentSince()).toEqual([
 			{
 				playerId: 207,
-				notificationType: NotificationType.ModerationRoomBan,
+				notificationType: NotificationType.ModerationKick,
+				// The client's moderation payload, camelCase, in wire order.
 				data: {
-					RoomId: 2,
-					BannedPlayerId: 207,
-					BanMask: 0,
-					BannedByAccountId: 1,
-					CreatedAt: expect.any(String),
+					reportCategory: -1, // Moderator — a person acted, not the system
+					duration: 0, // a room ban has no expiry
+					gameSessionId: 0,
+					// The host ejected them (as opposed to a room vote-kick, which doesn't
+					// exist yet). Account 1 owns RecCenter, so it hosts it.
+					isHostKick: true,
+					message: `You have been banned from ${Name}.`,
+					playerIdReporter: 1,
+					isBan: true,
+					isVoiceModAutoban: false,
 				},
 			},
 		])
+
+		// A staff moderator doesn't host the room, so it isn't a host kick — and
+		// `playerIdReporter` is still whoever caused it.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		expect(
+			(await postForm('/rooms/2/bans', { id: '208' }, '999', ['gameClient', 'moderator'])).status
+		).toBe(200)
+		expect((await sentSince())[0]).toMatchObject({
+			playerId: 208,
+			data: { isHostKick: false, playerIdReporter: 999 },
+		})
+	})
+
+	it('GET /rooms/:id/bans lists the room’s bans, under the same gate', async () => {
+		type Entry = { accountId: number; bannedByAccountId: number; banStartTime: string }
+		const list = async (path: string, sub?: string, roles?: string[]) =>
+			SELF.fetch(`${ORIGIN}${path}`, { headers: sub ? await bearer(sub, roles) : {} })
+
+		// Room 3 is owned by account 1 (it has no bans yet) — ban two players into it.
+		expect((await postForm('/rooms/3/bans', { id: '401' }, '1')).status).toBe(200)
+		expect((await postForm('/rooms/3/bans', { id: '402' }, '1')).status).toBe(200)
+
+		// No token → 401; a valid token with no room role and no staff role → 403.
+		expect((await list('/rooms/3/bans')).status).toBe(401)
+		expect((await list('/rooms/3/bans', '999')).status).toBe(403)
+
+		const res = await list('/rooms/3/bans', '1')
+		expect(res.status).toBe(200)
+		// A bare array in the client's camelCase shape — no room id, no ban mask.
+		const bans = (await res.json()) as Entry[]
+		expect(bans.map((b) => b.accountId).sort((a, b) => a - b)).toEqual([401, 402])
+		expect(bans[0]).toEqual({
+			accountId: expect.any(Number),
+			bannedByAccountId: 1,
+			banStartTime: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+		})
+
+		// A staffer can read a list for a room they have no role on.
+		expect((await list('/rooms/3/bans', '999', ['gameClient', 'moderator'])).status).toBe(200)
+
+		// An unknown room reads the same as a room with nobody banned — no probing which
+		// room ids exist.
+		expect(await (await list('/rooms/99999/bans', '1')).json()).toEqual([])
 	})
 
 	it('DELETE /rooms/:id/bans/:playerId lifts a ban, under the same gate', async () => {
@@ -2569,6 +2623,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/visitedby/me',
 			'GET /rooms/visitedby/{playerId}',
 			'GET /rooms/{roomId}',
+			'GET /rooms/{roomId}/bans',
 			'GET /rooms/{roomId}/interactionby/me',
 			'GET /rooms/{roomId}/playerdata/me',
 			'GET /rooms/{roomId}/similar',

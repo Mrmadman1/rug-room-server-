@@ -274,6 +274,14 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 /** MatchmakingErrorCode.NoSuchRoom — returned when a room isn't in the DB. */
 const NO_SUCH_ROOM = 20
 
+/**
+ * MatchmakingErrorCode for "you are banned from this room". Unlike the opaque
+ * NoSuchRoom every other refusal answers, a banned player is told why: they already
+ * know the room exists, so there's nothing to hide, and the client can say so instead
+ * of showing a room that mysteriously fails to load.
+ */
+const BANNED_FROM_ROOM = 55
+
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
 
@@ -478,10 +486,19 @@ async function inviteParty(
 }
 
 /**
+ * The outcome of resolving a room to join: the instance, or the `errorCode` to answer
+ * with. Kept as a pair rather than a bare null so callers can tell a room that isn't
+ * there (NoSuchRoom) from one the caller is banned from — those answer different codes.
+ */
+type ResolvedInstance =
+	| { instance: RoomInstance; errorCode: 0 }
+	| { instance: null; errorCode: number }
+
+/**
  * Resolve a room by `:room` path segment (numeric id or name) from D1, then find a
  * joinable instance of it (public matchmakes reuse one via the `room_instance`
- * table) or create a new one. Returns null when the room isn't found, or when the
- * caller is banned from it.
+ * table) or create a new one. A null instance carries the error code to answer:
+ * NoSuchRoom when the room isn't in the DB, BannedFromRoom when the caller is banned.
  */
 async function resolveRoomInstance(
 	c: Context<App>,
@@ -489,23 +506,22 @@ async function resolveRoomInstance(
 	isPrivate: boolean,
 	ownerId: number,
 	subRoomId?: number
-): Promise<RoomInstance | null> {
+): Promise<ResolvedInstance> {
 	const id = Number.parseInt(roomKey, 10)
 	const room = Number.isNaN(id)
 		? await getRoomByName(c.env.DB, roomKey)
 		: await getRoomById(c.env.DB, id)
-	if (!room) return null
+	if (!room) return { instance: null, errorCode: NO_SUCH_ROOM }
 
 	const f = instanceFieldsFromRoom(room, subRoomId)
 
 	// A banned player never gets an instance. This is the whole enforcement of a room
 	// ban: the Photon room id only ever reaches a player through a matchmake, so
 	// refusing here means they have no coordinates to join or interact with. Handled
-	// before any instance is created or reused so a ban can't spawn one. The caller sees
-	// the same opaque NO_SUCH_ROOM every other refusal answers.
+	// before any instance is created or reused so a ban can't spawn one.
 	if (await isPlayerBannedFromRoom(c.env.DB, f.roomId, ownerId)) {
 		logger.info('matchmake refused: player banned from room', { roomId: f.roomId, ownerId })
-		return null
+		return { instance: null, errorCode: BANNED_FROM_ROOM }
 	}
 
 	// Never place the player back into the instance they're already in: the client
@@ -538,13 +554,16 @@ async function resolveRoomInstance(
 			roomInstanceType: f.roomInstanceType,
 		})
 	}
-	return roomInstanceFromRoom(
-		room,
-		isPrivate,
-		instance.roomInstanceId,
-		instance.photonRoomId,
-		f.subRoomId
-	)
+	return {
+		instance: roomInstanceFromRoom(
+			room,
+			isPrivate,
+			instance.roomInstanceId,
+			instance.photonRoomId,
+			f.subRoomId
+		),
+		errorCode: 0,
+	}
 }
 
 /**
@@ -872,7 +891,8 @@ const app = new Hono<App>()
 			description: [
 				'Looks the club up, checks the caller is a member of it, and places them into an',
 				'instance of its clubhouse room. Returns errorCode 20 with a null instance when the',
-				'club is unknown, has no clubhouse set, or the caller isn’t a member.',
+				'club is unknown, has no clubhouse set, or the caller isn’t a member — and errorCode',
+				'55 when they are banned from the clubhouse room.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(JoinModeRequest, 'Optional JoinMode'),
@@ -888,7 +908,7 @@ const app = new Hono<App>()
 			responses: {
 				200: json(
 					MatchmakeResponse,
-					'The clubhouse instance (or errorCode 20 with null when it can’t be entered)'
+					'The clubhouse instance (or a null instance with errorCode 20 / 55 when it can’t be entered)'
 				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
@@ -908,13 +928,13 @@ const app = new Hono<App>()
 			}
 
 			const joinMode = await readJoinMode(c)
-			const instance = await resolveRoomInstance(
+			const { instance, errorCode } = await resolveRoomInstance(
 				c,
 				String(club.clubhouseRoomId),
 				joinMode === 2,
 				id
 			)
-			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			if (!instance) return c.json({ errorCode, roomInstance: null })
 			await enterRoom(c, id, instance)
 			return c.json({ errorCode: 0, roomInstance: instance })
 		}
@@ -938,7 +958,9 @@ const app = new Hono<App>()
 				'from the target’s stored presence. FRIENDS ONLY: the caller must be a mutual friend',
 				'of the target (otherwise anyone could read a player’s presence and warp to them).',
 				'Returns errorCode 20 with a null instance when the target isn’t a friend, is the',
-				'caller themselves, or isn’t currently in a room.',
+				'caller themselves, or isn’t currently in a room, and errorCode 55 when the caller is',
+				'banned from the room the friend is in — this path hands out join coordinates without',
+				'going through the room resolver, so it carries its own ban check.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -953,7 +975,7 @@ const app = new Hono<App>()
 			responses: {
 				200: json(
 					MatchmakeResponse,
-					'The friend’s instance (or errorCode 20 with null when it can’t be joined)'
+					'The friend’s instance (or a null instance with errorCode 20 / 55 when it can’t be joined)'
 				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
@@ -979,7 +1001,7 @@ const app = new Hono<App>()
 			// otherwise following a friend in is a way around a ban.
 			if (await isPlayerBannedFromRoom(c.env.DB, instance.roomId, id)) {
 				logger.info('follow refused: player banned from room', { roomId: instance.roomId, id })
-				return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+				return c.json({ errorCode: BANNED_FROM_ROOM, roomInstance: null })
 			}
 
 			// Join that same instance (same id + Photon room) and store it as the caller's
@@ -1015,7 +1037,10 @@ const app = new Hono<App>()
 				},
 			],
 			responses: {
-				200: json(MatchmakeResponse, 'The instance (or errorCode 20 with null on unknown room)'),
+				200: json(
+					MatchmakeResponse,
+					'The instance (or a null instance with errorCode 20 on an unknown room, 55 when banned)'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -1024,14 +1049,14 @@ const app = new Hono<App>()
 			if (id === null) return unauthorized(c)
 			const { joinMode, additionalPlayerIds } = await readMatchmakeBody(c)
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
-			const instance = await resolveRoomInstance(
+			const { instance, errorCode } = await resolveRoomInstance(
 				c,
 				c.req.param('roomId'),
 				joinMode === 2,
 				id,
 				subRoomId
 			)
-			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			if (!instance) return c.json({ errorCode, roomInstance: null })
 			await enterRoom(c, id, instance)
 			// Pull the caller's party (AdditionalPlayerIds) into the instance they landed in.
 			await inviteParty(c, id, additionalPlayerIds, instance)
@@ -1054,7 +1079,10 @@ const app = new Hono<App>()
 			requestBody: form(MatchmakeRoomRequest, 'Optional JoinMode and AdditionalPlayerIds'),
 			parameters: [{ name: 'roomId', in: 'path', required: true, schema: { type: 'string' } }],
 			responses: {
-				200: json(MatchmakeResponse, 'The instance (or errorCode 20 with null on unknown room)'),
+				200: json(
+					MatchmakeResponse,
+					'The instance (or a null instance with errorCode 20 on an unknown room, 55 when banned)'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -1062,8 +1090,13 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			const { joinMode, additionalPlayerIds } = await readMatchmakeBody(c)
-			const instance = await resolveRoomInstance(c, c.req.param('roomId'), joinMode === 2, id)
-			if (!instance) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+			const { instance, errorCode } = await resolveRoomInstance(
+				c,
+				c.req.param('roomId'),
+				joinMode === 2,
+				id
+			)
+			if (!instance) return c.json({ errorCode, roomInstance: null })
 			await enterRoom(c, id, instance)
 			// Pull the caller's party (AdditionalPlayerIds) into the instance they landed in.
 			await inviteParty(c, id, additionalPlayerIds, instance)
