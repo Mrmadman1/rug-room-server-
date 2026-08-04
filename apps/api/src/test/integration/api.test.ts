@@ -15,6 +15,7 @@ import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '..
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
 import { getReportsAgainst, SCHEMA_DDL as REPORTS_SCHEMA_DDL } from '../../reports-db'
+import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { Env } from '../../context'
 import type { SavedImage } from '../../images-db'
@@ -85,6 +86,9 @@ beforeAll(async () => {
 
 	// Reports table (owned by the api worker) — player reports are recorded here.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Warnings table (owned by the api worker) — moderator-issued warnings land here.
+	for (const stmt of WARNINGS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -98,10 +102,13 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+// `roles` mints the `role` claim the auth worker stamps from an account's flags; left
+// off, the token carries none, which is what a plain player's looks like to the
+// role-gated routes.
+async function bearer(sub = '42', roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...(roles && { role: roles }) })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -1185,6 +1192,97 @@ describe('player reports', () => {
 	})
 })
 
+describe('player warnings', () => {
+	const MOD = ['gameClient', 'moderator']
+
+	const issue = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+		exports.default.fetch(`${ORIGIN}/api/playerwarnings`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+			body: new URLSearchParams(fields),
+		})
+
+	test('POST /api/playerwarnings records the warning', async () => {
+		const res = await issue(
+			{
+				WarnedPlayerId: '205',
+				ReportCategory: '101',
+				DisplayReason: 'Sexual gestures',
+				ModeratorNote: 'dfg',
+			},
+			await bearer('42', MOD)
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const [row] = await getWarningsAgainst(env.DB, 205)
+		expect(row).toMatchObject({
+			// The moderator is the token's subject, not a body field.
+			moderator_player_id: 42,
+			warned_player_id: 205,
+			report_category: 101,
+			display_reason: 'Sexual gestures',
+			moderator_note: 'dfg',
+		})
+		expect(row?.created_at).toBeTruthy()
+	})
+
+	test('POST /api/playerwarnings stores absent fields as null', async () => {
+		const res = await issue({ WarnedPlayerId: '206' }, await bearer('42', MOD))
+		expect(res.status).toBe(200)
+
+		const [row] = await getWarningsAgainst(env.DB, 206)
+		expect(row).toMatchObject({
+			warned_player_id: 206,
+			report_category: 0,
+			display_reason: null,
+			moderator_note: null,
+		})
+	})
+
+	// Append-only, like reports: warning the same player twice is two rows.
+	test('POST /api/playerwarnings appends rather than dedupes', async () => {
+		await issue({ WarnedPlayerId: '207', ModeratorNote: 'first' }, await bearer('42', MOD))
+		await issue({ WarnedPlayerId: '207', ModeratorNote: 'second' }, await bearer('42', MOD))
+		const rows = await getWarningsAgainst(env.DB, 207)
+		expect(rows).toHaveLength(2)
+		// Newest first.
+		expect(rows.map((r) => r.moderator_note)).toEqual(['second', 'first'])
+	})
+
+	test('POST /api/playerwarnings 401s without a bearer token', async () => {
+		const res = await issue({ WarnedPlayerId: '205' })
+		expect(res.status).toBe(401)
+	})
+
+	// A valid token is not enough — a plain player's carries neither staff role.
+	// Nothing is written on the rejected branch.
+	test('POST /api/playerwarnings 403s without a staff role', async () => {
+		for (const roles of [undefined, ['gameClient']]) {
+			const res = await issue({ WarnedPlayerId: '208' }, await bearer('42', roles))
+			expect(res.status).toBe(403)
+			expect(await res.json()).toEqual({ success: false, error: 'Forbidden' })
+		}
+		expect(await getWarningsAgainst(env.DB, 208)).toHaveLength(0)
+	})
+
+	// `developer` gets in as well as `moderator` — staff hold both.
+	test('POST /api/playerwarnings accepts the developer role', async () => {
+		const res = await issue(
+			{ WarnedPlayerId: '209' },
+			await bearer('42', ['gameClient', 'developer'])
+		)
+		expect(res.status).toBe(200)
+		expect(await getWarningsAgainst(env.DB, 209)).toHaveLength(1)
+	})
+
+	test('POST /api/playerwarnings 400s without a warned player', async () => {
+		const res = await issue({ ModeratorNote: 'dfg' }, await bearer('42', MOD))
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ success: false, error: 'WarnedPlayerId is required' })
+	})
+})
+
 describe('rooms', () => {
 	test('POST /api/rooms/v1/verifyRole checks creator + room roles', async () => {
 		const verify = async (fields: Record<string, string>, sub?: string): Promise<boolean> => {
@@ -2114,6 +2212,7 @@ describe('openapi', () => {
 			'POST /api/playerReputation/v2/bulk',
 			'POST /api/players/v1/progression/bulk',
 			'POST /api/players/v2/progression/bulk',
+			'POST /api/playerwarnings',
 			'POST /api/relationships/v1/favorite',
 			'POST /api/relationships/v1/ignore',
 			'POST /api/relationships/v1/mute',

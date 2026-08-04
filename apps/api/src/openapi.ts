@@ -436,12 +436,30 @@ export const CreateReportRequest = z.object({
 })
 
 /**
- * The `{ success, error }` envelope `POST /api/PlayerReporting/v3/create` answers with —
- * `error` is an empty string on success, never null.
+ * The `{ success, error }` envelope the report / warning writes answer with — `error`
+ * is an empty string on success, never null.
  */
 export const ReportCreateResponse = z.object({
 	success: z.boolean(),
-	error: z.string().describe('Empty string when the report was recorded'),
+	error: z.string().describe('Empty string when the record was written'),
+})
+
+/**
+ * `POST /api/playerwarnings` form body — a warning a moderator hands down. Everything
+ * is a string on the wire (it's form-encoded); only `WarnedPlayerId` is required. The
+ * moderator is NOT in the body — it's taken from the bearer token.
+ */
+export const CreateWarningRequest = z.object({
+	WarnedPlayerId: z.string().describe('Account id of the player being warned'),
+	ReportCategory: z
+		.string()
+		.optional()
+		.describe('The reason category, e.g. `101`. Stored verbatim; unmapped'),
+	DisplayReason: z
+		.string()
+		.optional()
+		.describe('What the warned player is shown, e.g. `Sexual gestures`'),
+	ModeratorNote: z.string().optional().describe('Internal note; never shown to the player'),
 })
 
 /** `POST /api/PlayerReporting/v1/deviceId` form body — the id rotation the client reports. */
