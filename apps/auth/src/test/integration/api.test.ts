@@ -1084,3 +1084,67 @@ describe('auth worker routes', () => {
 		}
 	})
 })
+
+// The website is a browser origin calling these endpoints directly — the same ones the
+// game calls — instead of proxying them through `www`. That only works if the responses
+// carry CORS headers: without them the browser discards a perfectly good token response
+// and sign-in fails with nothing in any server log to explain it.
+describe('CORS', () => {
+	test('answers the preflight the browser sends before a token grant', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/connect/token`, {
+				method: 'OPTIONS',
+				headers: {
+					origin: 'https://www.example.com',
+					'access-control-request-method': 'POST',
+					'access-control-request-headers': 'content-type',
+				},
+			}),
+			env
+		)
+		expect(res.status).toBe(204)
+		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+			'content-type'
+		)
+	})
+
+	// The header has to be on the REAL response too, not just the preflight — and on a
+	// refusal as much as a success, or a rejected sign-in reaches the page as an opaque
+	// network error rather than "that password is incorrect".
+	test('allows the origin on the response itself, refusals included', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/connect/token`, {
+				method: 'POST',
+				headers: {
+					origin: 'https://www.example.com',
+					'content-type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ grant_type: 'password', username: 'nobody' }).toString(),
+			}),
+			env
+		)
+		expect(res.status).toBe(400)
+		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	})
+
+	// The bearer header is what the SPA authenticates with, so it must be allowed by name
+	// — a preflight that omits it makes every signed-in call fail.
+	test('allows the Authorization header the SPA signs its calls with', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/account/me/changepassword`, {
+				method: 'OPTIONS',
+				headers: {
+					origin: 'https://www.example.com',
+					'access-control-request-method': 'POST',
+					'access-control-request-headers': 'authorization',
+				},
+			}),
+			env
+		)
+		expect(res.status).toBe(204)
+		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+			'authorization'
+		)
+	})
+})

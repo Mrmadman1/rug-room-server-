@@ -24,22 +24,49 @@ beforeAll(async () => {
 	await adminSecretsStore(env.TURNSTILE_SECRET_KEY).create(TEST_SECRET_KEY)
 })
 
-it('rejects unauthenticated account reads', async () => {
-	const res = await SELF.fetch('https://example.com/api/me')
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
-})
-
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
 // the pass path can't be tested here (it would call Cloudflare's siteverify for real).
-it('advertises signup with the Turnstile site key the widget needs', async () => {
+//
+// The hostnames matter as much as the key: the SPA calls auth/accounts/api/notify
+// DIRECTLY (as rec.net's site did), and this is the only place it learns where they are.
+// A build with them missing can't sign anyone in.
+it('advertises signup and where the other workers live', async () => {
 	const res = await SELF.fetch('https://example.com/api/config')
 	expect(res.status).toBe(200)
 	// Read through the Secrets Store binding, from the value seeded above.
 	expect(await res.json()).toEqual({
 		signupEnabled: true,
 		turnstileSiteKey: TEST_SITE_KEY,
+		hosts: {
+			auth: 'https://auth.rec.example.com',
+			accounts: 'https://accounts.rec.example.com',
+			api: 'https://api.rec.example.com',
+			img: 'https://img.rec.example.com',
+			notify: 'https://notify.rec.example.com',
+		},
 	})
+})
+
+// The BFF proxies are gone: the browser calls those workers itself. Pinned because
+// nothing else would fail if one were left behind — a stale proxy keeps working, it just
+// re-creates the maintenance burden (and the shared-IP bug) this removed. `/api/signup`
+// is the deliberate exception, and it's covered below.
+it('no longer proxies the endpoints the game already serves', async () => {
+	for (const path of [
+		'/api/me',
+		'/api/login',
+		'/api/logout',
+		'/api/username',
+		'/api/email',
+		'/api/password',
+		'/api/maintenance',
+		'/api/coach-message',
+		'/api/slideshow',
+	]) {
+		const res = await SELF.fetch(`https://example.com${path}`, { method: 'POST' })
+		// Falls through to the SPA catch-all, which has no ASSETS binding under test.
+		expect(res.status, path).toBe(404)
+	}
 })
 
 // The keypair is the on/off switch for signup, so a www whose keys don't resolve must
@@ -86,19 +113,6 @@ it('refuses a signup with no Turnstile token', async () => {
 	// Rejected before any upstream call, so a bot can't reach create_account by omitting it.
 	expect(res.status).toBe(400)
 	expect(await res.json()).toEqual({ error: 'Please complete the bot check.' })
-})
-
-// The email is optional, but a malformed one is rejected BEFORE the account is created —
-// the accounts worker would refuse to store it, and by then the account exists and the
-// player would be left with an account whose email silently didn't save.
-it('refuses a signup whose email could not be stored', async () => {
-	const res = await SELF.fetch('https://example.com/api/signup', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ password: 'whatever', email: 'not-an-address', turnstileToken: 'x' }),
-	})
-	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'That email address looks wrong.' })
 })
 
 it('refuses a signup with no password', async () => {
@@ -204,66 +218,9 @@ it('carries the browser IP across to auth instead of losing it to the edge', asy
 
 	// A call with no IP to forward must not invent one: an absent header leaves auth's
 	// own `clientIp` empty, which SKIPS the cap, rather than counting everyone together.
-	await postAuthForm(withAuth(capture), '/account/me/changepassword', {}, { bearer: 'tok' })
+	// Reachable in local dev, where the edge sets no `cf-connecting-ip` to pass on.
+	await postAuthForm(withAuth(capture), '/connect/token', { grant_type: 'create_account' })
 	expect(seen[1]!.headers.get('cf-connecting-ip')).toBeNull()
-	expect(seen[1]!.headers.get('authorization')).toBe('Bearer tok')
-})
-
-it('requires credentials to log in', async () => {
-	const res = await SELF.fetch('https://example.com/api/login', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ username: 'alice' }),
-	})
-	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'Username and password are required.' })
-})
-
-it('rejects an unauthenticated username change', async () => {
-	const res = await SELF.fetch('https://example.com/api/username', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ username: 'newname' }),
-	})
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
-})
-
-// The accounts worker answers a refused username change at HTTP 200, in its own
-// `{ success, error, value }` envelope — so an empty name reaching it would come back
-// looking like a success to a browser that keys off the status. Rejected here instead,
-// before the upstream call, and in the `{ error }` + 4xx shape every other endpoint uses.
-it('refuses a username change with no username', async () => {
-	const res = await SELF.fetch('https://example.com/api/username', {
-		method: 'POST',
-		// Any cookie value gets past the session check — www holds no signing key and
-		// only forwards the token, so this stops at the empty-name check without ever
-		// reaching accounts.
-		headers: { 'content-type': 'application/json', cookie: 'rf_token=stub' },
-		body: JSON.stringify({ username: '   ' }),
-	})
-	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'A username is required.' })
-})
-
-it('rejects an unauthenticated maintenance broadcast', async () => {
-	const res = await SELF.fetch('https://example.com/api/maintenance', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ startsInMinutes: 15 }),
-	})
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
-})
-
-it('rejects an unauthenticated coach message', async () => {
-	const res = await SELF.fetch('https://example.com/api/coach-message', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ messageContent: 'hello all' }),
-	})
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
 })
 
 it('serves the aggregated docs page with a source per documented service', async () => {

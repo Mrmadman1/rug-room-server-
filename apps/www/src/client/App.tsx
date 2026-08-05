@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { NotificationType } from '../../../notify/src/notification-types'
+import { authFailure, authUnreachable } from '../auth-messages'
 import {
 	DISCORD_INVITE,
 	DOWNLOAD_URL,
@@ -10,7 +12,37 @@ import {
 
 import type { ReactNode } from 'react'
 
-/** The self-account shape returned by the www BFF (`/api/me`, `/api/login`, …). */
+/**
+ * The SPA calls the SAME endpoints the game does — `auth` for tokens and the password
+ * change, `accounts` for the profile, `api` for the photo feed, `notify` for the admin
+ * broadcasts — rather than proxying each one through `www`, exactly as rec.net's own
+ * site did. Those workers answer CORS for it (see their `withDefaultCors()`), and the
+ * access token lives here in the browser.
+ *
+ * `www` serves only two things of its own (see www.app.ts): the config below, and
+ * signup, which is Turnstile-gated and so cannot leave the server.
+ */
+
+/** Where each worker lives. From `/api/config`, never baked into this build. */
+interface Hosts {
+	auth: string
+	accounts: string
+	api: string
+	img: string
+	notify: string
+}
+
+/**
+ * Site config from `www`. `signupEnabled` is false when the operator has no Turnstile
+ * keypair configured — web signup runs behind that bot check, so without it the endpoint
+ * is closed and the UI must not offer the form.
+ */
+interface SiteConfig {
+	signupEnabled: boolean
+	turnstileSiteKey: string | null
+}
+
+/** The private self DTO from `accounts` (`GET /account/me`). */
 interface SelfAccount {
 	accountId: number
 	username: string
@@ -22,56 +54,238 @@ interface SelfAccount {
 	 * stays usable and lets the server be the one to refuse.
 	 */
 	availableUsernameChanges?: number
-	/** Whether this session may use admin controls (from the token's role claim). */
-	isAdmin?: boolean
 }
 
 /**
- * Site config from the BFF (`/api/config`). `signupEnabled` is false when the operator
- * has no Turnstile keypair configured — web signup runs behind that bot check, so
- * without it the endpoint is closed and the UI must not offer the form.
+ * RecNet (4) is the web platform, stamped as the token's `platform` claim on sign-in.
+ * NOT passed on signup: create_account treats an asserted platform as one to verify
+ * against Steam and rejects RecNet — the web signup is the (platform-less) password
+ * account path.
  */
-interface SiteConfig {
-	signupEnabled: boolean
-	turnstileSiteKey: string | null
+const WEB_PLATFORM = '4'
+
+/**
+ * The session's access token, in localStorage so a reload stays signed in.
+ *
+ * Readable by page JS, which the httpOnly cookie this replaced was not — that is the
+ * tradeoff that comes with the browser calling the workers itself, and it's the same
+ * posture the game client has. Nothing third-party runs on this origin except the
+ * Turnstile widget, which is Cloudflare's own.
+ */
+const TOKEN_KEY = 'rf_token'
+let token: string | null = localStorage.getItem(TOKEN_KEY)
+
+function setToken(next: string | null) {
+	token = next
+	if (next === null) localStorage.removeItem(TOKEN_KEY)
+	else localStorage.setItem(TOKEN_KEY, next)
+}
+
+/**
+ * Filled in once `/api/config` lands, before any worker call is made — a module value
+ * rather than a prop threaded through every form, since the components that call a
+ * worker only render after the config resolves.
+ */
+let hosts: Hosts | null = null
+
+/** The hostnames, once known. Throws rather than guessing a domain. */
+function where(): Hosts {
+	if (hosts === null) throw new Error('Still starting up — please reload the page.')
+	return hosts
+}
+
+/**
+ * Roles that unlock the admin controls. Mirrors the notify worker's `ADMIN_ROLES` gate —
+ * this only decides whether to SHOW them; notify verifies the token on every call.
+ */
+const ADMIN_ROLES = new Set(['developer', 'moderator'])
+
+/**
+ * Whether the session token carries an admin role. Decodes the `role` claim WITHOUT
+ * verifying it — a page holds no signing key, and faking one here only reveals buttons
+ * whose endpoints reject the same token. A malformed token reads as "not admin".
+ */
+function isAdmin(): boolean {
+	const payload = token?.split('.')[1]
+	if (!payload) return false
+	try {
+		const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+		const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=')
+		const claims = JSON.parse(atob(padded)) as { role?: unknown }
+		return Array.isArray(claims.role) && claims.role.some((r) => ADMIN_ROLES.has(r as string))
+	} catch {
+		return false
+	}
 }
 
 /**
  * An OAuth machine code (`invalid_grant`, `server_error`) rather than a sentence — a
- * lower_snake_case word with no spaces. Bodies relayed from a worker that speaks OAuth
- * put one of these in `error`, where the readable reason is in `error_description`.
+ * lower_snake_case word with no spaces. A worker that speaks OAuth puts one of these in
+ * `error`, where the readable reason is in `error_description`.
  */
 const isErrorCode = (s: string) => /^[a-z][a-z\d]*(_[a-z\d]+)+$/.test(s)
 
 /**
- * Call a www BFF endpoint. GET when no body is given, else POST JSON. Throws with
- * the upstream error message (auth uses `error`/`error_description`, the account
- * mutations use `error`) so callers can surface it.
- *
- * `error` wins, since that's where www puts the message it wrote for the player — but
- * NOT when it's a bare OAuth code: showing "invalid_grant" tells nobody anything, so a
- * relayed OAuth body falls through to its description. www translates the signup/login
- * grants itself (see `readAuthError`); this covers the endpoints that still relay.
+ * The message worth showing for a refusal. `error` wins, since that's where a worker
+ * puts a sentence it wrote for the player — but NOT when it's a bare OAuth code, which
+ * tells nobody anything. Some refusals carry no body at all (accounts answers a
+ * malformed email with an empty 400), hence the last-resort line.
  */
-async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
-	const res = await fetch(path, {
-		method: body === undefined ? 'GET' : 'POST',
-		headers: body === undefined ? undefined : { 'content-type': 'application/json' },
-		body: body === undefined ? undefined : JSON.stringify(body),
+function errorMessage(data: Record<string, unknown>, status: number): string {
+	const error = typeof data.error === 'string' ? data.error : ''
+	const description = typeof data.error_description === 'string' ? data.error_description : ''
+	return (
+		(error && !(isErrorCode(error) && description) && error) ||
+		description ||
+		error ||
+		`Request failed (${status})`
+	)
+}
+
+interface CallOptions {
+	method?: 'GET' | 'POST' | 'PUT'
+	/** Form fields — auth and accounts read their input with Hono's `parseBody()`. */
+	form?: Record<string, string>
+	/** A JSON body — what notify's internal endpoints take instead. */
+	json?: unknown
+	/** Send the session token. */
+	authed?: boolean
+}
+
+/** Call a worker. Returns the parsed body, or throws with something worth showing. */
+async function call<T = Record<string, unknown>>(url: string, opts: CallOptions = {}): Promise<T> {
+	const headers: Record<string, string> = {}
+	if (opts.authed && token) headers.authorization = `Bearer ${token}`
+	let body: string | undefined
+	if (opts.form) {
+		headers['content-type'] = 'application/x-www-form-urlencoded'
+		body = new URLSearchParams(opts.form).toString()
+	} else if (opts.json !== undefined) {
+		headers['content-type'] = 'application/json'
+		body = JSON.stringify(opts.json)
+	}
+
+	const res = await fetch(url, {
+		method: opts.method ?? (body === undefined ? 'GET' : 'POST'),
+		headers,
+		body,
 	})
 	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+
 	if (!res.ok) {
-		const error = typeof data.error === 'string' ? data.error : ''
-		const description = typeof data.error_description === 'string' ? data.error_description : ''
-		const message =
-			(error && !(isErrorCode(error) && description) && error) ||
-			description ||
-			error ||
-			`Request failed (${res.status})`
-		throw new Error(message)
+		// Expired or revoked. Cleared here so no caller has to remember to.
+		if (res.status === 401 && opts.authed) {
+			setToken(null)
+			throw new Error('Your session has expired. Please sign in again.')
+		}
+		throw new Error(errorMessage(data, res.status))
 	}
 	return data as T
 }
+
+/** The signed-in account, straight from `accounts`. */
+const fetchMe = (): Promise<SelfAccount> =>
+	call<SelfAccount>(`${where().accounts}/account/me`, { authed: true })
+
+/**
+ * Sign in with auth's password grant, posted directly the way the game posts it. The
+ * account is resolved by `username` (case-insensitive) — web players sign in with their
+ * username, not the numeric account id.
+ *
+ * A refusal is translated through the table shared with the worker (see
+ * `auth-messages.ts`): auth's `error` is always a machine code, and the reason in
+ * `error_description` is written for an operator, not a player.
+ */
+async function signIn(username: string, password: string): Promise<void> {
+	const res = await fetch(`${where().auth}/connect/token`, {
+		method: 'POST',
+		headers: { 'content-type': 'application/x-www-form-urlencoded' },
+		body: new URLSearchParams({
+			grant_type: 'password',
+			username,
+			platform: WEB_PLATFORM,
+			password,
+		}).toString(),
+	}).catch(() => null)
+	if (res === null) throw new Error(authUnreachable('login'))
+
+	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+	if (!res.ok) {
+		const code = typeof data.error === 'string' ? data.error : ''
+		const description = typeof data.error_description === 'string' ? data.error_description : ''
+		throw new Error(authFailure('login', res.status, code, description).message)
+	}
+	if (typeof data.access_token !== 'string') throw new Error(authUnreachable('login'))
+	setToken(data.access_token)
+}
+
+/**
+ * Create an account — the one flow that goes through `www`, because it's gated by
+ * Turnstile and that check needs a secret key a page can't hold. www hands back auth's
+ * token response unchanged, so the session is established just as sign-in establishes it.
+ */
+async function signUp(password: string, turnstileToken: string): Promise<void> {
+	const data = await call<{ access_token?: string }>('/api/signup', {
+		json: { password, turnstileToken },
+	})
+	if (typeof data.access_token !== 'string') throw new Error(authUnreachable('signup'))
+	setToken(data.access_token)
+}
+
+/**
+ * Change the username.
+ *
+ * `accounts` answers this one in its own envelope — `{ success, error, value }` at HTTP
+ * 200 even when it refused (taken name, no changes left) — so a 200 is not enough to
+ * call it done. The sentences it writes are already player-facing, so they're shown as-is.
+ *
+ * On success the SELF account is re-read rather than using the envelope's `value`: that
+ * is the PUBLIC DTO, and it carries no `availableUsernameChanges` — the very field this
+ * form needs to know whether another change is left.
+ */
+async function changeUsername(username: string): Promise<SelfAccount> {
+	const result = await call<{ error?: unknown }>(`${where().accounts}/account/me/username`, {
+		method: 'PUT',
+		form: { username },
+		authed: true,
+	})
+	const refusal = typeof result.error === 'string' ? result.error : ''
+	if (refusal !== '') throw new Error(refusal)
+	return fetchMe()
+}
+
+/** Set the account's email. `accounts` refuses an address with no `@` — with an empty
+ * 400 body, so the check is made here too rather than showing a bare status. */
+const saveEmail = (email: string): Promise<unknown> =>
+	call(`${where().accounts}/account/me/email`, { form: { email }, authed: true })
+
+/** Change the account's password. Lives on `auth`, not `accounts`. */
+const changePassword = (oldPassword: string, newPassword: string): Promise<unknown> =>
+	call(`${where().auth}/account/me/changepassword`, {
+		form: { oldPassword, newPassword },
+		authed: true,
+	})
+
+/**
+ * Admin-only broadcasts. The token goes to `notify`, which enforces the admin-role gate
+ * — so a session without the role is rejected there (403) even though the UI shows no
+ * button. The maintenance frame carries `Msg: { StartsInMinutes }`, matching the game
+ * client's ServerMaintenance handler.
+ */
+const broadcastMaintenance = (startsInMinutes: number): Promise<{ delivered?: number }> =>
+	call<{ delivered?: number }>(`${where().notify}/internal/broadcast`, {
+		json: {
+			notificationType: NotificationType.ServerMaintenance,
+			data: { StartsInMinutes: startsInMinutes },
+		},
+		authed: true,
+	})
+
+const coachMessageAll = (messageContent: string): Promise<{ sent?: number }> =>
+	call<{ sent?: number }>(`${where().notify}/internal/coach-message-all`, {
+		json: { messageContent },
+		authed: true,
+	})
 
 /** Minimal history-based router: current pathname + a navigate() that pushes state. */
 function useRouter() {
@@ -128,16 +342,31 @@ export function App() {
 	const { path, navigate } = useRouter()
 
 	useEffect(() => {
-		api<SelfAccount>('/api/me')
-			.then((me) => setAccount(me))
-			.catch(() => setAccount(null))
-		api<SiteConfig>('/api/config')
-			.then((c) => setConfig(c))
-			.catch(() => setConfig({ signupEnabled: false, turnstileSiteKey: null }))
+		// Config first, and everything else after it: it carries the hostnames every other
+		// call needs. A config that doesn't land leaves the page signed out with signup
+		// closed rather than guessing where the workers are.
+		call<SiteConfig & { hosts: Hosts }>('/api/config')
+			.then(async ({ hosts: resolved, ...site }) => {
+				hosts = resolved
+				setConfig(site)
+				if (token === null) return setAccount(null)
+				// A stored token that `accounts` rejects is stale — `call` has already dropped
+				// it, so this just falls back to signed-out rather than surfacing an error.
+				await fetchMe()
+					.then(setAccount)
+					.catch(() => setAccount(null))
+			})
+			.catch(() => {
+				setConfig({ signupEnabled: false, turnstileSiteKey: null })
+				setAccount(null)
+			})
 	}, [])
 
-	const logout = useCallback(async () => {
-		await api('/api/logout', {})
+	// Nothing to tell a server: the access token is a stateless JWT, so dropping it here
+	// IS the sign-out. (The refresh token auth issues alongside it is never stored, so a
+	// closed session leaves nothing behind to redeem.)
+	const logout = useCallback(() => {
+		setToken(null)
 		setAccount(null)
 		navigate('/')
 	}, [navigate])
@@ -239,16 +468,35 @@ interface Slide {
 	roomName: string | null
 }
 
-/** Loads the public photo feed once. `slides === null` means still in flight. */
-function useSlideshow() {
+/**
+ * Loads the public photo feed once. `slides === null` means still in flight.
+ *
+ * Waits for the config, since the feed is served by the `api` worker — the same public
+ * endpoint the game reads it from — and its hostname arrives with the config. Each entry
+ * names an image; the browsable URL for it is on the `img` worker.
+ */
+function useSlideshow(config: SiteConfig | undefined) {
 	const [slides, setSlides] = useState<Slide[] | null>(null)
 	const [error, setError] = useState('')
 
 	useEffect(() => {
-		api<{ images: Slide[] }>('/api/slideshow')
-			.then((d) => setSlides(d.images))
-			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
-	}, [])
+		if (config === undefined) return
+		type Feed = { Images?: Array<{ ImageName: string; Username: string; RoomName: string | null }> }
+		// Wrapped in an async call rather than started directly, because `where()` THROWS
+		// when the config didn't land — synchronously, which straight out of an effect
+		// would take the page down instead of leaving an empty stage behind the fold.
+		void (async () => {
+			const h = where()
+			const d = await call<Feed>(`${h.api}/api/images/v1/slideshow`)
+			setSlides(
+				(d.Images ?? []).map((i) => ({
+					url: `${h.img}/${i.ImageName}`,
+					username: i.Username,
+					roomName: i.RoomName,
+				}))
+			)
+		})().catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [config])
 
 	return { slides, error }
 }
@@ -267,7 +515,7 @@ function HomePage({
 	config: SiteConfig | undefined
 	navigate: Navigate
 }) {
-	const feed = useSlideshow()
+	const feed = useSlideshow(config)
 
 	// The signup offer only makes sense to a signed-out visitor when the server would
 	// actually take one. `account === undefined` is still-checking, so it shows nothing
@@ -694,7 +942,7 @@ function SignupForm({
 }) {
 	const [password, setPassword] = useState('')
 	const [email, setEmail] = useState('')
-	const { container, token, error: widgetError, reset } = useTurnstile(siteKey)
+	const { container, token: widgetToken, error: widgetError, reset } = useTurnstile(siteKey)
 	const { pending, error, run } = useAction()
 
 	return (
@@ -702,19 +950,41 @@ function SignupForm({
 			onSubmit={(e) => {
 				e.preventDefault()
 				void run(async () => {
+					// Checked before anything is created, because `accounts` rejects an address
+					// with no `@` and by then the account would exist: better to fail the form
+					// than to hand back an account whose email silently didn't save. Same rule
+					// accounts applies, deliberately no stricter — this is a contact address, not
+					// an identity, and nothing is sent to it to prove it.
+					const wanted = email.trim()
+					if (wanted !== '' && !wanted.includes('@')) {
+						throw new Error('That email address looks wrong.')
+					}
+
 					try {
-						const { account } = await api<{ account: SelfAccount }>('/api/signup', {
-							password,
-							email,
-							turnstileToken: token,
-						})
-						onAuthed(account)
-						return ''
+						await signUp(password, widgetToken)
 					} catch (err) {
-						// The token is spent either way, so re-arm the widget before they retry.
+						// The widget token is spent either way, so re-arm before they retry. Only
+						// a failed signup gets here — past this point the account exists, and a
+						// retry would spend another slot against auth's per-IP cap.
 						reset()
 						throw err
 					}
+
+					// Saved with the new session's own token: `create_account` takes no email,
+					// `accounts` owns the field. Deliberately not fatal — the account exists and
+					// the session is live, and the same field is one call away on the account
+					// page.
+					if (wanted !== '') await saveEmail(wanted).catch(() => {})
+
+					// The session is already stored, so a failure here isn't one they can act on
+					// by retrying: a reload finds them signed in.
+					const me = await fetchMe().catch(() => {
+						throw new Error(
+							'Your account was created, but loading it failed. Reload the page — you are already signed in.'
+						)
+					})
+					onAuthed(me)
+					return ''
 				})
 			}}
 		>
@@ -748,7 +1018,7 @@ function SignupForm({
 			<div className="turnstile" ref={container} />
 			{widgetError && <p className="error">{widgetError}</p>}
 			{error && <p className="error">{error}</p>}
-			<button type="submit" disabled={pending || token === ''}>
+			<button type="submit" disabled={pending || widgetToken === ''}>
 				{pending ? 'Creating…' : 'Create account'}
 			</button>
 		</form>
@@ -765,11 +1035,8 @@ function LoginForm({ onAuthed }: { onAuthed: (a: SelfAccount) => void }) {
 			onSubmit={(e) => {
 				e.preventDefault()
 				void run(async () => {
-					const { account } = await api<{ account: SelfAccount }>('/api/login', {
-						username,
-						password,
-					})
-					onAuthed(account)
+					await signIn(username, password)
+					onAuthed(await fetchMe())
 					return ''
 				})
 			}}
@@ -823,7 +1090,7 @@ function Dashboard({
 			render: () => <EmailForm account={account} onChange={onChange} />,
 		},
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
-		...(account.isAdmin
+		...(isAdmin()
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
 					{ id: 'coach', label: 'Broadcast message', render: () => <CoachMessageForm /> },
@@ -876,9 +1143,7 @@ function CoachMessageForm() {
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						const { sent } = await api<{ sent?: number }>('/api/coach-message', {
-							messageContent: message,
-						})
+						const { sent } = await coachMessageAll(message.trim())
 						setMessage('')
 						return `Sent to ${sent ?? 0} online player${sent === 1 ? '' : 's'}.`
 					})
@@ -919,9 +1184,10 @@ function MaintenanceForm() {
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						const { connections } = await api<{ connections?: number }>('/api/maintenance', {
-							startsInMinutes: Number(minutes),
-						})
+						// Coerced the way the worker used to: a blank or negative box means "now".
+						const asked = Number(minutes)
+						const startsIn = Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : 0
+						const { delivered: connections } = await broadcastMaintenance(startsIn)
 						return `Notified ${connections ?? 0} connected client${connections === 1 ? '' : 's'}.`
 					})
 				}}
@@ -984,7 +1250,7 @@ function UsernameForm({
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						const updated = await api<SelfAccount>('/api/username', { username })
+						const updated = await changeUsername(username.trim())
 						onChange(updated)
 						setUsername(updated.username)
 						return `You are now @${updated.username}.`
@@ -1036,7 +1302,7 @@ function EmailForm({
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						await api('/api/email', { email })
+						await saveEmail(email.trim())
 						onChange({ ...account, email })
 						return 'Email saved.'
 					})
@@ -1074,7 +1340,7 @@ function PasswordForm() {
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						await api('/api/password', { oldPassword, newPassword })
+						await changePassword(oldPassword, newPassword)
 						setOldPassword('')
 						setNewPassword('')
 						return 'Password changed.'

@@ -11,7 +11,7 @@ import {
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
-import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
+import { logger, withCleanSpec, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 import {
@@ -160,6 +160,14 @@ const app = new Hono<App>()
 				release: c.env.SENTRY_RELEASE,
 			})(c, next)
 	)
+
+	// The website (`www`) is a browser origin calling these endpoints directly, the way
+	// rec.net's own site called the game's API — so the responses need CORS headers or
+	// the browser discards them. `origin: '*'` is deliberate and safe HERE because these
+	// endpoints authenticate with a bearer token in the `Authorization` header, never a
+	// cookie: a hostile page can't read another origin's stored token, so there is no
+	// ambient credential for `*` to expose. Do not add cookie auth without narrowing it.
+	.use('*', withDefaultCors())
 
 	.onError(withOnError())
 	.notFound(withNotFound())
