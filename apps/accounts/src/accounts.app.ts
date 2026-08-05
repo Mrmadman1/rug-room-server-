@@ -8,6 +8,11 @@ import {
 	getAccount,
 	getAccountByUsername,
 	getAccountsByIds,
+	isValidBio,
+	isValidEmail,
+	MAX_DISPLAY_NAME_LENGTH,
+	MAX_USERNAME_LENGTH,
+	nameRejection,
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
@@ -422,7 +427,7 @@ const app = new Hono<App>()
 			requestBody: form(DisplayNameRequest, 'The new display name'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
-				400: { description: 'Empty display name (empty body)' },
+				400: { description: 'Empty, over 15 characters, or non-alphanumeric (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -431,6 +436,14 @@ const app = new Hono<App>()
 			if (id === null) return unauthorized(c)
 			const displayName = (await formField(c, 'displayName')).trim()
 			if (displayName === '') return c.body(null, 400)
+			// Held to the same shape as the username — it's the name other players actually
+			// see, so it can't be the place where spaces and punctuation get in. Refused with
+			// an empty 400 like the empty case above: this route answers a bare
+			// SuccessResponse, and giving it a body the client has never been sent is a
+			// bigger change than the rule is worth.
+			if (nameRejection(displayName, 'display name', MAX_DISPLAY_NAME_LENGTH) !== null) {
+				return c.body(null, 400)
+			}
 			const account = await updateAccount(c.env.DB, id, { displayName })
 			await pushAccountUpdate(c, account)
 			return c.json({ success: true })
@@ -446,9 +459,10 @@ const app = new Hono<App>()
 			tags: ['Profile'],
 			summary: 'Change username',
 			description: [
-				'Rejects a name taken by another account and requires a remaining change; on',
-				'success the name is persisted and the counter decremented. Always HTTP 200 —',
-				'failures carry a message in `error` (see the UsernameResult envelope).',
+				'Letters and digits only, at most 50 characters. Rejects a name taken by another',
+				'account and requires a remaining change; on success the name is persisted and',
+				'the counter decremented. Always HTTP 200 — failures carry a message in `error`',
+				'(see the UsernameResult envelope).',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(UsernameRequest, 'The desired username'),
@@ -463,6 +477,12 @@ const app = new Hono<App>()
 
 			const username = (await formField(c, 'username')).trim()
 			if (username === '') return usernameResult(c, 'You must enter a username.')
+
+			// Shape before availability: a rejected name shouldn't cost a D1 read, and it
+			// must never cost the account one of its rationed changes. The envelope carries
+			// the sentence straight to the player.
+			const rejection = nameRejection(username, 'username', MAX_USERNAME_LENGTH)
+			if (rejection !== null) return usernameResult(c, rejection)
 
 			// Duplicate check first (case-insensitive); keeping your own name is allowed.
 			const existing = await getAccountByUsername(c.env.DB, username)
@@ -497,7 +517,7 @@ const app = new Hono<App>()
 			requestBody: form(EmailRequest, 'The new email'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
-				400: { description: 'Email without an “@” (empty body)' },
+				400: { description: 'Not a valid address, or over 255 characters (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -505,7 +525,7 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			const email = (await formField(c, 'email')).trim()
-			if (!email.includes('@')) return c.body(null, 400)
+			if (!isValidEmail(email)) return c.body(null, 400)
 			await updateAccount(c.env.DB, id, { email })
 			return c.json({ success: true })
 		}
@@ -605,11 +625,12 @@ const app = new Hono<App>()
 		describeRoute({
 			tags: ['Profile'],
 			summary: 'Set bio',
-			description: 'Free text; empty is allowed. Persisted and broadcast.',
+			description: 'Free text up to 255 characters; empty is allowed. Persisted and broadcast.',
 			security: AUTHED,
 			requestBody: form(BioRequest, 'The new bio'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
+				400: { description: 'Bio over 255 characters (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -617,6 +638,9 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			const bio = await formField(c, 'bio')
+			// Length only — a bio is free text by design (see the route summary). Refused
+			// rather than truncated: silently storing half a sentence reads as data loss.
+			if (!isValidBio(bio)) return c.body(null, 400)
 			const account = await updateAccount(c.env.DB, id, { bio })
 			await pushAccountUpdate(c, account)
 			return c.json({ success: true })

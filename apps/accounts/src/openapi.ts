@@ -124,15 +124,21 @@ export const CreateAccountRequest = z.object({
 
 /** Single-string form bodies, one per profile mutation. */
 export const DisplayNameRequest = z.object({
-	displayName: z.string().describe('Trimmed; empty is rejected (400)'),
+	displayName: z
+		.string()
+		.describe('Trimmed; letters and digits only, max 15. Empty or invalid is rejected (400)'),
 })
 
 export const UsernameRequest = z.object({
-	username: z.string().describe('Trimmed; must be unique and changes must remain'),
+	username: z
+		.string()
+		.describe(
+			'Trimmed; letters and digits only, max 50. Must be unique and changes must remain'
+		),
 })
 
 export const EmailRequest = z.object({
-	email: z.string().describe('Must contain "@"; otherwise 400'),
+	email: z.string().describe('A deliverable-looking address, max 255; otherwise 400'),
 })
 
 export const PhoneRequest = z.object({
@@ -147,7 +153,9 @@ export const PronounsRequest = z.object({
 	pronounFlags: z.string().describe('Integer string bitmask; non-numeric is 400'),
 })
 
-export const BioRequest = z.object({ bio: z.string().describe('Free text; empty is allowed') })
+export const BioRequest = z.object({
+	bio: z.string().describe('Free text, max 255; empty is allowed'),
+})
 
 export const ProfileImageRequest = z.object({
 	imageName: z.string().describe('Avatar object key; empty is rejected (400)'),

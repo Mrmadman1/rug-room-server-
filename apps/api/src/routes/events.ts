@@ -14,6 +14,7 @@ import {
 	getEventsByIds,
 	getLiveEvents,
 	isEventResponseType,
+	eventInputRejection,
 	parseEventBody,
 	searchEvents,
 	setEventResponse,
@@ -327,6 +328,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			requestBody: jsonBody(PlayerEventRequest, 'The event to schedule'),
 			responses: {
 				200: json(PlayerEventResultDto, 'The created event'),
+				400: { description: 'Name over 64 or description over 512 characters (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -334,7 +336,13 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			const body = await c.req.json<unknown>().catch(() => ({}))
-			const event = await createEvent(c.env.DB, id, parseEventBody(body))
+			const input = parseEventBody(body)
+			// The one thing this route isn't lenient about. Everything else here defaults a
+			// missing or unusable field, but a name or description past the stored length
+			// can't be defaulted into something sensible — and truncating a player's event
+			// description silently is worse than refusing it.
+			if (eventInputRejection(input) !== null) return c.body(null, 400)
+			const event = await createEvent(c.env.DB, id, input)
 			await notifyEventCreated(c, event)
 			return c.json(toEventResult(event))
 		}
@@ -359,6 +367,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			requestBody: jsonBody(PlayerEventRequest, 'The fields to change'),
 			responses: {
 				200: json(PlayerEventResultDto, 'The updated event'),
+				400: { description: 'Name over 64 or description over 512 characters (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 				403: { description: 'Not the event’s creator (empty body)' },
 				404: { description: 'No such event (empty body)' },
@@ -373,7 +382,9 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			if (existing.CreatorPlayerId !== id) return c.body(null, 403)
 
 			const body = await c.req.json<unknown>().catch(() => ({}))
-			const updated = await updateEvent(c.env.DB, eventId, parseEventBody(body))
+			const input = parseEventBody(body)
+			if (eventInputRejection(input) !== null) return c.body(null, 400)
+			const updated = await updateEvent(c.env.DB, eventId, input)
 			// updateEvent only returns null when the row vanished, which the read above rules out.
 			return c.json(toEventResult(updated!))
 		}

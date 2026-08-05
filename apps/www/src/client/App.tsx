@@ -150,6 +150,12 @@ interface CallOptions {
 	json?: unknown
 	/** Send the session token. */
 	authed?: boolean
+	/**
+	 * What to say when the worker refuses with a 400 and NO body. Several accounts routes
+	 * do exactly that (email, display name, bio), so without this the player reads
+	 * "Request failed (400)" — the status, not the reason.
+	 */
+	refusal?: string
 }
 
 /** Call a worker. Returns the parsed body, or throws with something worth showing. */
@@ -177,6 +183,10 @@ async function call<T = Record<string, unknown>>(url: string, opts: CallOptions 
 		if (res.status === 401 && opts.authed) {
 			setToken(null)
 			throw new Error('Your session has expired. Please sign in again.')
+		}
+		// Only when the body really is empty — a worker that did send a reason keeps it.
+		if (opts.refusal !== undefined && res.status === 400 && Object.keys(data).length === 0) {
+			throw new Error(opts.refusal)
 		}
 		throw new Error(errorMessage(data, res.status))
 	}
@@ -254,10 +264,20 @@ async function changeUsername(username: string): Promise<SelfAccount> {
 	return fetchMe()
 }
 
-/** Set the account's email. `accounts` refuses an address with no `@` — with an empty
- * 400 body, so the check is made here too rather than showing a bare status. */
+/**
+ * Set the account's email.
+ *
+ * The address is NOT checked here first. `accounts` validates it with `isemail`, which
+ * can't come along into the browser (it reaches for node's `util`, which vite stubs with
+ * a throwing Proxy in dev) — and a second, looser copy of the rule would only disagree
+ * with the real one. The server decides; this just names the refusal it answers with.
+ */
 const saveEmail = (email: string): Promise<unknown> =>
-	call(`${where().accounts}/account/me/email`, { form: { email }, authed: true })
+	call(`${where().accounts}/account/me/email`, {
+		form: { email },
+		authed: true,
+		refusal: 'That email address looks wrong.',
+	})
 
 /** Change the account's password. Lives on `auth`, not `accounts`. */
 const changePassword = (oldPassword: string, newPassword: string): Promise<unknown> =>
@@ -950,15 +970,7 @@ function SignupForm({
 			onSubmit={(e) => {
 				e.preventDefault()
 				void run(async () => {
-					// Checked before anything is created, because `accounts` rejects an address
-					// with no `@` and by then the account would exist: better to fail the form
-					// than to hand back an account whose email silently didn't save. Same rule
-					// accounts applies, deliberately no stricter — this is a contact address, not
-					// an identity, and nothing is sent to it to prove it.
 					const wanted = email.trim()
-					if (wanted !== '' && !wanted.includes('@')) {
-						throw new Error('That email address looks wrong.')
-					}
 
 					try {
 						await signUp(password, widgetToken)

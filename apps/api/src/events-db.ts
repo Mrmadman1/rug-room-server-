@@ -17,6 +17,12 @@
  * relational table rather than a JSON blob.
  */
 
+import {
+	glyphLength,
+	MAX_EVENT_DESCRIPTION_LENGTH,
+	MAX_EVENT_NAME_LENGTH,
+} from '@repo/domain'
+
 /**
  * Schema DDL (mirror of migrations/0006_event.sql + 0007_event_attendee.sql, sans any
  * seed rows).
@@ -251,6 +257,30 @@ function asInt(value: unknown): number | undefined {
  * clear the value. Timestamps are normalized here, so an unparseable one is dropped
  * rather than stored.
  */
+/**
+ * Why a parsed event body can't be stored, or `null` when it's fine.
+ *
+ * Length only. An event name is a title, not an identifier — "Building a Better Room
+ * Using Trigonometry" is a real one — so the alphanumeric rule the account and room
+ * names carry would be wrong here. Absent fields are skipped: an update posts only what
+ * it changes, and create defaults a missing name rather than refusing it.
+ *
+ * The name is measured AFTER trimming, matching what create/update actually store.
+ */
+export function eventInputRejection(input: EventInput): string | null {
+	const name = input.name?.trim()
+	if (name !== undefined && glyphLength(name) > MAX_EVENT_NAME_LENGTH) {
+		return `Event names can be at most ${MAX_EVENT_NAME_LENGTH} characters.`
+	}
+	if (
+		input.description !== undefined &&
+		glyphLength(input.description) > MAX_EVENT_DESCRIPTION_LENGTH
+	) {
+		return `Event descriptions can be at most ${MAX_EVENT_DESCRIPTION_LENGTH} characters.`
+	}
+	return null
+}
+
 export function parseEventBody(body: unknown): EventInput {
 	const outer = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
 	const nested = outer.PlayerEvent

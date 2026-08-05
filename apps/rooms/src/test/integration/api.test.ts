@@ -2026,7 +2026,7 @@ describe('rooms endpoints', () => {
 	})
 
 	it('PUT /rooms/:id/subrooms/:sid/modify is auth-gated, owner-only, and persists subroom settings', async () => {
-		const fields = { name: 'My Cool Subroom', accessibility: '1', maxPlayers: '20' }
+		const fields = { name: 'MyCoolSubroom', accessibility: '1', maxPlayers: '20' }
 		// No token → 401 (auth gate).
 		expect((await putForm('/rooms/2/subrooms/2/modify', fields)).status).toBe(401)
 		// Not the owner (room 2 is owned by account 1) → NotOwner.
@@ -2056,7 +2056,7 @@ describe('rooms endpoints', () => {
 			Accessibility: number
 			MaxPlayers: number
 		}
-		expect(sub).toMatchObject({ Name: 'My Cool Subroom', Accessibility: 1, MaxPlayers: 20 })
+		expect(sub).toMatchObject({ Name: 'MyCoolSubroom', Accessibility: 1, MaxPlayers: 20 })
 	})
 
 	it('PUT /rooms/:id/subrooms/:sid/accessibility takes the enum name the client sends', async () => {
@@ -2499,10 +2499,10 @@ describe('rooms endpoints', () => {
 			await SELF.fetch(`${ORIGIN}/rooms/2/subrooms`, {
 				method: 'POST',
 				headers: { ...(await bearer('1')), 'Content-Type': 'application/x-www-form-urlencoded' },
-				body: new URLSearchParams({ name: 'to-delete' }).toString(),
+				body: new URLSearchParams({ name: 'ToDelete' }).toString(),
 			})
 		).json()) as { value: { SubRooms: SubRoom[] } }
-		const newId = created.value.SubRooms.find((s) => s.Name === 'to-delete')!.SubRoomId
+		const newId = created.value.SubRooms.find((s) => s.Name === 'ToDelete')!.SubRoomId
 
 		// No token → 401. Not the owner → success:false. Unknown subroom → success:false.
 		expect((await del(2, newId)).status).toBe(401)
@@ -2654,5 +2654,83 @@ describe('rooms endpoints', () => {
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
 		}
+	})
+})
+
+// Room and subroom names are held to the same rule as usernames — letters and digits,
+// at most 32 (see `nameRejection` in @repo/domain). All four routes that take a
+// player-supplied name enforce it, and each keeps its OWN refusal shape: the create
+// paths answer the lowercase `{ success, error, value }` envelope, the two settings
+// routes answer `{ Success, ErrorId, Error }` with the same `Rooms.InvalidName` id they
+// already used for an empty name. The client keys off those, so the rule had to fit the
+// existing shapes rather than introduce a fifth one.
+//
+// Names the SERVER generates are exempt on purpose — a dorm is `@<username>'s Dorm`,
+// which this rule would reject. That's why the check lives in the handlers.
+describe('room name validation', () => {
+	const bad = ['My Room', 'under_score', 'punct!', 'a'.repeat(33)]
+
+	const post = async (path: string, fields: Record<string, string>, sub: string) =>
+		SELF.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams(fields).toString(),
+		})
+
+	const put = async (path: string, fields: Record<string, string>, sub: string) =>
+		SELF.fetch(`${ORIGIN}${path}`, {
+			method: 'PUT',
+			headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams(fields).toString(),
+		})
+
+	it('refuses a bad name when a player clones a room into existence', async () => {
+		for (const name of bad) {
+			const res = await post('/rooms/2/clone', { name }, '1')
+			const body = (await res.json()) as { success: boolean; error: string; value: unknown }
+			expect(body.success, name).toBe(false)
+			expect(body.error).toMatch(/letters and numbers|at most 32 characters/)
+			expect(body.value).toBeNull()
+		}
+	})
+
+	it('refuses a bad name on rename, with the id the client already handles', async () => {
+		for (const name of bad) {
+			const res = await put('/rooms/2/name', { name }, '1')
+			const body = (await res.json()) as { Success: boolean; ErrorId: string; Error: string }
+			expect(body.Success, name).toBe(false)
+			expect(body.ErrorId).toBe('Rooms.InvalidName')
+			expect(body.Error).toMatch(/letters and numbers|at most 32 characters/)
+		}
+
+		// Unchanged: the refusals above never reached the write.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { Name: string }
+		expect(room.Name).not.toMatch(/[^A-Za-z0-9]/)
+	})
+
+	it('refuses a bad name when creating or modifying a subroom', async () => {
+		for (const name of bad) {
+			const created = await post('/rooms/2/subrooms', { name }, '1')
+			const env1 = (await created.json()) as { success: boolean; error: string }
+			expect(env1.success, name).toBe(false)
+			expect(env1.error).toMatch(/letters and numbers|at most 32 characters/)
+
+			const modified = await put(
+				'/rooms/2/subrooms/2/modify',
+				{ name, accessibility: '1', maxPlayers: '20' },
+				'1'
+			)
+			const res2 = (await modified.json()) as { Success: boolean; ErrorId: string }
+			expect(res2.Success, name).toBe(false)
+			expect(res2.ErrorId).toBe('Rooms.InvalidName')
+		}
+	})
+
+	it('accepts a 32-character alphanumeric name', async () => {
+		const name = 'a'.repeat(32)
+		const res = await post('/rooms/2/subrooms', { name }, '1')
+		const body = (await res.json()) as { success: boolean; value: { SubRooms: Array<{ Name: string }> } }
+		expect(body.success).toBe(true)
+		expect(body.value.SubRooms.some((s) => s.Name === name)).toBe(true)
 	})
 })

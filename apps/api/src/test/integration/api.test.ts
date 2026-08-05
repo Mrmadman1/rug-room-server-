@@ -2420,6 +2420,44 @@ describe('player events', () => {
 		expect(upcoming.StartTime).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
 	})
 
+	// The one thing the event writes are strict about. Everything else here defaults a
+	// missing or unusable field (a nameless event becomes "Untitled Event"), but a name or
+	// description past the stored length can't be defaulted into anything sensible, and
+	// truncating a player's description silently is worse than refusing the write.
+	//
+	// Deliberately length ONLY: an event name is a title, not an identifier — the fixture
+	// above is called "Building a Better Room Using Trigonometry" — so the alphanumeric
+	// rule that guards usernames and room names would be wrong here.
+	test('POST /api/playerevents/v2 caps the name at 64 and the description at 512', async () => {
+		expect((await post('/api/playerevents/v2', { Name: 'n'.repeat(65), RoomId: 3 })).status).toBe(
+			400
+		)
+		expect((await post('/api/playerevents/v2', { Name: 'n'.repeat(64), RoomId: 3 })).status).toBe(
+			200
+		)
+
+		const withDescription = (description: string) =>
+			post('/api/playerevents/v2', { Name: 'Described', RoomId: 3, Description: description })
+		expect((await withDescription('d'.repeat(513))).status).toBe(400)
+		expect((await withDescription('d'.repeat(512))).status).toBe(200)
+		// Counted in code points, so an emoji costs one character rather than two.
+		expect((await withDescription('🎉'.repeat(512))).status).toBe(200)
+
+		// Spaces and punctuation stay fine — this is a title, not an identifier.
+		expect(
+			(await post('/api/playerevents/v2', { Name: "Bob's Big Night (2)!", RoomId: 3 })).status
+		).toBe(200)
+
+		// The update path enforces the same limits, and a refusal leaves the event alone.
+		const event = await create({ Name: 'EditMe', RoomId: 3 })
+		const tooLong = await post(`/api/playerevents/v2/${event.PlayerEventId}`, {
+			Name: 'n'.repeat(65),
+		})
+		expect(tooLong.status).toBe(400)
+		const after = await get(`/api/playerevents/v1/${event.PlayerEventId}`)
+		expect(((await after.json()) as PlayerEvent).Name).toBe('EditMe')
+	})
+
 	test('POST /api/playerevents/v2 answers the write envelope, not the bare event', async () => {
 		const res = await post('/api/playerevents/v2', { Name: 'Enveloped', RoomId: 3 })
 		const body = (await res.json()) as PlayerEventResult

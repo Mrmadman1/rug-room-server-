@@ -31,7 +31,9 @@ import {
 	getSubRoomPermissions,
 	getSubRoomSaves,
 	getVisitedRooms,
+	MAX_ROOM_NAME_LENGTH,
 	modifySubRoom,
+	nameRejection,
 	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
@@ -1071,6 +1073,9 @@ const app = new Hono<App>()
 			const name = typeof raw === 'string' ? raw.trim() : ''
 
 			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your room.')
+			// Shape before availability, so a rejected name costs no D1 read.
+			const badName = nameRejection(name, 'room name', MAX_ROOM_NAME_LENGTH)
+			if (badName !== null) return roomEnvelope(c, null, badName)
 			if (await getRoomByName(c.env.DB, name)) {
 				return roomEnvelope(c, null, 'A room with that name already exists!')
 			}
@@ -1194,6 +1199,12 @@ const app = new Hono<App>()
 					ErrorId: 'Rooms.InvalidName',
 					Error: 'You must enter a name for your room!',
 				})
+			}
+			// Same ErrorId as the empty case — the client keys off it to mark the field, and
+			// both are the name being unusable. The sentence is what tells them which.
+			const badName = nameRejection(name, 'room name', MAX_ROOM_NAME_LENGTH)
+			if (badName !== null) {
+				return roomResult(c, { Success: false, ErrorId: 'Rooms.InvalidName', Error: badName })
 			}
 
 			// Reject if a different room already uses this name (case-insensitive).
@@ -2075,6 +2086,10 @@ const app = new Hono<App>()
 					Error: 'You must enter a name for your room!',
 				})
 			}
+			const badName = nameRejection(name, 'subroom name', MAX_ROOM_NAME_LENGTH)
+			if (badName !== null) {
+				return roomResult(c, { Success: false, ErrorId: 'Rooms.InvalidName', Error: badName })
+			}
 			const maxPlayers =
 				typeof body.maxPlayers === 'string' ? Number.parseInt(body.maxPlayers, 10) : Number.NaN
 
@@ -2383,6 +2398,8 @@ const app = new Hono<App>()
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const name = typeof body.name === 'string' ? body.name.trim() : ''
 			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
+			const badName = nameRejection(name, 'subroom name', MAX_ROOM_NAME_LENGTH)
+			if (badName !== null) return roomEnvelope(c, null, badName)
 
 			const result = await createSubRoom(c.env.DB, roomId, accountId, name)
 			if (!result) return roomEnvelope(c, null, 'This room does not exist!')
