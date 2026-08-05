@@ -893,6 +893,26 @@ describe('auth worker routes', () => {
 			expect(await getLinksForAccount(env.DB, 7103)).toEqual([])
 		})
 
+		test('a sideloaded APK (platform id 1) logs in but is never linked', async () => {
+			// The sideload placeholder identifies nobody — every sideloaded headset reports
+			// `1`, so a link on it would be a password-free way into this account from any of
+			// them. The password login still stands; Meta is never even asked, since there is
+			// nothing there to validate.
+			await seedPasswordAccount(7105, 'sideloader')
+			const login = await metaLogin(
+				`grant_type=password&username=sideloader&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=1` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true // even with Meta answering yes to everything
+			)
+			expect(login.status).toBe(200)
+			expect(login.graphCalls).toHaveLength(0)
+			expect(await getLinksForAccount(env.DB, 7105)).toEqual([])
+			// And so the picker never offers this account off the placeholder — only the
+			// canned stub entry is there.
+			expect((await cachedLogins(1, '1')).map((a) => a.accountId)).toEqual([1])
+		})
+
 		test('linking obeys the per-identity account cap, without failing the login', async () => {
 			// Otherwise the signup cap would be trivially bypassable: create accounts with a
 			// password, then link the capped identity into all of them.

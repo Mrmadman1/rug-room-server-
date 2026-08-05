@@ -4,7 +4,11 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import '../../econ.app'
 
-import { RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain'
+import {
+	getOwnedInventionIds,
+	INVENTORY_INVENTION_SCHEMA_DDL,
+	RECEIVED_GIFT_SCHEMA_DDL,
+} from '@repo/domain'
 
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
 // is built here too (see the same cross-worker import in econ.app.ts).
@@ -20,7 +24,6 @@ import {
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
-import { getOwnedInventionIds, INVENTORY_INVENTION_SCHEMA_DDL } from '../../inventory-invention-db'
 import { OUTFIT_SCHEMA_DDL } from '../../outfit-db'
 
 import type { Env } from '../../context'

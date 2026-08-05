@@ -2,7 +2,14 @@ import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { consumeGift, createGift, getGift, getPendingGifts } from '@repo/domain'
+import {
+	consumeGift,
+	createGift,
+	getGift,
+	getPendingGifts,
+	grantInvention,
+	ownsInvention,
+} from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
@@ -35,7 +42,6 @@ import {
 } from './consumables-db'
 import { getEquipment, grantEquipment, setEquipmentFavorited } from './equipment-db'
 import { getInventory, grantItem } from './inventory-db'
-import { grantInvention, ownsInvention } from './inventory-invention-db'
 import {
 	AUTHED,
 	AvatarV2Dto,

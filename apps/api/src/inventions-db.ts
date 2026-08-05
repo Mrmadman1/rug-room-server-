@@ -12,7 +12,12 @@
  * The stored/returned DTO mirrors Rec Room's `RRInvention` (PascalCase), including
  * the nested `CurrentVersion` that carries the blob name and per-version costs —
  * shaped after a real `GET /api/inventions/v1?inventionId=…` response.
+ *
+ * Who OWNS an invention is a separate table (`inventory_invention`, written by the
+ * `econ` worker at purchase time); this module only reads it, to fold bought inventions
+ * into the caller's own list. See @repo/domain's inventory-invention-db.ts.
  */
+import { getOwnedInventionIds } from '@repo/domain'
 
 /**
  * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql,
@@ -263,6 +268,32 @@ export async function getInventionsByCreator(
 	return results
 		.map((r) => JSON.parse(r.data) as SavedInvention)
 		.sort((a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId)
+}
+
+/**
+ * The player's "my inventions" shelf (`v2/mine`): everything they created, plus
+ * everything they BOUGHT. Ownership of a bought invention lives in the
+ * `inventory_invention` table the `econ` worker writes at purchase time — a creator is
+ * never listed there (they own theirs through `CreatorPlayerId`), so the two sets are
+ * disjoint in practice and merged by id anyway.
+ *
+ * Bought inventions are returned whatever their state: unpublished or hidden since the
+ * purchase, they are still on the shelf of the player who paid for them. An owned id
+ * with no invention row left (deleted) simply drops out. Newest first, like the other
+ * invention lists; not paginated.
+ */
+export async function getMyInventions(db: D1Database, playerId: number): Promise<SavedInvention[]> {
+	const [created, ownedIds] = await Promise.all([
+		getInventionsByCreator(db, playerId),
+		getOwnedInventionIds(db, playerId),
+	])
+	const bought = await getInventionsByIds(db, ownedIds)
+
+	const byId = new Map<number, SavedInvention>()
+	for (const invention of [...created, ...bought]) byId.set(invention.InventionId, invention)
+	return [...byId.values()].sort(
+		(a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId
+	)
 }
 
 /**

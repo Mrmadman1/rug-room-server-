@@ -6,12 +6,12 @@ import {
 	createInvention,
 	getFeaturedInventions,
 	getInventionById,
-	getInventionsByCreator,
 	getInventionsByIds,
 	getInventionsByRoom,
 	getInventionTagFilters,
 	getInventionTags,
 	getInventionVersion,
+	getMyInventions,
 	getTopInventions,
 	parsePermissionLevel,
 	publishInvention,
@@ -648,16 +648,20 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The signed-in player's saved inventions ("my inventions"), newest first.
-	// Auth-gated; returns a bare array (empty when the player has saved none).
+	// The signed-in player's invention shelf ("my inventions"), newest first — the ones
+	// they created AND the ones they bought (`inventory_invention`, written by the `econ`
+	// worker's buyInvention). A bought invention stays on the shelf whatever happens to it
+	// afterwards: unpublished or hidden since, the buyer paid for it.
+	// Auth-gated; returns a bare array (empty when the player has neither).
 	.get(
 		'/api/inventions/v2/mine',
 		describeRoute({
 			tags: ['Inventions'],
 			summary: 'The caller’s own inventions',
 			description:
-				'“My inventions”, newest first — including unpublished ones, which nobody else can ' +
-				'see. Not paginated.',
+				'“My inventions”, newest first — the ones the caller created plus the ones they ' +
+				'bought. Includes unpublished ones, which nobody else can see, and keeps a bought ' +
+				'invention listed even if it has since been unpublished or hidden. Not paginated.',
 			security: AUTHED,
 			responses: {
 				200: json(InventionDto.array(), 'The caller’s inventions'),
@@ -667,7 +671,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(await getInventionsByCreator(c.env.DB, id))
+			return c.json(await getMyInventions(c.env.DB, id))
 		}
 	)
 

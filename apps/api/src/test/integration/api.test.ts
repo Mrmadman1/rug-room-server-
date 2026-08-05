@@ -4,6 +4,8 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import {
 	GAME_VERSION,
+	grantInvention,
+	INVENTORY_INVENTION_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -90,6 +92,9 @@ beforeAll(async () => {
 
 	// Inventions table (owned by the api worker) — invention save/mine use it.
 	for (const stmt of INVENTIONS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Bought-invention ownership (owned by the econ worker) — `v2/mine` folds it in.
+	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Reports table (owned by the api worker) — player reports are recorded here.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -451,6 +456,49 @@ describe('public endpoints', () => {
 		)
 		expect(one.status).toBe(200)
 		expect((await one.json()) as SavedInvention).toMatchObject({ InventionId: saved.InventionId })
+	})
+
+	test('GET /api/inventions/v2/mine lists bought inventions alongside the caller’s own', async () => {
+		// Account 6100 creates one; 6101 buys it (the econ worker's buyInvention writes
+		// exactly this row) and also creates one of their own.
+		const save = async (sub: string, name: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, inventionDataFilename: `${name}.inv` }),
+			})
+			expect(res.status).toBe(200)
+			return ((await res.json()) as InventionSaveResult).Invention
+		}
+		const mine = async (sub: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+				headers: await bearer(sub),
+			})
+			expect(res.status).toBe(200)
+			return (await res.json()) as SavedInvention[]
+		}
+
+		const bought = await save('6100', 'bought-invention')
+		const own = await save('6101', 'own-invention')
+		await grantInvention(env.DB, 6101, bought.InventionId)
+
+		// Newest first, whichever set it came from: 6101 saved theirs after buying.
+		const list = await mine('6101')
+		expect(list.map((i) => i.InventionId)).toEqual([own.InventionId, bought.InventionId])
+		// A bought invention is still the creator's — it is listed, not re-attributed.
+		expect(list.find((i) => i.InventionId === bought.InventionId)?.CreatorPlayerId).toBe(6100)
+		// It is unpublished (a fresh save is), and stays on the buyer's shelf regardless.
+		expect(list.find((i) => i.InventionId === bought.InventionId)?.IsPublished).toBe(false)
+
+		// The seller's own list is unaffected by the sale.
+		expect((await mine('6100')).map((i) => i.InventionId)).toEqual([bought.InventionId])
+
+		// An ownership row pointing at an invention that no longer exists just drops out.
+		await grantInvention(env.DB, 6101, 999_888)
+		expect((await mine('6101')).map((i) => i.InventionId)).toEqual([
+			own.InventionId,
+			bought.InventionId,
+		])
 	})
 
 	test('POST /api/inventions/v6/save 401s without a bearer token', async () => {

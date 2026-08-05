@@ -1,7 +1,7 @@
 /**
  * Owned inventions on the shared `recflare` D1 database — the inventions a player has
- * bought. One row per (account, invention), written at purchase time by
- * `GET /api/storefronts/v2/buyInvention`.
+ * bought. One row per (account, invention), written at purchase time by the `econ`
+ * worker's `GET /api/storefronts/v2/buyInvention`.
  *
  * Only the invention id is stored: the invention record itself lives in the `invention`
  * table, whose schema the `api` worker owns (apps/api/migrations/0002_invention.sql) on
@@ -9,8 +9,10 @@
  * creator is not listed here either — they own their invention through its
  * `CreatorPlayerId`, and the buy path refuses to sell an invention to its own creator.
  *
- * This worker (`econ`) owns the table and its migration — see apps/econ/migrations/
- * 0008_inventory_invention.sql.
+ * The `econ` worker owns the schema/migration (apps/econ/migrations/
+ * 0008_inventory_invention.sql) and is the only writer; `api` only reads, to fold bought
+ * inventions into `GET /api/inventions/v2/mine`. Both import these helpers so the table
+ * name and row shape live in one place — the same split as gifts-db.ts.
  */
 
 /** Schema DDL (mirror of migrations 0008_inventory_invention.sql) — also builds the table in tests. */
