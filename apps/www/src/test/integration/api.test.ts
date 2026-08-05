@@ -4,6 +4,7 @@ import { beforeAll, expect, it } from 'vitest'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
 import { turnstileKeys } from '../../turnstile'
+import { readAuthError } from '../../upstream'
 
 import type { Env } from '../../context'
 
@@ -108,6 +109,58 @@ it('refuses a signup with no password', async () => {
 	})
 	expect(res.status).toBe(400)
 	expect(await res.json()).toEqual({ error: 'A password is required.' })
+})
+
+// A refused grant reaches the form as a sentence, never as the OAuth code. auth answers
+// `{ error: 'invalid_grant', error_description: <the actual reason> }`, and www used to
+// relay that untouched — so every failed signup, including one the player could act on
+// (the per-network cap), read simply "invalid_grant". Checked directly because the pass
+// path can't be reached from here (it would call the real auth worker).
+it('explains a refused signup instead of relaying invalid_grant', async () => {
+	const refused = (description: string, status = 400) =>
+		new Response(JSON.stringify({ error: 'invalid_grant', error_description: description }), {
+			status,
+			headers: { 'content-type': 'application/json' },
+		})
+
+	const capped = await readAuthError(
+		refused('too many accounts created from this network'),
+		'signup'
+	)
+	expect(capped.status).toBe(400)
+	expect(capped.message).toContain('Too many accounts have already been created from your network')
+	// The raw pair still reaches the operator's log line.
+	expect(capped.upstream).toBe('invalid_grant: too many accounts created from this network')
+
+	const badPassword = await readAuthError(refused('invalid account_id or password'), 'login')
+	expect(badPassword.message).toBe('That username or password is incorrect.')
+
+	// A description auth grew since this table was written must not leak through as-is:
+	// it's written for an operator, so an unmapped one falls back to the generic sentence.
+	const unmapped = await readAuthError(refused('some new internal reason'), 'signup')
+	expect(unmapped.message).not.toContain('some new internal reason')
+	expect(unmapped.message).toContain('could not be created')
+
+	// Nothing about the form was wrong — auth couldn't proceed (an unset JWT_SECRET). Don't
+	// send them back to re-check their details, and don't answer 400 for our own fault.
+	const broken = await readAuthError(
+		new Response(
+			JSON.stringify({
+				error: 'server_error',
+				error_description: 'token signing is not configured',
+			}),
+			{ status: 500, headers: { 'content-type': 'application/json' } }
+		),
+		'signup'
+	)
+	expect(broken.status).toBe(502)
+	expect(broken.message).toContain('problem on our end')
+
+	// A body from something in front of auth (an edge error page) is not JSON at all.
+	const html = await readAuthError(new Response('<html>502</html>', { status: 502 }), 'signup')
+	expect(html.status).toBe(502)
+	expect(html.message).toContain('problem on our end')
+	expect(html.upstream).toBe('HTTP 502')
 })
 
 it('requires credentials to log in', async () => {

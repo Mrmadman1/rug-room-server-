@@ -34,3 +34,90 @@ export async function postForm(
 		body: new URLSearchParams(fields).toString(),
 	})
 }
+
+/** Which grant www was making, so a shared refusal reads right on either form. */
+export type AuthAction = 'signup' | 'login'
+
+/** A rejected `/connect/token` grant, translated for the browser. */
+export interface AuthFailure {
+	/** The sentence to put in front of the player. */
+	message: string
+	/** 400 when the grant was refused, 502 when `auth` itself couldn't proceed. */
+	status: 400 | 502
+	/** The raw `error`/`error_description` pair, for the operator's log line only. */
+	upstream: string
+}
+
+/**
+ * What each of auth's `error_description`s means to somebody filling in a form.
+ *
+ * Keyed on the exact string auth sends (see its `/connect/token` handler). Only a few
+ * are reachable from the web — signup posts `create_account` with no platform, login
+ * posts `password` with no `platform_auth` — but the platform arms are mapped anyway so
+ * a future web flow that does assert one can't regress to a bare code.
+ */
+const AUTH_MESSAGES: Record<string, string> = {
+	'too many accounts created from this network':
+		'Too many accounts have already been created from your network. Try again later, or from a different connection.',
+	'account limit reached for this platform account':
+		'This platform account has already created as many accounts as it is allowed.',
+	'invalid account_id or password': 'That username or password is incorrect.',
+	'account_id or username is required': 'Username and password are required.',
+	'invalid or missing platform_auth': 'Your platform sign-in could not be verified.',
+	'unsupported platform; only Steam and Meta can be verified':
+		'That platform cannot be verified — only Steam and Meta are supported.',
+	'no linked account for this platform identity':
+		'No account is linked to this platform sign-in yet. Sign in with your password once to link it.',
+	'refresh_token is invalid or expired': 'Your session has expired. Please sign in again.',
+}
+
+/** Fallbacks when nothing above matched, so a player never reads an OAuth code. */
+const GENERIC_MESSAGES: Record<AuthAction, { rejected: string; broken: string }> = {
+	signup: {
+		rejected: 'Your account could not be created. Please check your details and try again.',
+		broken:
+			'Accounts cannot be created right now. This is a problem on our end — please try again later.',
+	},
+	login: {
+		rejected: 'You could not be signed in. Please check your details and try again.',
+		broken:
+			'Sign-in is unavailable right now. This is a problem on our end — please try again later.',
+	},
+}
+
+/** Message for an `auth` that couldn't be reached at all (the fetch itself threw). */
+export const authUnreachable = (action: AuthAction): string => GENERIC_MESSAGES[action].broken
+
+/**
+ * Read a failed `auth` `/connect/token` response into something worth showing.
+ *
+ * auth answers the OAuth shape — `{ error: 'invalid_grant', error_description: … }` —
+ * where `error` is one of three machine codes and the DESCRIPTION carries the actual
+ * reason. Relaying that body verbatim put "invalid_grant" on screen for every failure,
+ * including the ones a player can act on (the per-network signup cap), so the
+ * description is matched to a sentence here instead. An unrecognised body — or a
+ * non-JSON one from something in front of auth — falls back to the generic line for
+ * the action rather than leaking whatever it did say.
+ */
+export async function readAuthError(res: Response, action: AuthAction): Promise<AuthFailure> {
+	const parsed = (await res.json().catch(() => null)) as {
+		error?: unknown
+		error_description?: unknown
+	} | null
+	const body = parsed ?? {}
+	const code = typeof body.error === 'string' ? body.error : ''
+	const description = typeof body.error_description === 'string' ? body.error_description : ''
+
+	// A 5xx (or a `server_error`) is an operator misconfiguration — an unset JWT_SECRET,
+	// an unset META_APP_SECRET — not something the player got wrong. Don't send them back
+	// to re-check a form that was fine; the real reason is in auth's log, not theirs.
+	const broken = res.status >= 500 || code === 'server_error'
+	const generic = GENERIC_MESSAGES[action]
+
+	return {
+		message:
+			(!broken && AUTH_MESSAGES[description]) || (broken ? generic.broken : generic.rejected),
+		status: broken ? 502 : 400,
+		upstream: description ? `${code || 'unknown'}: ${description}` : code || `HTTP ${res.status}`,
+	}
+}

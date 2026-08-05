@@ -8,11 +8,21 @@ import { NotificationType } from '../../notify/src/notification-types'
 import { docsPage, fetchSpec } from './docs'
 import { privacyPage } from './privacy'
 import { turnstileKeys, verifyTurnstile } from './turnstile'
-import { accountsBase, apiBase, authBase, imgBase, notifyBase, postForm } from './upstream'
+import {
+	accountsBase,
+	apiBase,
+	authBase,
+	authUnreachable,
+	imgBase,
+	notifyBase,
+	postForm,
+	readAuthError,
+} from './upstream'
 
 import type { Context } from 'hono'
 import type { CookieOptions } from 'hono/utils/cookie'
 import type { App } from './context'
+import type { AuthAction } from './upstream'
 
 /**
  * www — the first frontend worker. It serves the React SPA (create account, set
@@ -92,13 +102,32 @@ async function relay(c: Context<App>, res: Response) {
  * `email`, when given, is saved onto the new account before that fetch, so the account
  * comes back already carrying it. `create_account` takes no email — the accounts worker
  * owns that field — which is why this is a second call rather than another grant field.
+ *
+ * A refused grant is translated (see `readAuthError`) rather than relayed: auth answers
+ * the OAuth shape, whose `error` is always a code like `invalid_grant`, and that code is
+ * what the form used to show for every failure — including the per-network signup cap,
+ * which the player could otherwise understand. The raw pair is logged for the operator.
  */
-async function establishSession(c: Context<App>, tokenResponse: Response, email?: string) {
-	if (!tokenResponse.ok) return relay(c, tokenResponse)
+async function establishSession(
+	c: Context<App>,
+	action: AuthAction,
+	tokenResponse: Response,
+	email?: string
+) {
+	if (!tokenResponse.ok) {
+		const failure = await readAuthError(tokenResponse, action)
+		logger.info('auth refused a token grant', {
+			action,
+			status: tokenResponse.status,
+			upstream: failure.upstream,
+		})
+		return c.json({ error: failure.message }, failure.status)
+	}
 
 	const token = (await tokenResponse.json()) as { access_token?: string; expires_in?: number }
 	if (!token.access_token) {
-		return c.json({ error: 'auth did not return an access token' }, 502)
+		logger.error('auth answered a token grant with no access_token', { action })
+		return c.json({ error: authUnreachable(action) }, 502)
 	}
 
 	setCookie(
@@ -130,7 +159,21 @@ async function establishSession(c: Context<App>, tokenResponse: Response, email?
 	const me = await fetch(`${accountsBase(c.env)}/account/me`, {
 		headers: { authorization: `Bearer ${token.access_token}` },
 	})
-	if (!me.ok) return c.json({ error: 'failed to load account after auth' }, 502)
+	// The session cookie is already set, so this is the one failure where telling them to
+	// retry would be wrong: on signup the account exists (and a second attempt spends
+	// another slot against auth's per-IP cap), and either way a reload finds them signed in.
+	if (!me.ok) {
+		logger.error('failed to load the account after a token grant', { action, status: me.status })
+		return c.json(
+			{
+				error:
+					action === 'signup'
+						? 'Your account was created, but loading it failed. Reload the page — you are already signed in.'
+						: 'You are signed in, but loading your account failed. Please reload the page.',
+			},
+			502
+		)
+	}
 	const account = (await me.json()) as Record<string, unknown>
 	return c.json({ account: { ...account, isAdmin: isAdminToken(token.access_token) } })
 }
@@ -201,11 +244,19 @@ const app = new Hono<App>()
 		// A token is single-use, so the client resets its widget before letting them retry.
 		if (!verified) return c.json({ error: 'Bot check failed. Please try again.' }, 403)
 
+		// A throw here is auth being unreachable, not a rejected signup — answered as such
+		// rather than falling through to the generic 500 handler, whose "internal server
+		// error" tells the player nothing about whether they now have an account (they don't:
+		// nothing was created).
 		const res = await postForm(`${authBase(c.env)}/connect/token`, {
 			grant_type: 'create_account',
 			password,
-		})
-		return establishSession(c, res, signupEmail || undefined)
+		}).catch(() => null)
+		if (res === null) {
+			logger.error('could not reach auth to create an account')
+			return c.json({ error: authUnreachable('signup') }, 502)
+		}
+		return establishSession(c, 'signup', res, signupEmail || undefined)
 	})
 
 	// Log in with a username + password, then start a session. The auth password grant
@@ -224,8 +275,12 @@ const app = new Hono<App>()
 			username,
 			platform: WEB_PLATFORM,
 			password,
-		})
-		return establishSession(c, res)
+		}).catch(() => null)
+		if (res === null) {
+			logger.error('could not reach auth to sign in')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		return establishSession(c, 'login', res)
 	})
 
 	// Clear the session cookie.

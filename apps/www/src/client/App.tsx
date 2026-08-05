@@ -31,9 +31,21 @@ interface SiteConfig {
 }
 
 /**
+ * An OAuth machine code (`invalid_grant`, `server_error`) rather than a sentence — a
+ * lower_snake_case word with no spaces. Bodies relayed from a worker that speaks OAuth
+ * put one of these in `error`, where the readable reason is in `error_description`.
+ */
+const isErrorCode = (s: string) => /^[a-z][a-z\d]*(_[a-z\d]+)+$/.test(s)
+
+/**
  * Call a www BFF endpoint. GET when no body is given, else POST JSON. Throws with
  * the upstream error message (auth uses `error`/`error_description`, the account
  * mutations use `error`) so callers can surface it.
+ *
+ * `error` wins, since that's where www puts the message it wrote for the player — but
+ * NOT when it's a bare OAuth code: showing "invalid_grant" tells nobody anything, so a
+ * relayed OAuth body falls through to its description. www translates the signup/login
+ * grants itself (see `readAuthError`); this covers the endpoints that still relay.
  */
 async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
 	const res = await fetch(path, {
@@ -43,9 +55,12 @@ async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
 	})
 	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
 	if (!res.ok) {
+		const error = typeof data.error === 'string' ? data.error : ''
+		const description = typeof data.error_description === 'string' ? data.error_description : ''
 		const message =
-			(typeof data.error === 'string' && data.error) ||
-			(typeof data.error_description === 'string' && data.error_description) ||
+			(error && !(isErrorCode(error) && description) && error) ||
+			description ||
+			error ||
 			`Request failed (${res.status})`
 		throw new Error(message)
 	}
