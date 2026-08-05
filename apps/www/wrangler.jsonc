@@ -5,6 +5,18 @@
 	"compatibility_date": "2026-06-16",
 	"compatibility_flags": ["nodejs_compat"],
 	"routes": [],
+	// The shared `recflare` D1 — read-only here, and only for the public
+	// `/server-status` head-count (see src/www.app.ts). The schema is owned by the
+	// workers that write it (presence lives in apps/rooms/migrations), so no
+	// migrations_dir: www never migrates. The "local" placeholder is spliced with
+	// RECFLARE_D1 at deploy time, as it is for every other worker.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "recflare",
+			"database_id": "local"
+		}
+	],
 	// React SPA client build (Vite emits it to dist/www/client). Static assets are
 	// served directly; any non-asset request falls through to the Worker, which
 	// serves API routes and returns index.html for client-side routes (SPA).
@@ -18,7 +30,8 @@
 	// SPA `not_found_handling`, a top-level *navigation* to a non-asset path (browsers
 	// send `Sec-Fetch-Mode: navigate`) is served index.html WITHOUT invoking the Worker,
 	// so a browser hitting `/docs` got the homepage. Keep this in sync with the Worker's
-	// routes (`/api/*`, `/docs*` and `/privacy`). `/docs/scalar.standalone.js` is
+	// routes (`/api/*`, `/docs*`, `/privacy` and `/server-status`).
+	// `/docs/scalar.standalone.js` is
 	// deliberately excluded so it's served directly as the static asset it is.
 	//
 	// `/privacy` is here for the same reason `/docs` is, and it matters more: the Meta
@@ -27,7 +40,7 @@
 	"assets": {
 		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
-		"run_worker_first": ["/api/*", "/docs", "/docs/openapi/*", "/privacy"]
+		"run_worker_first": ["/api/*", "/docs", "/docs/openapi/*", "/privacy", "/server-status"]
 	},
 	// The Turnstile keypair guarding web signup, out of the same account-level Secrets
 	// Store every other worker binds for JWT_SECRET — values live there, never in this

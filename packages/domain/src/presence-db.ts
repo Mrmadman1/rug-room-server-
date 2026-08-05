@@ -153,6 +153,21 @@ export async function countPlayersInInstance(
 }
 
 /**
+ * How many players are online right now, anywhere — one row per account, so this is
+ * the player count a status page means. Counts unexpired presence only: rows outlive
+ * the player by up to the TTL until the sweep purges them, and reads elsewhere ignore
+ * them the same way. Lobby (null-instance) presence IS counted — those players are
+ * signed in and playing, they're just not in a room.
+ */
+export async function countOnlinePlayers(db: D1Database, now = nowSeconds()): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM presence WHERE expires_at > ?1')
+		.bind(now)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
  * Live head-count per ROOM, keyed by room id — the players standing in any of a
  * room's instances right now. One grouped query rather than a count per room, so
  * feeds that rank by "who's playing" (the hot feed) stay a single read. Counts

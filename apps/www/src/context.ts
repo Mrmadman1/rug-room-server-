@@ -7,6 +7,12 @@ export type Env = SharedHonoEnv & {
 	/** Static-asset fetcher for the built React SPA (see wrangler.jsonc `assets`). */
 	ASSETS: Fetcher
 	/**
+	 * The shared `recflare` D1, bound READ-ONLY in practice: the only thing www asks it
+	 * is the live presence head-count behind `/server-status`. Every table it can see is
+	 * owned (and migrated) by another worker.
+	 */
+	DB: D1Database
+	/**
 	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
 	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).
 	 *

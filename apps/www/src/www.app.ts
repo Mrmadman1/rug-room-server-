@@ -1,7 +1,8 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { logger, withOnError } from '@repo/hono-helpers'
+import { countOnlinePlayers } from '@repo/domain/src/presence-db'
+import { logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
 
 import { authUnreachable } from './auth-messages'
 import { docsPage, fetchSpec } from './docs'
@@ -67,6 +68,26 @@ const app = new Hono<App>()
 				img: imgBase(c.env),
 				notify: notifyBase(c.env),
 			},
+		})
+	})
+
+	// ---- Server status ------------------------------------------------------
+
+	// A public, unauthenticated snapshot of the server — what a status page, a Discord
+	// bot or the homepage can poll without a token. CORS is open on this one route (the
+	// rest of www is same-origin) so a page hosted anywhere can read it.
+	//
+	// `status` is a stub: this handler only runs when the worker is up, so there is no
+	// state in which it answers anything but "online". It's here so callers can key off
+	// a field rather than off HTTP 200, and so a real health signal can replace the
+	// constant without changing the payload's shape.
+	.get('/server-status', withDefaultCors(), async (c) => {
+		return c.json({
+			status: 'online',
+			// One presence row per account, expired rows excluded — see countOnlinePlayers.
+			// Players sitting in the lobby count as online, same as anywhere else we read
+			// presence.
+			players: await countOnlinePlayers(c.env.DB),
 		})
 	})
 

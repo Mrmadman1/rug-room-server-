@@ -1,6 +1,8 @@
 import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { beforeAll, expect, it } from 'vitest'
 
+import { PRESENCE_SCHEMA_DDL, PRESENCE_TTL_SECONDS } from '@repo/domain/src/presence-db'
+
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
 import { turnstileKeys } from '../../turnstile'
@@ -22,6 +24,9 @@ const TEST_SECRET_KEY = '1x0000000000000000000000000000000AA'
 beforeAll(async () => {
 	await adminSecretsStore(env.TURNSTILE_SITE_KEY).create(TEST_SITE_KEY)
 	await adminSecretsStore(env.TURNSTILE_SECRET_KEY).create(TEST_SECRET_KEY)
+	// `presence` is owned (and migrated) by other workers — www only reads it — so the
+	// table has to be created here for the head-count behind /server-status.
+	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
@@ -221,6 +226,35 @@ it('carries the browser IP across to auth instead of losing it to the edge', asy
 	// Reachable in local dev, where the edge sets no `cf-connecting-ip` to pass on.
 	await postAuthForm(withAuth(capture), '/connect/token', { grant_type: 'create_account' })
 	expect(seen[1]!.headers.get('cf-connecting-ip')).toBeNull()
+})
+
+// The public status snapshot. Two things are pinned: it needs no auth and no origin (a
+// status page or Discord bot fetches it from anywhere), and its player count is LIVE
+// presence — a row whose TTL has run out is a player who crashed or hard-quit, and
+// counting them would leave the number permanently inflated between sweeps.
+it('serves a public head-count of the players actually online', async () => {
+	const now = Math.floor(Date.now() / 1000)
+	const write = (accountId: number, expiresAt: number) =>
+		env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId, roomInstance: null, expiresAt }))
+			.run()
+
+	// Empty table: online, nobody playing.
+	let res = await SELF.fetch('https://example.com/server-status')
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ status: 'online', players: 0 })
+
+	await write(1, now + PRESENCE_TTL_SECONDS) // in a lobby — still online
+	await write(2, now + PRESENCE_TTL_SECONDS)
+	await write(3, now - 1) // stopped heartbeating, not yet swept
+
+	res = await SELF.fetch('https://example.com/server-status', {
+		headers: { origin: 'https://s.example' },
+	})
+	expect(res.status).toBe(200)
+	// Readable from any origin — it's meant to be embedded elsewhere.
+	expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	expect(await res.json()).toEqual({ status: 'online', players: 2 })
 })
 
 it('serves the aggregated docs page with a source per documented service', async () => {
