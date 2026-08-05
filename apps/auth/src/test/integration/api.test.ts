@@ -198,6 +198,23 @@ describe('auth worker routes', () => {
 		}
 	)
 
+	// The one stubbed identity: `1/1` consults nothing and always answers the canned
+	// entry, which is how a sideloaded APK (no Meta SDK, so no real identity) gets off
+	// the platform login screen and onto username/password.
+	test('GET /cachedlogin/forplatformid/1/1 returns the canned Oculus entry', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/1/1`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([
+			{
+				platform: 1,
+				platformId: '1',
+				accountId: 1,
+				lastLoginTime: '2026-07-19T17:13:29.225Z',
+				requirePassword: true,
+			},
+		])
+	})
+
 	// Only Steam (0) and Meta (1) can be verified — Steam by its signed platform_auth
 	// ticket, Meta by validating its nonce with Meta. Every OTHER platform is rejected
 	// on the platform-authenticated grants: we won't bind or authorize an identity we
