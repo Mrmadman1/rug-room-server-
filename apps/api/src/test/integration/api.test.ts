@@ -1531,6 +1531,29 @@ describe('images', () => {
 		})
 	})
 
+	// The feed is public and unauthenticated, so `take` is clamped rather than trusted:
+	// without the cap a single anonymous request could pull the whole image table through
+	// the two joins behind it.
+	test('GET /api/images/v1/slideshow serves 10 by default and caps take at 100', async () => {
+		// 120 public ShareCamera photos — more than both the default and the cap.
+		for (let i = 0; i < 120; i++) {
+			await createImage(env.DB, { imageName: `bulkslide${i}.jpg`, playerId: 42 })
+		}
+		const feed = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/images/v1/slideshow${query}`)
+			expect(res.status).toBe(200)
+			return ((await res.json()) as { Images: unknown[] }).Images.length
+		}
+
+		expect(await feed('')).toBe(10)
+		expect(await feed('?take=25')).toBe(25)
+		expect(await feed('?take=500')).toBe(100)
+		// Junk and non-positive takes fall back rather than erroring or emptying the stage.
+		expect(await feed('?take=0')).toBe(10)
+		expect(await feed('?take=-5')).toBe(10)
+		expect(await feed('?take=lots')).toBe(10)
+	})
+
 	test('POST /api/images/v1/cheer persists, syncs CheerCount, and the bulk lookup reflects it', async () => {
 		// Seed an image to cheer.
 		// Its own player id: 700's photos are asserted on exactly in the player-list test.

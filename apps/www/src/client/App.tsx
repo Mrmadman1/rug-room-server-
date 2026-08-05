@@ -481,6 +481,14 @@ function NavBar({
 	)
 }
 
+/**
+ * How many photos the hero asks the feed for. Explicit rather than left to the api's
+ * default, since the count is a design decision here: the stage rotates one photo every
+ * six seconds, so ten is a minute of it — long enough that a repeat visitor sees fresh
+ * photos, short enough that the arrows stay walkable and the payload stays small.
+ */
+const SLIDESHOW_TAKE = 10
+
 /** A recent public image plus who took it and where. */
 interface Slide {
 	url: string
@@ -507,7 +515,7 @@ function useSlideshow(config: SiteConfig | undefined) {
 		// would take the page down instead of leaving an empty stage behind the fold.
 		void (async () => {
 			const h = where()
-			const d = await call<Feed>(`${h.api}/api/images/v1/slideshow`)
+			const d = await call<Feed>(`${h.api}/api/images/v1/slideshow?take=${SLIDESHOW_TAKE}`)
 			setSlides(
 				(d.Images ?? []).map((i) => ({
 					url: `${h.img}/${i.ImageName}`,
@@ -636,9 +644,9 @@ function Stage({
 							{slide.roomName && ` in ${slide.roomName}`}
 						</span>
 					)}
-					{/* Arrows and a count, not a dot per photo: the feed runs to SLIDESHOW_LIMIT
-					    (130) images, and a dot each is both unusable and wide enough to shove
-					    the headline's half of the split off the page. */}
+					{/* Arrows and a count, not a dot per photo: a dot each is wide enough to
+					    shove the headline's half of the split off the page, and it would have
+					    to be rebuilt the moment SLIDESHOW_TAKE grows. */}
 					{count > 1 && (
 						<span className="steer">
 							<button onClick={() => step(-1)} aria-label="Previous photo">
