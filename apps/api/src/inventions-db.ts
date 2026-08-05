@@ -1,8 +1,8 @@
 /**
  * Saved-invention storage on the shared `recflare` D1 database. Each invention is
- * a single JSON blob in the `data` column; queryable fields (Id, CreatorPlayerId)
- * are SQLite generated (virtual) columns extracted from that JSON — the same
- * JSON-blob pattern the image/rooms/accounts tables use.
+ * a single JSON blob in the `data` column; queryable fields (Id, CreatorPlayerId, the
+ * visibility flags) are SQLite generated (virtual) columns extracted from that JSON —
+ * the same JSON-blob pattern the image/rooms/accounts tables use.
  *
  * The `api` worker owns this schema/migration (migrations/0002_invention.sql,
  * applied under its own `migrations_table`). The invention's data file itself is
@@ -20,16 +20,20 @@
 import { getOwnedInventionIds } from '@repo/domain'
 
 /**
- * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql,
- * sans any seed rows). `is_featured` backs the featured feed's query; json_extract
- * of a JSON `true` is 1, so the column is 1/0.
+ * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql +
+ * 0008_invention_visibility.sql, sans any seed rows). `is_featured` backs the featured
+ * feed's query and `is_published`/`hide_from_player` the "may anyone see this" filter
+ * every feed shares; json_extract of a JSON `true` is 1, so those columns are 1/0 — and
+ * NULL when the key is missing, which fails a `= 1` or `= 0` test either way.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS invention (
 		data TEXT NOT NULL,
 		id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.InventionId')) VIRTUAL,
 		creator_player_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorPlayerId')) VIRTUAL,
-		is_featured INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsFeatured')) VIRTUAL
+		is_featured INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsFeatured')) VIRTUAL,
+		is_published INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsPublished')) VIRTUAL,
+		hide_from_player INTEGER GENERATED ALWAYS AS (json_extract(data, '$.HideFromPlayer')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_invention_id ON invention (id)`,
 	`CREATE INDEX IF NOT EXISTS idx_invention_creator ON invention (creator_player_id)`,
@@ -335,12 +339,12 @@ export async function searchInventions(
  * ones via the indexed `is_featured` column.
  */
 async function publicInventions(db: D1Database, featuredOnly = false): Promise<SavedInvention[]> {
-	// json_extract of a JSON `true` is 1, so these filters stay in SQL.
+	// All three are generated columns off the JSON blob, so the filter stays in SQL.
 	const { results } = await db
 		.prepare(
 			`SELECT data FROM invention
-			 WHERE json_extract(data, '$.IsPublished') = 1
-			   AND json_extract(data, '$.HideFromPlayer') = 0
+			 WHERE is_published = 1
+			   AND hide_from_player = 0
 			   ${featuredOnly ? 'AND is_featured = 1' : ''}`
 		)
 		.all<InventionRow>()
@@ -614,8 +618,8 @@ export async function getInventionsByRoom(
 		.prepare(
 			`SELECT data FROM invention
 			 WHERE json_extract(data, '$.CreationRoomId') = ?1
-			   AND json_extract(data, '$.IsPublished') = 1
-			   AND json_extract(data, '$.HideFromPlayer') = 0`
+			   AND is_published = 1
+			   AND hide_from_player = 0`
 		)
 		.bind(roomId)
 		.all<InventionRow>()
