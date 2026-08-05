@@ -157,7 +157,7 @@ export const BuyInventionResponse = z.object({
 		.describe('The same envelope `POST /api/inventions/v6/save` returns'),
 })
 
-/** buyItem / buyInvention error body (`{ error }`), returned on 400/402/403/404/409. */
+/** buyItem / buyInvention error body (`{ error }`), returned on 400/403/404/409. */
 export const ErrorResponse = z.object({ error: z.string() })
 
 // ---- Request schemas -------------------------------------------------------

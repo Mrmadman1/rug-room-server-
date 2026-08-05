@@ -426,7 +426,7 @@ describe('public endpoints', () => {
 		const withExt = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
 			headers: { ...(await bearer('5150')), 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: 'Already .inv', inventionDataFilename: '2026-07-12/x.inv' }),
+			body: JSON.stringify({ name: 'Already Suffixed', inventionDataFilename: '2026-07-12/x.inv' }),
 		})
 		expect(((await withExt.json()) as InventionSaveResult).InventionVersion.BlobName).toBe(
 			'2026-07-12/x.inv'
@@ -532,6 +532,51 @@ describe('public endpoints', () => {
 		})
 	})
 
+	test('POST /api/inventions/v6/save enforces the name and description rules', async () => {
+		const save = async (fields: Record<string, unknown>): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+				method: 'POST',
+				headers: { ...(await bearer('6262')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ inventionDataFilename: 'a.inv', ...fields }),
+			})
+
+		// A name is 3–24 characters of letters, digits, spaces, dashes and colons.
+		expect((await save({ name: 'ab' })).status).toBe(400)
+		expect((await save({ name: 'a'.repeat(25) })).status).toBe(400)
+		expect((await save({ name: 'Rocket!' })).status).toBe(400)
+		expect((await save({ name: 'Café Lamp' })).status).toBe(400)
+		const ok = await save({ name: 'Rocket Sofa-Bed 2' })
+		expect(ok.status).toBe(200)
+		expect(((await ok.json()) as InventionSaveResult).Invention.Name).toBe('Rocket Sofa-Bed 2')
+
+		// The rejection carries the player-facing sentence, not a code.
+		const short = await save({ name: 'ab' })
+		expect((await short.json()) as { error: string }).toEqual({
+			error: 'Invention names must be at least 3 characters.',
+		})
+
+		// A description is prose: any characters, at most 512 of them.
+		expect((await save({ name: 'Long Winded', description: 'x'.repeat(513) })).status).toBe(400)
+		expect((await save({ name: 'Long Winded', description: 'x'.repeat(512) })).status).toBe(200)
+		expect((await save({ name: 'Punctuated', description: 'Yes! It’s 100% good.' })).status).toBe(
+			200
+		)
+	})
+
+	test('POST /api/inventions/v6/save accepts the client’s auto-generated timestamp name', async () => {
+		// The real client names an unnamed invention after the moment it was saved
+		// (`071126 13:10:50`, captured from a live save), so the colon is in the allowed name
+		// charset on purpose. Dropping it from the pattern would 400 every unnamed save the
+		// game makes — this test is what would catch that.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('6363')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ inventionDataFilename: 'a.inv', name: '071126 13:10:50' }),
+		})
+		expect(res.status).toBe(200)
+		expect(((await res.json()) as InventionSaveResult).Invention.Name).toBe('071126 13:10:50')
+	})
+
 	test('GET /api/inventions/v1 404s for an unknown invention', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1?inventionId=999999`)
 		expect(res.status).toBe(404)
@@ -610,6 +655,39 @@ describe('public endpoints', () => {
 			CustomTags: ['Modern', ' modern ', 'Bed'],
 		})
 		expect(await replaced.json()).toEqual({ Result: 0, Tags: ['modern', 'bed'] })
+
+		// A tag is at most 15 letters once lowercased. One bad tag in either list fails the
+		// whole call — nothing is dropped silently — and leaves the stored tags alone.
+		const punctuated = await settags({
+			InventionId: Invention.InventionId,
+			CustomTags: ['racing', 'Cool Stuff!'],
+		})
+		expect(punctuated.status).toBe(400)
+		expect((await punctuated.json()) as { error: string }).toEqual({
+			error: 'Invention tags can only contain letters. (“cool stuff!”)',
+		})
+		expect(
+			(await settags({ InventionId: Invention.InventionId, AutoTags: ['a'.repeat(16)] })).status
+		).toBe(400)
+		expect(
+			(await settags({ InventionId: Invention.InventionId, CustomTags: ['tag2'] })).status
+		).toBe(400)
+		const stillThere = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/details?inventionId=${Invention.InventionId}`
+		)
+		expect(await stillThere.json()).toEqual({
+			Tags: [
+				{ Tag: 'modern', Type: 0 },
+				{ Tag: 'bed', Type: 0 },
+			],
+		})
+
+		// Blank entries are skipped rather than rejected: the store already drops them.
+		const padded = await settags({
+			InventionId: Invention.InventionId,
+			CustomTags: ['modern', '', '  '],
+		})
+		expect(await padded.json()).toEqual({ Result: 0, Tags: ['modern'] })
 
 		// Only the creator may retag; unknown inventions 404; no token → 401.
 		const notMine = await settags({ InventionId: Invention.InventionId, CustomTags: ['x'] }, '9999')
@@ -938,6 +1016,16 @@ describe('public endpoints', () => {
 		// An empty description clears it; an empty name does *not* blank the invention.
 		const cleared = (await (await update('description=&name=')).json()) as InventionSaveResult
 		expect(cleared.Invention).toMatchObject({ Description: '', Name: 'Draft Lamp' })
+
+		// A supplied name/description is held to the same rules as the save path, and a
+		// rejected edit changes nothing.
+		expect((await update('name=xy')).status).toBe(400)
+		expect((await update(`name=${encodeURIComponent('Lamp?')}`)).status).toBe(400)
+		expect((await update(`description=${'x'.repeat(513)}`)).status).toBe(400)
+		const unchanged = (await (await update('permission=20')).json()) as InventionSaveResult
+		expect(unchanged.Invention).toMatchObject({ Name: 'Draft Lamp', Description: '' })
+		const renamed = (await (await update('name=Draft-Lamp%20Two')).json()) as InventionSaveResult
+		expect(renamed.Invention.Name).toBe('Draft-Lamp Two')
 
 		// allowTrial takes true/1.
 		const trial = (await (await update('allowTrial=true')).json()) as InventionSaveResult

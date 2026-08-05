@@ -28,8 +28,10 @@ import weeklyChallenge from '../static/weekly-challenge.json'
 import { getAvatar, setAvatar } from './avatar-db'
 import {
 	ALL_PLATFORMS,
+	creditCurrency,
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
+	ensureStartingBalances,
 	getBalance,
 	isSpendable,
 	spendCurrency,
@@ -1181,11 +1183,13 @@ const app = new Hono<App>({ strict: false })
 	// Buy an invention. [Authorize]. A GET, despite being a purchase — the client sends
 	// `?inventionId=…&requestedPrice=…` with no body, so that's what we answer.
 	//
-	// Only FREE inventions can be bought for now: we look the invention up by id and
-	// confirm its stored `Price` — both against the price the client rendered (a
-	// mismatch is a stale or tampered client, 409) and against 0 (a priced invention is
-	// 402, since nothing here debits the buyer or pays the creator yet). That keeps the
-	// path from ever moving currency while the payout half is unimplemented.
+	// A priced invention is settled player-to-player: the buyer is debited its `Price` in
+	// RecCenterTokens and the CREATOR is credited the same amount — no house cut, so the
+	// tokens are moved rather than minted or burned. A free invention (`Price` 0) skips the
+	// money entirely: nothing is debited and nobody is paid. The stored price is confirmed
+	// against the price the client rendered first, so a stale or tampered client can't buy
+	// at a price the creator no longer offers (409), and an unaffordable one is a 400 —
+	// the same "Insufficient balance" buyItem answers with.
 	//
 	// Ownership is recorded in `inventory_invention`; the creator is not sold their own
 	// invention (they own it already, via CreatorPlayerId) and a re-buy is a 409 rather
@@ -1199,9 +1203,11 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Buy an invention',
 			description: [
 				'Looks the invention up by id, confirms the client’s `requestedPrice` still matches',
-				'its stored `Price`, records ownership in `inventory_invention`, and returns the',
-				'invention alongside the (unchanged) balance. Only FREE inventions are sellable for',
-				'now — a priced one is 402. A GET because that is how the client sends it.',
+				'its stored `Price`, debits the buyer and pays the creator that price in',
+				'RecCenterTokens (a free invention moves nothing), records ownership in',
+				'`inventory_invention`, and returns the invention alongside the buyer’s resulting',
+				'balance. Both players get a StorefrontBalanceUpdate push when tokens moved.',
+				'A GET because that is how the client sends it.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -1222,9 +1228,11 @@ const app = new Hono<App>({ strict: false })
 			],
 			responses: {
 				200: json(BuyInventionResponse, 'The purchase result (invention + balance)'),
-				400: json(ErrorResponse, 'Missing/non-numeric inventionId, or buying your own'),
+				400: json(
+					ErrorResponse,
+					'Missing/non-numeric inventionId, buying your own, or insufficient balance'
+				),
 				401: UNAUTHORIZED_RESPONSE,
-				402: json(ErrorResponse, 'The invention is not free (unsupported for now)'),
 				403: json(ErrorResponse, 'The invention is not published, so it is not for sale'),
 				404: json(ErrorResponse, 'No such invention'),
 				409: json(ErrorResponse, 'Already owned, or the price has changed'),
@@ -1236,8 +1244,8 @@ const app = new Hono<App>({ strict: false })
 
 			const inventionId = Number.parseInt(c.req.query('inventionId') ?? '', 10)
 			if (Number.isNaN(inventionId)) return c.json({ error: 'inventionId is required' }, 400)
-			// Absent/non-numeric requestedPrice reads as 0 — the only price we sell at anyway,
-			// so the confirmation below still has something to compare against.
+			// Absent/non-numeric requestedPrice reads as 0, which only matches a free invention —
+			// a priced one then fails the confirmation below rather than selling for nothing.
 			const requestedPrice = Number.parseInt(c.req.query('requestedPrice') ?? '0', 10) || 0
 
 			const invention = await getInventionById(c.env.DB, inventionId)
@@ -1251,27 +1259,66 @@ const app = new Hono<App>({ strict: false })
 				return c.json({ error: 'Already owned' }, 409)
 			}
 
-			// Confirm the price twice: against what the client rendered, then against the only
-			// price we can actually settle (free).
+			// The price the client rendered must still be the stored one: a mismatch is a stale
+			// catalog or a tampered request, never a sale.
 			if (invention.Price !== requestedPrice) {
 				return c.json({ error: 'Price has changed' }, 409)
 			}
-			if (invention.Price !== 0) {
-				return c.json({ error: 'Only free inventions can be bought right now' }, 402)
+
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			// Inventions are priced in RecCenterTokens only — the store shows no other currency
+			// for them, and `Price` carries no currency of its own to pick a different one from.
+			const price = invention.Price
+			if (price > 0) {
+				// Debit the buyer atomically; false means they couldn't afford it and nothing
+				// changed, so no ownership is recorded and the creator is not paid.
+				const paid = await spendCurrency(
+					c.env.DB,
+					id,
+					CurrencyType.RecCenterTokens,
+					price,
+					startingTokens
+				)
+				if (!paid) return c.json({ error: 'Insufficient balance' }, 400)
 			}
 
+			// Grant before paying out: these are three separate D1 writes with no transaction
+			// around them, so order them by what a failure costs. A buyer who paid and got the
+			// invention but left the creator unpaid is recoverable; a buyer charged for nothing
+			// is not.
 			await grantInvention(c.env.DB, id, inventionId)
 
-			// Nothing was debited, so this is the buyer's balance as it stands (a first read
-			// seeds their starting grant, as everywhere else). Unlike buyItem — whose `Balance`
-			// is the change applied — the reference server answers this one with the RESULTING
-			// total, so no StorefrontBalanceUpdate push is needed either: nothing changed.
-			const balance = await getBalance(
-				c.env.DB,
-				id,
-				CurrencyType.RecCenterTokens,
-				intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-			)
+			if (price > 0) {
+				// Seed the creator's signup grant BEFORE crediting them: `creditCurrency` upserts
+				// the balance row, and `ensureStartingBalances` is an INSERT OR IGNORE, so a
+				// creator who had never touched their balance would otherwise have the row created
+				// here and lose their starting tokens forever.
+				await ensureStartingBalances(c.env.DB, invention.CreatorPlayerId, startingTokens)
+				const creatorBalance = await creditCurrency(
+					c.env.DB,
+					invention.CreatorPlayerId,
+					CurrencyType.RecCenterTokens,
+					price,
+					startingTokens
+				)
+				// The creator is a different, probably-online player: push their new total so a
+				// sale lands on their shown balance without a re-fetch. Best-effort, as everywhere.
+				await pushBalanceUpdate(
+					c,
+					invention.CreatorPlayerId,
+					CurrencyType.RecCenterTokens,
+					creatorBalance
+				)
+			}
+
+			// Unlike buyItem — whose `Balance` is the change applied — the reference server
+			// answers this one with the RESULTING total (a first read seeds the buyer's starting
+			// grant, as everywhere else).
+			const balance = await getBalance(c.env.DB, id, CurrencyType.RecCenterTokens, startingTokens)
+			// A free invention moved nothing, so there is no balance to push for it.
+			if (price > 0) {
+				await pushBalanceUpdate(c, id, CurrencyType.RecCenterTokens, balance)
+			}
 			return c.json({
 				BalanceUpdateResponse: {
 					Balance: balance,

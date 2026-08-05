@@ -320,8 +320,14 @@ export const InventionPersonalDetails = z.object({
 /** `POST /api/inventions/v1/settags` JSON body — both lists are replaced wholesale. */
 export const SetTagsRequest = z.object({
 	InventionId: z.int(),
-	AutoTags: z.array(z.string()).optional().describe('Client-derived tags (Type 2)'),
-	CustomTags: z.array(z.string()).optional().describe('Creator-submitted tags (Type 0)'),
+	AutoTags: z
+		.array(z.string())
+		.optional()
+		.describe('Client-derived tags (Type 2); each at most 15 letters once lowercased'),
+	CustomTags: z
+		.array(z.string())
+		.optional()
+		.describe('Creator-submitted tags (Type 0); each at most 15 letters once lowercased'),
 })
 
 /** `POST /api/inventions/v1/settags` response — `Tags` is the flat list of tag NAMES. */
@@ -341,8 +347,14 @@ export const SaveInventionRequest = z.object({
 	inventionDataFilename: z
 		.string()
 		.describe('The blob uploaded through the storage worker; the one required field'),
-	name: z.string().optional().describe('Defaults to “Untitled”'),
-	description: z.string().optional(),
+	name: z
+		.string()
+		.optional()
+		.describe('3–24 chars: letters, digits, spaces, dashes, colons. Omitted/blank ⇒ “Untitled”'),
+	description: z
+		.string()
+		.optional()
+		.describe('At most 512 chars. Omitted/blank ⇒ “No description yet”'),
 	imageName: z.string().optional(),
 	instantiationCost: z.int().optional(),
 	lightsCost: z.int().optional(),

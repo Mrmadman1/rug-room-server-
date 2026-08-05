@@ -111,7 +111,7 @@ function invention(
 
 const SEEDED_INVENTIONS = [
 	invention(8), // free, published, someone else's — the sellable one
-	invention(9, { Price: 250 }), // priced: not sellable while only free is supported
+	invention(9, { Price: 250 }), // priced: buying it pays creator 999 250 tokens
 	invention(10, { IsPublished: false }), // a draft, not on sale even at 0
 	invention(11, { CreatorPlayerId: 60 }), // account 60's own invention
 ]
@@ -1039,12 +1039,52 @@ describe('econ endpoints', () => {
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
 	})
 
-	test('GET /api/storefronts/v2/buyInvention refuses anything but a free invention', async () => {
-		// Invention 9 costs 250. Sending the price the client rendered is a 402 (nothing
-		// here can settle a paid purchase yet); sending 0 for it is a stale/tampered price.
-		expect((await buyInvention('51', 9, 250)).status).toBe(402)
-		expect((await buyInvention('51', 9, 0)).status).toBe(409)
-		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([])
+	test('GET /api/storefronts/v2/buyInvention pays the creator the buyer’s tokens', async () => {
+		// Invention 9 costs 250 and was made by account 999. Buying it moves 250 tokens from
+		// the buyer to that creator — no house cut, so the two sides are equal and opposite.
+		const res = await buyInvention('51', 9, 250)
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { BalanceUpdateResponse: { Balance: number } }
+		// `Balance` is the buyer's RESULTING total, so it already has the debit in it.
+		expect(body.BalanceUpdateResponse.Balance).toBe(DEFAULT_STARTING_TOKENS - 250)
+		expect(
+			await getBalance(env.DB, 51, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(DEFAULT_STARTING_TOKENS - 250)
+		// The creator had never touched their balance: they keep their starting grant AND get
+		// paid, rather than the payout standing in for the grant.
+		expect(
+			await getBalance(env.DB, 999, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(DEFAULT_STARTING_TOKENS + 250)
+		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([9])
+	})
+
+	test('GET /api/storefronts/v2/buyInvention rejects a stale price and an unaffordable one', async () => {
+		// Sending 0 for the 250-token invention 9 is a stale (or tampered) price.
+		expect((await buyInvention('53', 9, 0)).status).toBe(409)
+
+		// Account 54 can't afford it: nothing is debited, nobody is paid, nothing is owned.
+		await spendCurrency(
+			env.DB,
+			54,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS,
+			DEFAULT_STARTING_TOKENS
+		)
+		const creatorBefore = await getBalance(
+			env.DB,
+			999,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS
+		)
+		expect((await buyInvention('54', 9, 250)).status).toBe(400)
+		expect(
+			await getBalance(env.DB, 54, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(0)
+		expect(
+			await getBalance(env.DB, 999, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(creatorBefore)
+		expect(await getOwnedInventionIds(env.DB, 53)).toEqual([])
+		expect(await getOwnedInventionIds(env.DB, 54)).toEqual([])
 	})
 
 	test('GET /api/storefronts/v2/buyInvention rejects drafts, self-buys and unknown ids', async () => {
