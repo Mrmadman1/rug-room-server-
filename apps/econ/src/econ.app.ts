@@ -203,23 +203,30 @@ async function pushConsumableAdded(
  * Push a StorefrontBalanceUpdate to a player after their balance changes, mirroring the
  * reference's
  * `HubSendToPlayer(accountID, NotifFrame(StorefrontBalanceUpdate, {Balance, CurrencyType, BalanceType}))`.
- * The client applies it to the shown balance so a purchase debit reflects immediately,
- * without waiting for a `GET /balance` re-fetch. `Balance` is the resulting total in that
- * currency (not the delta), `BalanceType` is -2 (account-wide, all platforms). Best-effort:
- * a hub failure is logged and swallowed, since the balance change has already committed.
+ * The client applies it to the shown balance so a purchase reflects immediately, without
+ * waiting for a `GET /balance` re-fetch.
+ *
+ * `Balance` is the CHANGE — negative for a debit, positive for a payout — not the
+ * resulting total. The client ADDS what it receives to the balance it is already showing,
+ * so sending the total made a 10,000-token player who earned 250 read 20,250: their own
+ * balance plus the new total. That also makes this frame non-idempotent, so push exactly
+ * once per change and never re-send it as a "refresh".
+ *
+ * `BalanceType` is -2 (account-wide, all platforms). Best-effort: a hub failure is logged
+ * and swallowed, since the balance change has already committed.
  */
 async function pushBalanceUpdate(
 	c: Context<App>,
 	accountId: number,
 	currencyType: number,
-	balance: number
+	change: number
 ): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			accountId,
 			NotificationType.StorefrontBalanceUpdate,
 			{
-				Balance: balance,
+				Balance: change,
 				CurrencyType: currencyType,
 				BalanceType: ALL_PLATFORMS,
 			}
@@ -1012,7 +1019,8 @@ const app = new Hono<App>({ strict: false })
 				'still matches, debits the buyer atomically, grants the item (into the inventory or',
 				'consumable table), and returns a gift box. A `Gift` block routes the item to another',
 				'player, but the caller always pays. `Balance` in the response is the CHANGE (negated',
-				'price), not the new total. Pushes a StorefrontBalanceUpdate socket notification.',
+				'price), not the new total. Pushes a StorefrontBalanceUpdate socket frame carrying the',
+				'same change, which the client ADDS to the balance it is showing.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(BuyItemRequest, 'The item, currency, price, and optional Gift'),
@@ -1133,11 +1141,11 @@ const app = new Hono<App>({ strict: false })
 				)
 			)
 
-			// Push the buyer's new (reduced) balance over the socket so their client updates the
-			// shown total immediately — the buyer (`id`) is who was debited, in the currency they
-			// spent. Best-effort; the HTTP response still carries the change either way.
-			const newBalance = await getBalance(c.env.DB, id, currencyType as number, startingTokens)
-			await pushBalanceUpdate(c, id, currencyType as number, newBalance)
+			// Push the debit over the socket so the buyer's client updates the shown total
+			// immediately — the buyer (`id`) is who was charged, in the currency they spent. The
+			// frame carries the CHANGE, so a purchase is negative. Best-effort; the HTTP response
+			// carries the same change either way.
+			await pushBalanceUpdate(c, id, currencyType as number, -price.Price)
 
 			// The response mirrors a captured real buyItem: `Balance` is the change applied (the
 			// negated price), not the resulting balance (the client reads its new total from
@@ -1206,7 +1214,9 @@ const app = new Hono<App>({ strict: false })
 				'its stored `Price`, debits the buyer and pays the creator that price in',
 				'RecCenterTokens (a free invention moves nothing), records ownership in',
 				'`inventory_invention`, and returns the invention alongside the buyer’s resulting',
-				'balance. Both players get a StorefrontBalanceUpdate push when tokens moved.',
+				'balance. When tokens moved, both players get a StorefrontBalanceUpdate push carrying',
+				'their CHANGE (the buyer’s negative, the creator’s positive), which the client adds to',
+				'the balance it is showing — unlike this response body, which replaces it.',
 				'A GET because that is how the client sends it.',
 			].join(' '),
 			security: AUTHED,
@@ -1294,30 +1304,27 @@ const app = new Hono<App>({ strict: false })
 				// creator who had never touched their balance would otherwise have the row created
 				// here and lose their starting tokens forever.
 				await ensureStartingBalances(c.env.DB, invention.CreatorPlayerId, startingTokens)
-				const creatorBalance = await creditCurrency(
+				await creditCurrency(
 					c.env.DB,
 					invention.CreatorPlayerId,
 					CurrencyType.RecCenterTokens,
 					price,
 					startingTokens
 				)
-				// The creator is a different, probably-online player: push their new total so a
-				// sale lands on their shown balance without a re-fetch. Best-effort, as everywhere.
-				await pushBalanceUpdate(
-					c,
-					invention.CreatorPlayerId,
-					CurrencyType.RecCenterTokens,
-					creatorBalance
-				)
+				// The creator is a different, probably-online player: push the payout so a sale
+				// lands on their shown balance without a re-fetch. Positive, because the frame
+				// carries the change. Best-effort, as everywhere.
+				await pushBalanceUpdate(c, invention.CreatorPlayerId, CurrencyType.RecCenterTokens, price)
 			}
 
 			// Unlike buyItem — whose `Balance` is the change applied — the reference server
 			// answers this one with the RESULTING total (a first read seeds the buyer's starting
-			// grant, as everywhere else).
+			// grant, as everywhere else). The socket frame below is the other way round: the HTTP
+			// body REPLACES the shown balance, the push ADDS to it.
 			const balance = await getBalance(c.env.DB, id, CurrencyType.RecCenterTokens, startingTokens)
-			// A free invention moved nothing, so there is no balance to push for it.
+			// A free invention moved nothing, so there is no change to push for it.
 			if (price > 0) {
-				await pushBalanceUpdate(c, id, CurrencyType.RecCenterTokens, balance)
+				await pushBalanceUpdate(c, id, CurrencyType.RecCenterTokens, -price)
 			}
 			return c.json({
 				BalanceUpdateResponse: {

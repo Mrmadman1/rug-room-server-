@@ -701,6 +701,7 @@ describe('econ endpoints', () => {
 
 	test('POST /api/storefronts/v2/buyItem debits, grants the item, and hands back a gift box', async () => {
 		// Account 20: fresh, so its first balance touch grants the 10000 default.
+		await drainFrames()
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await bearer('20')), 'Content-Type': 'application/json' },
@@ -727,6 +728,16 @@ describe('econ endpoints', () => {
 		const gift = body.BalanceUpdates[0].Data[0]
 		expect(gift.AvatarItemDesc).not.toBe('')
 		expect(gift.Id).toBeGreaterThan(0)
+
+		// The socket frame carries the same change the response does — the client adds it to
+		// the balance it is showing, so the resulting total here would double-count the 9550.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 20,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: -450, CurrencyType: 2, BalanceType: -2 },
+			},
+		])
 
 		// The balance endpoint reflects the debit (this is the resulting total, 10000 - 450).
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
@@ -992,6 +1003,26 @@ describe('econ endpoints', () => {
 		expect(list.every((i) => i.FriendlyName !== 'Bowtie (White)')).toBe(true)
 	})
 
+	/**
+	 * The StorefrontBalanceUpdate (and other) frames the worker has pushed since the last
+	 * drain, read back off the stub hub in vitest.config.ts. Notification sends are
+	 * best-effort — the worker logs and swallows a hub failure — so this is the only way a
+	 * test sees what was actually pushed.
+	 */
+	const drainFrames = async (): Promise<
+		Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+	> =>
+		(
+			env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
+				drainFrames(): Promise<
+					Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+				>
+			}
+		).drainFrames()
+
+	/** `NotificationType.StorefrontBalanceUpdate` in the notify worker's enum. */
+	const STOREFRONT_BALANCE_UPDATE = 61
+
 	// buyInvention is a GET with query params — that is how the client sends it.
 	const buyInvention = async (sub: string, inventionId: number, requestedPrice = 0) =>
 		exports.default.fetch(
@@ -1042,6 +1073,7 @@ describe('econ endpoints', () => {
 	test('GET /api/storefronts/v2/buyInvention pays the creator the buyer’s tokens', async () => {
 		// Invention 9 costs 250 and was made by account 999. Buying it moves 250 tokens from
 		// the buyer to that creator — no house cut, so the two sides are equal and opposite.
+		await drainFrames()
 		const res = await buyInvention('51', 9, 250)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { BalanceUpdateResponse: { Balance: number } }
@@ -1056,6 +1088,22 @@ describe('econ endpoints', () => {
 			await getBalance(env.DB, 999, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
 		).toBe(DEFAULT_STARTING_TOKENS + 250)
 		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([9])
+
+		// Both sides get a socket frame carrying their CHANGE, not their new total: the client
+		// ADDS what it receives to the balance it is showing, so a total would have the creator
+		// reading their own balance plus the payout. Equal and opposite, like the ledger.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 999,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: 250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
+			},
+			{
+				accountId: 51,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: -250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
+			},
+		])
 	})
 
 	test('GET /api/storefronts/v2/buyInvention rejects a stale price and an unaffordable one', async () => {
