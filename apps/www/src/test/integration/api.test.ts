@@ -4,7 +4,7 @@ import { beforeAll, expect, it } from 'vitest'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
 import { turnstileKeys } from '../../turnstile'
-import { readAuthError } from '../../upstream'
+import { postAuthForm, readAuthError } from '../../upstream'
 
 import type { Env } from '../../context'
 
@@ -163,6 +163,52 @@ it('explains a refused signup instead of relaying invalid_grant', async () => {
 	expect(html.upstream).toBe('HTTP 502')
 })
 
+// The signup cap counts auth's `CF-Connecting-IP` as the account's immutable `signupIp`,
+// and www used to reach auth over https://auth.<DOMAIN> — a Worker subrequest, which
+// re-enters the Cloudflare edge, which REPLACES that header with Cloudflare's own
+// address. Every browser signup therefore shared one IP, and the cap (3, never decaying)
+// refused the fourth web account ever created, for everyone. The service binding skips
+// the edge, so the header set here is the one auth reads.
+//
+// Checked directly rather than through /api/signup: the pass path would call Cloudflare's
+// siteverify for real (see the Turnstile tests above).
+it('carries the browser IP across to auth instead of losing it to the edge', async () => {
+	const seen: Request[] = []
+	const withAuth = (fetcher?: Fetcher) =>
+		({
+			DOMAIN: 'rec.example.com',
+			AUTH: fetcher,
+		}) as unknown as Env
+	const capture = {
+		fetch: async (request: Request) => {
+			seen.push(request)
+			return new Response('{}', { headers: { 'content-type': 'application/json' } })
+		},
+	} as unknown as Fetcher
+
+	await postAuthForm(
+		withAuth(capture),
+		'/connect/token',
+		{ grant_type: 'create_account', password: 'hunter2' },
+		{ clientIp: '203.0.113.7' }
+	)
+
+	// The binding is used in preference to the hostname, and the real IP rides along.
+	expect(seen).toHaveLength(1)
+	expect(seen[0]!.headers.get('cf-connecting-ip')).toBe('203.0.113.7')
+	// Still the same host/path/body auth already answers — only the transport changed.
+	expect(seen[0]!.url).toBe('https://auth.rec.example.com/connect/token')
+	const body = await seen[0]!.formData()
+	expect(body.get('grant_type')).toBe('create_account')
+	expect(body.get('password')).toBe('hunter2')
+
+	// A call with no IP to forward must not invent one: an absent header leaves auth's
+	// own `clientIp` empty, which SKIPS the cap, rather than counting everyone together.
+	await postAuthForm(withAuth(capture), '/account/me/changepassword', {}, { bearer: 'tok' })
+	expect(seen[1]!.headers.get('cf-connecting-ip')).toBeNull()
+	expect(seen[1]!.headers.get('authorization')).toBe('Bearer tok')
+})
+
 it('requires credentials to log in', async () => {
 	const res = await SELF.fetch('https://example.com/api/login', {
 		method: 'POST',
@@ -171,6 +217,33 @@ it('requires credentials to log in', async () => {
 	})
 	expect(res.status).toBe(400)
 	expect(await res.json()).toEqual({ error: 'Username and password are required.' })
+})
+
+it('rejects an unauthenticated username change', async () => {
+	const res = await SELF.fetch('https://example.com/api/username', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ username: 'newname' }),
+	})
+	expect(res.status).toBe(401)
+	expect(await res.json()).toEqual({ error: 'not signed in' })
+})
+
+// The accounts worker answers a refused username change at HTTP 200, in its own
+// `{ success, error, value }` envelope — so an empty name reaching it would come back
+// looking like a success to a browser that keys off the status. Rejected here instead,
+// before the upstream call, and in the `{ error }` + 4xx shape every other endpoint uses.
+it('refuses a username change with no username', async () => {
+	const res = await SELF.fetch('https://example.com/api/username', {
+		method: 'POST',
+		// Any cookie value gets past the session check — www holds no signing key and
+		// only forwards the token, so this stops at the empty-name check without ever
+		// reaching accounts.
+		headers: { 'content-type': 'application/json', cookie: 'rf_token=stub' },
+		body: JSON.stringify({ username: '   ' }),
+	})
+	expect(res.status).toBe(400)
+	expect(await res.json()).toEqual({ error: 'A username is required.' })
 })
 
 it('rejects an unauthenticated maintenance broadcast', async () => {

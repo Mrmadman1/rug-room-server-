@@ -16,6 +16,12 @@ interface SelfAccount {
 	username: string
 	displayName: string
 	email: string | null
+	/**
+	 * Username changes left on the account — each change spends one, and an account
+	 * starts with one. Absent on an older self DTO, which reads as "unknown": the form
+	 * stays usable and lets the server be the one to refuse.
+	 */
+	availableUsernameChanges?: number
 	/** Whether this session may use admin controls (from the token's role claim). */
 	isAdmin?: boolean
 }
@@ -807,6 +813,11 @@ function Dashboard({
 	// sections are appended when the session carries an admin role.
 	const sections = [
 		{
+			id: 'username',
+			label: 'Username',
+			render: () => <UsernameForm account={account} onChange={onChange} />,
+		},
+		{
 			id: 'email',
 			label: 'Email',
 			render: () => <EmailForm account={account} onChange={onChange} />,
@@ -930,6 +941,78 @@ function MaintenanceForm() {
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
 					{pending ? 'Broadcasting…' : 'Broadcast maintenance'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+/**
+ * Change the account's username — the name used to sign in, here and in the game.
+ *
+ * Changes are rationed (an account starts with one), so the count is stated up front and
+ * the form locks itself once none are left rather than letting someone spend the attempt
+ * finding out. The server is still the one that decides: an unknown count leaves the form
+ * open, and a name taken since the page loaded is refused upstream.
+ *
+ * The response is the caller's whole self account, re-read after the write, so the
+ * remaining count on screen is the stored one and not a guess.
+ */
+function UsernameForm({
+	account,
+	onChange,
+}: {
+	account: SelfAccount
+	onChange: (a: SelfAccount) => void
+}) {
+	const [username, setUsername] = useState(account.username)
+	const { pending, error, done, run } = useAction()
+
+	const remaining = account.availableUsernameChanges
+	const spent = remaining !== undefined && remaining <= 0
+	// Retyping the current name would be refused upstream anyway ("already taken" is
+	// waived for your own name, but it would still spend a change).
+	const unchanged = username.trim() === account.username
+
+	return (
+		<section className="card">
+			<h2>Username</h2>
+			<p className="muted">
+				What you sign in with, here and in the game — and what other players see you by.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const updated = await api<SelfAccount>('/api/username', { username })
+						onChange(updated)
+						setUsername(updated.username)
+						return `You are now @${updated.username}.`
+					})
+				}}
+			>
+				<label>
+					Username
+					<input
+						type="text"
+						value={username}
+						autoComplete="username"
+						disabled={spent}
+						onChange={(e) => setUsername(e.target.value)}
+						required
+					/>
+					<span className="hint">
+						{remaining === undefined
+							? 'Changing your username uses up one of a limited number of changes.'
+							: spent
+								? 'You have no username changes remaining, so this can no longer be changed.'
+								: `You have ${remaining} username change${remaining === 1 ? '' : 's'} remaining — this one is permanent once used.`}
+					</span>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+				<button type="submit" disabled={pending || spent || unchanged}>
+					{pending ? 'Changing…' : 'Change username'}
 				</button>
 			</form>
 		</section>

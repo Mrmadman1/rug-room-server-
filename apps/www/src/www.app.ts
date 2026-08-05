@@ -11,11 +11,12 @@ import { turnstileKeys, verifyTurnstile } from './turnstile'
 import {
 	accountsBase,
 	apiBase,
-	authBase,
 	authUnreachable,
 	imgBase,
 	notifyBase,
+	postAuthForm,
 	postForm,
+	putForm,
 	readAuthError,
 } from './upstream'
 
@@ -235,12 +236,10 @@ const app = new Hono<App>()
 
 		// The IP Turnstile cross-checks the token against — set by the edge, so the client
 		// can't spoof it (unlike X-Forwarded-For). `auth` records the same header as the
-		// account's signup IP.
-		const verified = await verifyTurnstile(
-			keys.secretKey,
-			turnstileToken,
-			c.req.header('cf-connecting-ip')
-		)
+		// account's signup IP, which is why it's forwarded to the grant below rather than
+		// left to the edge: see `postAuthForm`.
+		const clientIp = c.req.header('cf-connecting-ip')
+		const verified = await verifyTurnstile(keys.secretKey, turnstileToken, clientIp)
 		// A token is single-use, so the client resets its widget before letting them retry.
 		if (!verified) return c.json({ error: 'Bot check failed. Please try again.' }, 403)
 
@@ -248,10 +247,12 @@ const app = new Hono<App>()
 		// rather than falling through to the generic 500 handler, whose "internal server
 		// error" tells the player nothing about whether they now have an account (they don't:
 		// nothing was created).
-		const res = await postForm(`${authBase(c.env)}/connect/token`, {
-			grant_type: 'create_account',
-			password,
-		}).catch(() => null)
+		const res = await postAuthForm(
+			c.env,
+			'/connect/token',
+			{ grant_type: 'create_account', password },
+			{ clientIp }
+		).catch(() => null)
 		if (res === null) {
 			logger.error('could not reach auth to create an account')
 			return c.json({ error: authUnreachable('signup') }, 502)
@@ -270,12 +271,14 @@ const app = new Hono<App>()
 			return c.json({ error: 'Username and password are required.' }, 400)
 		}
 
-		const res = await postForm(`${authBase(c.env)}/connect/token`, {
-			grant_type: 'password',
-			username,
-			platform: WEB_PLATFORM,
-			password,
-		}).catch(() => null)
+		// The IP goes along here too: auth refreshes `lastLoginIp` on every successful
+		// grant, and without it every web login would stamp the same Cloudflare address.
+		const res = await postAuthForm(
+			c.env,
+			'/connect/token',
+			{ grant_type: 'password', username, platform: WEB_PLATFORM, password },
+			{ clientIp: c.req.header('cf-connecting-ip') }
+		).catch(() => null)
 		if (res === null) {
 			logger.error('could not reach auth to sign in')
 			return c.json({ error: authUnreachable('login') }, 502)
@@ -327,6 +330,63 @@ const app = new Hono<App>()
 		return c.json({ ...account, isAdmin: isAdminToken(token) })
 	})
 
+	// Change the signed-in account's username.
+	//
+	// The accounts worker answers this one in its own envelope — `{ success, error, value }`
+	// at HTTP 200 even when it refused (taken name, no changes left) — so relaying it
+	// verbatim would read as a success to the browser, which keys off the status. It's
+	// translated to the same `{ error }` + 4xx shape as every other endpoint here instead;
+	// the sentences accounts writes are already player-facing, so they pass through as-is.
+	//
+	// On success the caller's SELF account is re-fetched rather than returning the
+	// envelope's `value`: that's the PUBLIC DTO, and it carries no
+	// `availableUsernameChanges` — the very field the form needs to know whether another
+	// change is left. (An account starts with one; it's spent by this call.)
+	.post('/api/username', async (c) => {
+		const token = sessionToken(c)
+		if (!token) return c.json({ error: 'not signed in' }, 401)
+
+		const { username } = await c.req
+			.json<{ username?: string }>()
+			.catch(() => ({}) as { username?: string })
+		const wanted = typeof username === 'string' ? username.trim() : ''
+		if (wanted === '') return c.json({ error: 'A username is required.' }, 400)
+
+		const res = await putForm(
+			`${accountsBase(c.env)}/account/me/username`,
+			{ username: wanted },
+			token
+		)
+		if (!res.ok) return relay(c, res)
+
+		const result = (await res.json().catch(() => null)) as {
+			success?: boolean
+			error?: unknown
+		} | null
+		if (!result) {
+			logger.error('accounts answered a username change with a body that was not JSON')
+			return c.json({ error: 'Your username could not be changed. Please try again later.' }, 502)
+		}
+		const refusal = typeof result.error === 'string' ? result.error : ''
+		if (refusal !== '') return c.json({ error: refusal }, 400)
+
+		const me = await fetch(`${accountsBase(c.env)}/account/me`, {
+			headers: { authorization: `Bearer ${token}` },
+		})
+		// The name has already changed by now, so this can't be reported as a failure —
+		// telling them to retry would spend the change they no longer have. A reload shows
+		// the new name either way.
+		if (!me.ok) {
+			logger.error('failed to reload the account after a username change', { status: me.status })
+			return c.json(
+				{ error: 'Your username was changed, but reloading your account failed. Reload the page.' },
+				502
+			)
+		}
+		const account = (await me.json()) as Record<string, unknown>
+		return c.json({ ...account, isAdmin: isAdminToken(token) })
+	})
+
 	// Set the signed-in account's email.
 	.post('/api/email', async (c) => {
 		const token = sessionToken(c)
@@ -349,10 +409,13 @@ const app = new Hono<App>()
 			.catch(() => ({}) as { oldPassword?: string; newPassword?: string })
 		if (!newPassword) return c.json({ error: 'A new password is required.' }, 400)
 
-		const res = await postForm(
-			`${authBase(c.env)}/account/me/changepassword`,
+		// No `clientIp`: auth reads no IP on this path — it's routed through the binding
+		// only so every auth call goes one way.
+		const res = await postAuthForm(
+			c.env,
+			'/account/me/changepassword',
 			{ oldPassword: oldPassword ?? '', newPassword },
-			token
+			{ bearer: token }
 		)
 		return relay(c, res)
 	})

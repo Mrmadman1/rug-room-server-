@@ -54,6 +54,17 @@
 			"secret_name": "TURNSTILE_SECRET_KEY"
 		}
 	],
+	// The `auth` worker, reached directly instead of over its public hostname. This is
+	// about the CLIENT IP, not latency: a Worker subrequest to https://auth.<DOMAIN>
+	// re-enters the Cloudflare edge, which overwrites CF-Connecting-IP with Cloudflare's
+	// own address — so auth recorded the SAME `signupIp` for every browser signup and its
+	// per-IP cap (3 by default) locked out every player after the third account ever
+	// created. A service binding skips the edge, so the real browser IP www forwards on
+	// that header survives (see src/upstream.ts `postAuthForm`).
+	//
+	// Only auth is bound: it's the only upstream whose behaviour depends on the caller's
+	// IP. accounts/api/img/notify still go over their public hostnames.
+	"services": [{ "binding": "AUTH", "service": "auth" }],
 	"upload_source_maps": true,
 	"observability": {
 		"logs": {

@@ -15,11 +15,12 @@ export const apiBase = (env: Env): string => `https://api.${env.DOMAIN}`
 export const imgBase = (env: Env): string => `https://img.${env.DOMAIN}`
 
 /**
- * POST a form-urlencoded body to an upstream worker. The auth/accounts endpoints
+ * Send a form-urlencoded body to an upstream worker. The auth/accounts endpoints
  * read their inputs via Hono's `parseBody()`, so they expect form fields (not
  * JSON). `bearer`, when given, authenticates the caller.
  */
-export async function postForm(
+async function sendForm(
+	method: 'POST' | 'PUT',
 	url: string,
 	fields: Record<string, string>,
 	bearer?: string
@@ -29,10 +30,70 @@ export async function postForm(
 	}
 	if (bearer) headers.authorization = `Bearer ${bearer}`
 	return fetch(url, {
+		method,
+		headers,
+		body: new URLSearchParams(fields).toString(),
+	})
+}
+
+/** POST a form-urlencoded body to an upstream worker (see `sendForm`). */
+export const postForm = (
+	url: string,
+	fields: Record<string, string>,
+	bearer?: string
+): Promise<Response> => sendForm('POST', url, fields, bearer)
+
+/**
+ * PUT a form-urlencoded body to an upstream worker (see `sendForm`). The accounts
+ * worker's profile mutations are split by verb — the username change is a PUT, and
+ * posting to it 404s rather than failing loudly.
+ */
+export const putForm = (
+	url: string,
+	fields: Record<string, string>,
+	bearer?: string
+): Promise<Response> => sendForm('PUT', url, fields, bearer)
+
+/**
+ * POST a form body to the `auth` worker, carrying the browser's real IP across.
+ *
+ * Every other upstream is reached over its public hostname, but auth can't be: it reads
+ * the caller's address from `CF-Connecting-IP` and counts it as the account's immutable
+ * `signupIp`, and a Worker subrequest to https://auth.<DOMAIN> re-enters the Cloudflare
+ * edge, which REPLACES that header with Cloudflare's own address. Every web signup
+ * therefore recorded one shared IP, and auth's per-IP cap — 3 accounts, never decaying —
+ * refused the fourth web account ever created, for everybody. The web path asserts no
+ * platform, so that arm was also the only cap actually in front of it.
+ *
+ * Going through the service binding skips the edge, so the header set here is the one
+ * auth reads. That is safe precisely because the edge does overwrite it on the public
+ * route: a game client posting `/connect/token` directly still cannot spoof its own IP,
+ * so no shared secret is needed to tell the two callers apart.
+ *
+ * `clientIp` is the caller's own edge-set `cf-connecting-ip`, and must never be anything
+ * a browser supplied. Omit it on calls that aren't IP-sensitive.
+ *
+ * Falls back to the public hostname when the binding is absent (local `vite dev` — see
+ * `Env.AUTH`); the edge then overwrites the header again, which is the old behaviour.
+ */
+export async function postAuthForm(
+	env: Env,
+	path: string,
+	fields: Record<string, string>,
+	opts: { bearer?: string; clientIp?: string } = {}
+): Promise<Response> {
+	const headers: Record<string, string> = {
+		'content-type': 'application/x-www-form-urlencoded',
+	}
+	if (opts.bearer) headers.authorization = `Bearer ${opts.bearer}`
+	if (opts.clientIp) headers['cf-connecting-ip'] = opts.clientIp
+
+	const request = new Request(`${authBase(env)}${path}`, {
 		method: 'POST',
 		headers,
 		body: new URLSearchParams(fields).toString(),
 	})
+	return env.AUTH ? env.AUTH.fetch(request) : fetch(request)
 }
 
 /** Which grant www was making, so a shared refusal reads right on either form. */
