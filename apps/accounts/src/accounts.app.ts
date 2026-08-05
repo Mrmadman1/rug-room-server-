@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
+import { describeRoute, openAPIRouteHandler, validator } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
@@ -8,11 +8,6 @@ import {
 	getAccount,
 	getAccountByUsername,
 	getAccountsByIds,
-	isValidBio,
-	isValidEmail,
-	MAX_DISPLAY_NAME_LENGTH,
-	MAX_USERNAME_LENGTH,
-	nameRejection,
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
@@ -74,12 +69,18 @@ function unauthorized(c: Context<App>) {
 const DEFAULT_USERNAME_CHANGES = 1
 
 /**
- * Username-change result envelope: `{ success, error, value }`, always HTTP 200.
- * On success `value` is the updated account; on error `error` carries the message
- * and `value` is an empty string.
+ * Username-change result envelope: `{ success, error, value }`. On success `value` is
+ * the updated account; on a refusal `error` carries the message and `value` is an empty
+ * string.
+ *
+ * A refusal is a 400. The body shape is unchanged — anything reading `error` still
+ * works — but it used to come back at HTTP 200, which meant a caller keying off the
+ * status read every refusal as a success. That envelope-at-200 was the reference's
+ * (`RecNet`) convention and is kept by `POST /account/create`; here it was traded for a
+ * status a client can actually branch on.
  */
 function usernameResult(c: Context<App>, error = '', value: unknown = '') {
-	return c.json({ success: error === '', error, value })
+	return c.json({ success: error === '', error, value }, error === '' ? 200 : 400)
 }
 
 /** Read a single string field from a form-urlencoded / multipart body. */
@@ -424,26 +425,20 @@ const app = new Hono<App>()
 			summary: 'Set display name',
 			description: 'Persisted and broadcast via an AccountUpdate notification.',
 			security: AUTHED,
-			requestBody: form(DisplayNameRequest, 'The new display name'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
 				400: { description: 'Empty, over 15 characters, or non-alphanumeric (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
+		// An EMPTY 400, which is what this route already answered for an empty name: it
+		// acks with a bare SuccessResponse and has never sent the client a body on
+		// failure, so enforcing the schema doesn't change what a refusal looks like.
+		validator('form', DisplayNameRequest, (r, c) => (r.success ? undefined : c.body(null, 400))),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			const displayName = (await formField(c, 'displayName')).trim()
-			if (displayName === '') return c.body(null, 400)
-			// Held to the same shape as the username — it's the name other players actually
-			// see, so it can't be the place where spaces and punctuation get in. Refused with
-			// an empty 400 like the empty case above: this route answers a bare
-			// SuccessResponse, and giving it a body the client has never been sent is a
-			// bigger change than the rule is worth.
-			if (nameRejection(displayName, 'display name', MAX_DISPLAY_NAME_LENGTH) !== null) {
-				return c.body(null, 400)
-			}
+			const { displayName } = c.req.valid('form')
 			const account = await updateAccount(c.env.DB, id, { displayName })
 			await pushAccountUpdate(c, account)
 			return c.json({ success: true })
@@ -465,24 +460,28 @@ const app = new Hono<App>()
 				'(see the UsernameResult envelope).',
 			].join(' '),
 			security: AUTHED,
-			requestBody: form(UsernameRequest, 'The desired username'),
 			responses: {
-				200: json(UsernameResult, 'Result envelope (success or a validation error)'),
+				200: json(UsernameResult, 'The updated account, in the result envelope'),
+				400: json(UsernameResult, 'Refused — `error` carries the reason, `value` is ""'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
+		// Shape is checked before the handler runs, so a rejected name costs no D1 read and
+		// — the part that matters — can never spend one of the account's rationed changes.
+		// The message is relayed rather than zod's issue array: `nameRejection` writes the
+		// sentence the player reads, and nothing can render an array of issues.
+		// `c` is annotated so the hook's context matches this app's bindings, and `error` is
+		// Standard Schema's flat issue list rather than a zod error object.
+		validator('form', UsernameRequest, (r, c: Context<App>) =>
+			r.success
+				? undefined
+				: usernameResult(c, r.error[0]?.message ?? 'That username cannot be used.')
+		),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			const username = (await formField(c, 'username')).trim()
-			if (username === '') return usernameResult(c, 'You must enter a username.')
-
-			// Shape before availability: a rejected name shouldn't cost a D1 read, and it
-			// must never cost the account one of its rationed changes. The envelope carries
-			// the sentence straight to the player.
-			const rejection = nameRejection(username, 'username', MAX_USERNAME_LENGTH)
-			if (rejection !== null) return usernameResult(c, rejection)
+			const { username } = c.req.valid('form')
 
 			// Duplicate check first (case-insensitive); keeping your own name is allowed.
 			const existing = await getAccountByUsername(c.env.DB, username)
@@ -514,18 +513,17 @@ const app = new Hono<App>()
 			summary: 'Set email',
 			description: 'Persisted; surfaced only by `/account/me`. Not broadcast.',
 			security: AUTHED,
-			requestBody: form(EmailRequest, 'The new email'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
-				400: { description: 'Not a valid address, or over 255 characters (empty body)' },
+				400: { description: 'Not a syntactically valid address (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
+		validator('form', EmailRequest, (r, c) => (r.success ? undefined : c.body(null, 400))),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			const email = (await formField(c, 'email')).trim()
-			if (!isValidEmail(email)) return c.body(null, 400)
+			const { email } = c.req.valid('form')
 			await updateAccount(c.env.DB, id, { email })
 			return c.json({ success: true })
 		}
@@ -539,18 +537,17 @@ const app = new Hono<App>()
 			summary: 'Set phone number',
 			description: 'Persisted on the account row. Not broadcast.',
 			security: AUTHED,
-			requestBody: form(PhoneRequest, 'The new phone number'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
 				400: { description: 'Empty phone (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
+		validator('form', PhoneRequest, (r, c) => (r.success ? undefined : c.body(null, 400))),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			const phone = (await formField(c, 'phone')).trim()
-			if (phone === '') return c.body(null, 400)
+			const { phone } = c.req.valid('form')
 			await updateAccount(c.env.DB, id, { phone })
 			return c.json({ success: true })
 		}
@@ -627,20 +624,18 @@ const app = new Hono<App>()
 			summary: 'Set bio',
 			description: 'Free text up to 255 characters; empty is allowed. Persisted and broadcast.',
 			security: AUTHED,
-			requestBody: form(BioRequest, 'The new bio'),
 			responses: {
 				200: json(SuccessResponse, 'Updated'),
 				400: { description: 'Bio over 255 characters (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
+		// Refused rather than truncated: silently storing half a sentence reads as data loss.
+		validator('form', BioRequest, (r, c) => (r.success ? undefined : c.body(null, 400))),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			const bio = await formField(c, 'bio')
-			// Length only — a bio is free text by design (see the route summary). Refused
-			// rather than truncated: silently storing half a sentence reads as data loss.
-			if (!isValidBio(bio)) return c.body(null, 400)
+			const { bio } = c.req.valid('form')
 			const account = await updateAccount(c.env.DB, id, { bio })
 			await pushAccountUpdate(c, account)
 			return c.json({ success: true })
