@@ -65,7 +65,7 @@ export async function ownsInvention(
 /**
  * How many times each invention was acquired at or after `since`, most-acquired first
  * (ties broken by newest invention, so paging is stable). Backs the `api` worker's "top
- * today" feed, which passes the start of the current UTC day.
+ * today" feed, which passes 24 hours ago.
  *
  * `acquired_at` holds `toISOString()` output, which is fixed-width UTC, so a lexical
  * `>=` on the string is a chronological comparison — no date parsing in SQL.

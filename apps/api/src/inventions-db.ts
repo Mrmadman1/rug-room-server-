@@ -352,23 +352,29 @@ async function publicInventions(db: D1Database, featuredOnly = false): Promise<S
 	return results.map((r) => JSON.parse(r.data) as SavedInvention)
 }
 
-/** Midnight UTC today, as the ISO timestamp `acquired_at` is compared against. */
-function startOfUtcDay(): string {
-	return `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`
+/** Length of the "today" window — a trailing day, not the calendar one. */
+const TOP_TODAY_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/** 24 hours ago, as the ISO timestamp `acquired_at` is compared against. */
+function startOfWindow(): string {
+	return new Date(Date.now() - TOP_TODAY_WINDOW_MS).toISOString()
 }
 
 /**
- * The "top today" feed — the inventions other players picked up TODAY, most first.
+ * The "top today" feed — the inventions other players picked up in the last 24 hours,
+ * most first.
  *
  * Ranked from the acquisitions the `econ` worker records in `inventory_invention` at
  * purchase time, grouped by invention, rather than from the lifetime counters on the
  * invention itself: those never reset, so "top today" used to mean "top ever" and the
  * shelf only changed when something overtook a total built up over months.
  *
- * "Today" is the UTC day, matching the timestamps econ writes. The day therefore rolls
- * over at 00:00 UTC wherever the player is, and the feed IS EMPTY until the first
- * acquisition of that day — nothing stands in for it, the same way the featured feed
- * serves nothing while nothing is curated.
+ * "Today" is a TRAILING 24 hours, not the calendar UTC day, so the feed doesn't empty
+ * itself at midnight UTC and slowly refill through the small hours — it always covers a
+ * full day's worth of activity. It is still genuinely a window: an invention nobody has
+ * picked up since yesterday falls off, and the feed IS EMPTY when nothing at all was
+ * acquired in a day. Nothing stands in for it, the same way the featured feed serves
+ * nothing while nothing is curated.
  *
  * An acquired invention that has since been unpublished or hidden drops out: this is a
  * public feed, so it is filtered like every other one. Paginated via skip/take AFTER
@@ -379,7 +385,7 @@ export async function getTopInventions(
 	skip: number,
 	take: number
 ): Promise<SavedInvention[]> {
-	const counts = await getInventionAcquisitionCounts(db, startOfUtcDay())
+	const counts = await getInventionAcquisitionCounts(db, startOfWindow())
 	if (counts.length === 0) return []
 
 	// getInventionsByIds answers in the order it is asked, so the ranking survives the

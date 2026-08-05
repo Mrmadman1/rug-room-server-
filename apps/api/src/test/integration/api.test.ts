@@ -1184,22 +1184,23 @@ describe('public endpoints', () => {
 				.run()
 		}
 
-		// Today's acquisitions, which is what "top today" now counts: 201 picked up by three
+		// Recent acquisitions, which is what "top today" now counts: 201 picked up by three
 		// players, 203 by one. 204/205 are acquired too — an unpublished and a hidden
 		// invention can still be owned — and must not surface in a public feed.
 		for (const accountId of [7001, 7002, 7003]) await grantInvention(env.DB, accountId, 201)
 		await grantInvention(env.DB, 7001, 203)
 		await grantInvention(env.DB, 7001, 204)
 		await grantInvention(env.DB, 7002, 205)
-		// 202 was acquired, but not today — the window is the current UTC day, so it is out.
+		// 202 was acquired 25 hours ago, just past the trailing 24-hour window, so it is out —
+		// the feed really does forget, rather than accumulating every acquisition ever.
 		await env.DB.prepare(
 			'INSERT INTO inventory_invention (account_id, invention_id, acquired_at) VALUES (?1, ?2, ?3)'
 		)
-			.bind(7004, 202, '2020-01-01T00:00:00.000Z')
+			.bind(7004, 202, new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString())
 			.run()
 
-		// Top: most acquisitions today first. Download counts no longer rank anything — 202
-		// has the biggest of them and is absent entirely.
+		// Top: most acquisitions in the window first. Download counts no longer rank anything —
+		// 202 has the biggest of them and is absent entirely.
 		const top = await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday`))
 		expect(top).toEqual([201, 203])
 
