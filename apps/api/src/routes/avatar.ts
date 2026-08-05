@@ -622,17 +622,20 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The "top today" invention feed — published inventions ranked by engagement
-	// (lifetime, not per-day: we keep no daily counters). Paginated via skip/take
-	// (take defaults to 50, as the client asks for). Bare array.
+	// The "top today" invention feed — the inventions most acquired since 00:00 UTC,
+	// counted from the purchase rows the `econ` worker writes. A real day window, so an
+	// empty list is a quiet day rather than a bug. Paginated via skip/take (take defaults
+	// to 50, as the client asks for). Bare array.
 	.get(
 		'/api/inventions/v1/toptoday',
 		describeRoute({
 			tags: ['Inventions'],
 			summary: 'The “top today” feed',
 			description:
-				'Published inventions ranked by engagement — lifetime, not per-day: we keep no ' +
-				'daily counters, so “today” is a label, not a window.',
+				'Published inventions ranked by how many players acquired them TODAY (since ' +
+				'00:00 UTC), counted from the purchase records — free grants included, one per ' +
+				'player per invention. Genuinely a day window: empty until the day’s first ' +
+				'acquisition, and it resets at midnight UTC.',
 			parameters: pageParams(50),
 			responses: { 200: json(InventionDto.array(), 'The top inventions') },
 		}),

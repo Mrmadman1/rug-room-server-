@@ -62,6 +62,36 @@ export async function ownsInvention(
 	return row !== null
 }
 
+/**
+ * How many times each invention was acquired at or after `since`, most-acquired first
+ * (ties broken by newest invention, so paging is stable). Backs the `api` worker's "top
+ * today" feed, which passes the start of the current UTC day.
+ *
+ * `acquired_at` holds `toISOString()` output, which is fixed-width UTC, so a lexical
+ * `>=` on the string is a chronological comparison — no date parsing in SQL.
+ *
+ * This counts ACQUISITIONS, not spend: a free invention's grant is a row here just like
+ * a paid one, and one player can only ever contribute a single row per invention (the
+ * table's primary key), so a popular invention can't be inflated by one buyer. Creators
+ * are absent by design — they own theirs through `CreatorPlayerId` and never buy it —
+ * which is what makes this a measure of what other people picked up.
+ */
+export async function getInventionAcquisitionCounts(
+	db: D1Database,
+	since: string
+): Promise<Array<{ inventionId: number; count: number }>> {
+	const { results } = await db
+		.prepare(
+			`SELECT invention_id, COUNT(*) AS count FROM inventory_invention
+			 WHERE acquired_at >= ?1
+			 GROUP BY invention_id
+			 ORDER BY count DESC, invention_id DESC`
+		)
+		.bind(since)
+		.all<{ invention_id: number; count: number }>()
+	return results.map((r) => ({ inventionId: r.invention_id, count: r.count }))
+}
+
 /** The ids of every invention a player has bought, oldest purchase first. */
 export async function getOwnedInventionIds(db: D1Database, accountId: number): Promise<number[]> {
 	const { results } = await db

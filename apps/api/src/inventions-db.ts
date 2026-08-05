@@ -14,10 +14,11 @@
  * shaped after a real `GET /api/inventions/v1?inventionId=…` response.
  *
  * Who OWNS an invention is a separate table (`inventory_invention`, written by the
- * `econ` worker at purchase time); this module only reads it, to fold bought inventions
- * into the caller's own list. See @repo/domain's inventory-invention-db.ts.
+ * `econ` worker at purchase time); this module only reads it — to fold bought inventions
+ * into the caller's own list, and to rank the "top today" feed by what players actually
+ * picked up today. See @repo/domain's inventory-invention-db.ts.
  */
-import { getOwnedInventionIds } from '@repo/domain'
+import { getInventionAcquisitionCounts, getOwnedInventionIds } from '@repo/domain'
 
 /**
  * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql +
@@ -351,31 +352,43 @@ async function publicInventions(db: D1Database, featuredOnly = false): Promise<S
 	return results.map((r) => JSON.parse(r.data) as SavedInvention)
 }
 
-/** Engagement score used to rank the top feed (downloads weigh most, then cheers). */
-function topScore(invention: SavedInvention): number {
-	const n = (v: unknown): number => (typeof v === 'number' ? v : 0)
-	return (
-		n(invention.NumDownloads) * 3 +
-		n(invention.CheerCount) * 2 +
-		n(invention.NumPlayersHaveUsedInRoom)
-	)
+/** Midnight UTC today, as the ISO timestamp `acquired_at` is compared against. */
+function startOfUtcDay(): string {
+	return `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`
 }
 
 /**
- * The "top today" feed — published inventions ranked by engagement. The real feed
- * ranks by *today's* activity; we don't track per-day counters, so this ranks by
- * lifetime engagement instead. Ties fall back to invention id so paging is stable.
- * Paginated via skip/take; returns a bare array, like the other invention feeds.
+ * The "top today" feed — the inventions other players picked up TODAY, most first.
+ *
+ * Ranked from the acquisitions the `econ` worker records in `inventory_invention` at
+ * purchase time, grouped by invention, rather than from the lifetime counters on the
+ * invention itself: those never reset, so "top today" used to mean "top ever" and the
+ * shelf only changed when something overtook a total built up over months.
+ *
+ * "Today" is the UTC day, matching the timestamps econ writes. The day therefore rolls
+ * over at 00:00 UTC wherever the player is, and the feed IS EMPTY until the first
+ * acquisition of that day — nothing stands in for it, the same way the featured feed
+ * serves nothing while nothing is curated.
+ *
+ * An acquired invention that has since been unpublished or hidden drops out: this is a
+ * public feed, so it is filtered like every other one. Paginated via skip/take AFTER
+ * that filtering, so a hidden invention doesn't leave a hole in a page.
  */
 export async function getTopInventions(
 	db: D1Database,
 	skip: number,
 	take: number
 ): Promise<SavedInvention[]> {
-	const inventions = await publicInventions(db)
-	return inventions
-		.sort((a, b) => topScore(b) - topScore(a) || b.InventionId - a.InventionId)
-		.slice(skip, skip + take)
+	const counts = await getInventionAcquisitionCounts(db, startOfUtcDay())
+	if (counts.length === 0) return []
+
+	// getInventionsByIds answers in the order it is asked, so the ranking survives the
+	// load; ids with no invention row left (deleted) simply drop out.
+	const ranked = await getInventionsByIds(
+		db,
+		counts.map((c) => c.inventionId)
+	)
+	return ranked.filter((i) => i.IsPublished && !i.HideFromPlayer).slice(skip, skip + take)
 }
 
 /**

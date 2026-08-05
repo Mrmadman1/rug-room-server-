@@ -1138,14 +1138,15 @@ describe('public endpoints', () => {
 		const ids = async (res: Response): Promise<number[]> =>
 			((await res.json()) as SavedInvention[]).map((i) => i.InventionId)
 
-		// Nothing is flagged IsFeatured yet, so featured is EMPTY — it does not stand in the
-		// top feed, which by now has published inventions in it.
-		const beforeTop = await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday`))
-		expect(beforeTop.length).toBeGreaterThan(0)
-		const beforeFeatured = await ids(
-			await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featured`)
+		// Both feeds start EMPTY, for different reasons: nothing is flagged IsFeatured, and
+		// the only inventions acquired so far in this file are an unpublished one and an id
+		// with no invention row — neither of which a public feed may show.
+		expect(await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday`))).toEqual(
+			[]
 		)
-		expect(beforeFeatured).toEqual([])
+		expect(await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featured`))).toEqual(
+			[]
+		)
 
 		const feedInvention = (
 			id: number,
@@ -1183,11 +1184,24 @@ describe('public endpoints', () => {
 				.run()
 		}
 
-		// Top: engagement-ranked, so the biggest download counts lead.
+		// Today's acquisitions, which is what "top today" now counts: 201 picked up by three
+		// players, 203 by one. 204/205 are acquired too — an unpublished and a hidden
+		// invention can still be owned — and must not surface in a public feed.
+		for (const accountId of [7001, 7002, 7003]) await grantInvention(env.DB, accountId, 201)
+		await grantInvention(env.DB, 7001, 203)
+		await grantInvention(env.DB, 7001, 204)
+		await grantInvention(env.DB, 7002, 205)
+		// 202 was acquired, but not today — the window is the current UTC day, so it is out.
+		await env.DB.prepare(
+			'INSERT INTO inventory_invention (account_id, invention_id, acquired_at) VALUES (?1, ?2, ?3)'
+		)
+			.bind(7004, 202, '2020-01-01T00:00:00.000Z')
+			.run()
+
+		// Top: most acquisitions today first. Download counts no longer rank anything — 202
+		// has the biggest of them and is absent entirely.
 		const top = await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday`))
-		expect(top.slice(0, 3)).toEqual([202, 203, 201])
-		expect(top).not.toContain(204)
-		expect(top).not.toContain(205)
+		expect(top).toEqual([201, 203])
 
 		// Featured: only the flagged, visible inventions — newest first. 201 is published but
 		// unflagged, so it stays out however popular it is.
@@ -1197,6 +1211,10 @@ describe('public endpoints', () => {
 		// skip/take paginate both feeds.
 		const page = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday?skip=1&take=1`)
 		expect(await ids(page)).toEqual([203])
+		// Pagination happens after the visibility filter, so the hidden/unpublished
+		// acquisitions don't leave holes in a page.
+		const firstPage = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday?take=1`)
+		expect(await ids(firstPage)).toEqual([201])
 		const featuredPage = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1/featured?skip=1&take=1`
 		)
