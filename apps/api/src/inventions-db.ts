@@ -377,8 +377,13 @@ export async function getTopInventions(
 /**
  * The featured feed — published inventions flagged `IsFeatured`, newest first.
  * Selected on the indexed `is_featured` column rather than by parsing every public
- * invention. Nothing sets that flag yet, so this falls back to the top feed rather
- * than handing the client an empty shelf; once inventions are curated it serves them.
+ * invention.
+ *
+ * Curated means curated: when nothing is flagged this serves an EMPTY list rather than
+ * standing in the top feed. It used to fall back, from when no invention could be
+ * featured at all, but a fallback makes the shelf lie — the client labels these as
+ * hand-picked, and a feed that silently becomes "top today" hides the fact that nobody
+ * has picked anything.
  */
 export async function getFeaturedInventions(
 	db: D1Database,
@@ -386,7 +391,6 @@ export async function getFeaturedInventions(
 	take: number
 ): Promise<SavedInvention[]> {
 	const featured = await publicInventions(db, true)
-	if (featured.length === 0) return getTopInventions(db, skip, take)
 	return featured
 		.sort((a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId)
 		.slice(skip, skip + take)

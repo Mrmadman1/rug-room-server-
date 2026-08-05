@@ -643,16 +643,17 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The featured invention feed — curated (`IsFeatured`) inventions, falling back
-	// to the top feed while nothing is curated. Bare array, like toptoday.
+	// The featured invention feed — the curated (`IsFeatured`) inventions and nothing
+	// else, newest first. Empty until someone flags one. Bare array, like toptoday.
 	.get(
 		'/api/inventions/v1/featured',
 		describeRoute({
 			tags: ['Inventions'],
 			summary: 'The featured feed',
 			description:
-				'Curated (`IsFeatured`) inventions, falling back to the top feed while nothing is ' +
-				'curated — so this is never empty just because no one has picked favourites.',
+				'Curated (`IsFeatured`) inventions, newest first — published and non-hidden only. ' +
+				'Serves an empty list while nothing is flagged rather than standing in the top ' +
+				'feed: the client presents these as hand-picked, so a fallback would be a lie.',
 			parameters: pageParams(50),
 			responses: { 200: json(InventionDto.array(), 'The featured inventions') },
 		}),

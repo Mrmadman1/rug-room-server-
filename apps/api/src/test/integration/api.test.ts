@@ -1138,12 +1138,14 @@ describe('public endpoints', () => {
 		const ids = async (res: Response): Promise<number[]> =>
 			((await res.json()) as SavedInvention[]).map((i) => i.InventionId)
 
-		// Nothing is flagged IsFeatured yet → featured falls back to the top feed.
+		// Nothing is flagged IsFeatured yet, so featured is EMPTY — it does not stand in the
+		// top feed, which by now has published inventions in it.
 		const beforeTop = await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday`))
+		expect(beforeTop.length).toBeGreaterThan(0)
 		const beforeFeatured = await ids(
 			await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featured`)
 		)
-		expect(beforeFeatured).toEqual(beforeTop)
+		expect(beforeFeatured).toEqual([])
 
 		const feedInvention = (
 			id: number,
@@ -1187,13 +1189,18 @@ describe('public endpoints', () => {
 		expect(top).not.toContain(204)
 		expect(top).not.toContain(205)
 
-		// Featured: only the flagged, visible inventions — newest first.
+		// Featured: only the flagged, visible inventions — newest first. 201 is published but
+		// unflagged, so it stays out however popular it is.
 		const featured = await ids(await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featured`))
 		expect(featured).toEqual([203, 202])
 
-		// skip/take paginate the top feed.
+		// skip/take paginate both feeds.
 		const page = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/toptoday?skip=1&take=1`)
 		expect(await ids(page)).toEqual([203])
+		const featuredPage = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/featured?skip=1&take=1`
+		)
+		expect(await ids(featuredPage)).toEqual([202])
 	})
 
 	test('POST /api/sanitize/v1 echoes the value; isPure reports true', async () => {
