@@ -195,6 +195,28 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `invention/${c.req.param('dataBlob')}`)
 	)
 
+	// Generic client data by name. Anything the client uploads as FileType 2 lands
+	// under `data/` (a Holotar recording is the one seen in the wild) and the client
+	// fetches it back from this prefix. Date-foldered like the room and invention
+	// blobs, so the rest of the path is matched as-is.
+	.get(
+		'/data/:id{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve a client data blob',
+			description: [
+				'Streams the object stored under `data/<id>` — whatever the client uploaded as',
+				'`UploadFileType` 2 (see the `storage` worker), a Holotar recording being the case',
+				'observed. Like room and invention blobs the name is date-foldered by the upload,',
+				'e.g. `2026-02-03/<uuid>`, so it contains slashes. The worker does not interpret the',
+				'bytes — the prefix exists because the client expects to read these back from `/data/`.',
+			].join(' '),
+			parameters: [keyParam('id', 'The blob name.', true), ...CONDITIONAL_HEADERS],
+			responses: assetResponses('The data blob'),
+		}),
+		(c) => serveAsset(c, `data/${c.req.param('id')}`)
+	)
+
 // The generated spec. Documentation only — no request is validated against it (see
 // openapi.ts). `hide: true` keeps this route out of its own output.
 app.get(
@@ -209,10 +231,11 @@ app.get(
 					description: [
 						'Binary asset delivery for recflare, a private-server reimplementation of the Rec',
 						'Room backend. Streams the blobs the client downloads while playing — anti-cheat',
-						'signatures, saved room scenes and invention data — out of the shared `recflare-cdn`',
-						'R2 bucket, plus the one bundled config file the loading screen reads.',
+						'signatures, saved room scenes, invention data and generic client uploads — out of',
+						'the shared `recflare-cdn` R2 bucket, plus the one bundled config file the loading',
+						'screen reads.',
 						'',
-						'Everything is keyed by prefix (`sigs/`, `room/`, `invention/`) and served as',
+						'Everything is keyed by prefix (`sigs/`, `room/`, `invention/`, `data/`) and served as',
 						'`application/octet-stream`; the worker never interprets what it hands back. Reads',
 						'are unauthenticated — a caller needs the exact key, which only comes from an',
 						'authenticated call to another worker.',

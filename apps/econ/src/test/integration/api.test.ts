@@ -4,7 +4,11 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import '../../econ.app'
 
-import { RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain'
+import {
+	getOwnedInventionIds,
+	INVENTORY_INVENTION_SCHEMA_DDL,
+	RECEIVED_GIFT_SCHEMA_DDL,
+} from '@repo/domain'
 
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
 // is built here too (see the same cross-worker import in econ.app.ts).
@@ -20,7 +24,6 @@ import {
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
-import { getOwnedInventionIds, INVENTORY_INVENTION_SCHEMA_DDL } from '../../inventory-invention-db'
 import { OUTFIT_SCHEMA_DDL } from '../../outfit-db'
 
 import type { Env } from '../../context'
@@ -108,7 +111,7 @@ function invention(
 
 const SEEDED_INVENTIONS = [
 	invention(8), // free, published, someone else's — the sellable one
-	invention(9, { Price: 250 }), // priced: not sellable while only free is supported
+	invention(9, { Price: 250 }), // priced: buying it pays creator 999 250 tokens
 	invention(10, { IsPublished: false }), // a draft, not on sale even at 0
 	invention(11, { CreatorPlayerId: 60 }), // account 60's own invention
 ]
@@ -698,6 +701,7 @@ describe('econ endpoints', () => {
 
 	test('POST /api/storefronts/v2/buyItem debits, grants the item, and hands back a gift box', async () => {
 		// Account 20: fresh, so its first balance touch grants the 10000 default.
+		await drainFrames()
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await bearer('20')), 'Content-Type': 'application/json' },
@@ -724,6 +728,16 @@ describe('econ endpoints', () => {
 		const gift = body.BalanceUpdates[0].Data[0]
 		expect(gift.AvatarItemDesc).not.toBe('')
 		expect(gift.Id).toBeGreaterThan(0)
+
+		// The socket frame carries the same change the response does — the client adds it to
+		// the balance it is showing, so the resulting total here would double-count the 9550.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 20,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: -450, CurrencyType: 2, BalanceType: -2 },
+			},
+		])
 
 		// The balance endpoint reflects the debit (this is the resulting total, 10000 - 450).
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
@@ -989,6 +1003,26 @@ describe('econ endpoints', () => {
 		expect(list.every((i) => i.FriendlyName !== 'Bowtie (White)')).toBe(true)
 	})
 
+	/**
+	 * The StorefrontBalanceUpdate (and other) frames the worker has pushed since the last
+	 * drain, read back off the stub hub in vitest.config.ts. Notification sends are
+	 * best-effort — the worker logs and swallows a hub failure — so this is the only way a
+	 * test sees what was actually pushed.
+	 */
+	const drainFrames = async (): Promise<
+		Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+	> =>
+		(
+			env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
+				drainFrames(): Promise<
+					Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+				>
+			}
+		).drainFrames()
+
+	/** `NotificationType.StorefrontBalanceUpdate` in the notify worker's enum. */
+	const STOREFRONT_BALANCE_UPDATE = 61
+
 	// buyInvention is a GET with query params — that is how the client sends it.
 	const buyInvention = async (sub: string, inventionId: number, requestedPrice = 0) =>
 		exports.default.fetch(
@@ -1036,12 +1070,69 @@ describe('econ endpoints', () => {
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
 	})
 
-	test('GET /api/storefronts/v2/buyInvention refuses anything but a free invention', async () => {
-		// Invention 9 costs 250. Sending the price the client rendered is a 402 (nothing
-		// here can settle a paid purchase yet); sending 0 for it is a stale/tampered price.
-		expect((await buyInvention('51', 9, 250)).status).toBe(402)
-		expect((await buyInvention('51', 9, 0)).status).toBe(409)
-		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([])
+	test('GET /api/storefronts/v2/buyInvention pays the creator the buyer’s tokens', async () => {
+		// Invention 9 costs 250 and was made by account 999. Buying it moves 250 tokens from
+		// the buyer to that creator — no house cut, so the two sides are equal and opposite.
+		await drainFrames()
+		const res = await buyInvention('51', 9, 250)
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { BalanceUpdateResponse: { Balance: number } }
+		// `Balance` is the buyer's RESULTING total, so it already has the debit in it.
+		expect(body.BalanceUpdateResponse.Balance).toBe(DEFAULT_STARTING_TOKENS - 250)
+		expect(
+			await getBalance(env.DB, 51, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(DEFAULT_STARTING_TOKENS - 250)
+		// The creator had never touched their balance: they keep their starting grant AND get
+		// paid, rather than the payout standing in for the grant.
+		expect(
+			await getBalance(env.DB, 999, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(DEFAULT_STARTING_TOKENS + 250)
+		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([9])
+
+		// Both sides get a socket frame carrying their CHANGE, not their new total: the client
+		// ADDS what it receives to the balance it is showing, so a total would have the creator
+		// reading their own balance plus the payout. Equal and opposite, like the ledger.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 999,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: 250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
+			},
+			{
+				accountId: 51,
+				notificationType: STOREFRONT_BALANCE_UPDATE,
+				payload: { Balance: -250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
+			},
+		])
+	})
+
+	test('GET /api/storefronts/v2/buyInvention rejects a stale price and an unaffordable one', async () => {
+		// Sending 0 for the 250-token invention 9 is a stale (or tampered) price.
+		expect((await buyInvention('53', 9, 0)).status).toBe(409)
+
+		// Account 54 can't afford it: nothing is debited, nobody is paid, nothing is owned.
+		await spendCurrency(
+			env.DB,
+			54,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS,
+			DEFAULT_STARTING_TOKENS
+		)
+		const creatorBefore = await getBalance(
+			env.DB,
+			999,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS
+		)
+		expect((await buyInvention('54', 9, 250)).status).toBe(400)
+		expect(
+			await getBalance(env.DB, 54, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(0)
+		expect(
+			await getBalance(env.DB, 999, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(creatorBefore)
+		expect(await getOwnedInventionIds(env.DB, 53)).toEqual([])
+		expect(await getOwnedInventionIds(env.DB, 54)).toEqual([])
 	})
 
 	test('GET /api/storefronts/v2/buyInvention rejects drafts, self-buys and unknown ids', async () => {

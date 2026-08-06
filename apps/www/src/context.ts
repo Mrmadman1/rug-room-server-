@@ -7,6 +7,22 @@ export type Env = SharedHonoEnv & {
 	/** Static-asset fetcher for the built React SPA (see wrangler.jsonc `assets`). */
 	ASSETS: Fetcher
 	/**
+	 * The shared `recflare` D1, bound READ-ONLY in practice: the only thing www asks it
+	 * is the live presence head-count behind `/server-status`. Every table it can see is
+	 * owned (and migrated) by another worker.
+	 */
+	DB: D1Database
+	/**
+	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
+	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).
+	 *
+	 * OPTIONAL because a deployed www always has it (it's declared in wrangler.jsonc) but
+	 * standalone local dev doesn't: `vite dev` runs www on its own against a deployed
+	 * DOMAIN, with no `auth` session to bind to. Absent, `postAuthForm` falls back to
+	 * fetching auth.<DOMAIN> — the pre-binding behaviour, correct except for the IP.
+	 */
+	AUTH?: Fetcher
+	/**
 	 * The Turnstile widget's public site key. Public by design — it ships to the browser so
 	 * the widget can render — but it lives in the Secrets Store beside its secret, so one
 	 * place configures signup and there's a single place to look.

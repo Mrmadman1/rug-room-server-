@@ -21,7 +21,7 @@ import {
 	updateAccount,
 	verifyPassword,
 } from '@repo/domain'
-import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
+import { intVar, logger, withCleanSpec, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
 import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
 
 import { verifyMetaNonce } from './meta-nonce'
@@ -29,6 +29,7 @@ import {
 	CachedLogin,
 	ChangePasswordRequest,
 	ChangePasswordResponse,
+	FakeCachedLogin,
 	form,
 	json,
 	OAuthError,
@@ -56,6 +57,30 @@ import type { PlatformLink } from './platform-db'
 /** OAuth scopes granted by `/connect/token`. */
 const TOKEN_SCOPE =
 	'offline_access profile rn rn.accounts rn.accounts.gc rn.api rn.chat rn.clubs rn.commerce rn.match.read rn.match.write rn.notify rn.rooms rn.storage'
+
+/**
+ * The platform id a SIDELOADED Oculus APK reports. It is not an identity: a sideloaded
+ * build has no Meta SDK to ask, so it has nothing real to report — and every sideloaded
+ * headset reports this same value. Two things follow, and both are enforced below:
+ *  - it is never verifiable (`verifyPlatformProof` refuses it outright), and
+ *  - it is therefore never LINKED to an account. A link is a password-free way in, so
+ *    one link on a shared id would open that account to every sideloaded build.
+ * It exists only to get such a client onto the username/password login screen.
+ */
+const SIDELOAD_PLATFORM_ID = '1'
+
+/**
+ * The canned entry served for the one Oculus cached-login lookup below — the sideloaded
+ * APK's way onto the password login screen. Not backed by a link, an account or a
+ * platform proof, hence `requirePassword: true`.
+ */
+const FAKE_OCULUS_CACHED_LOGIN = {
+	platform: PlatformType.Oculus,
+	platformId: SIDELOAD_PLATFORM_ID,
+	accountId: 1,
+	lastLoginTime: '2026-07-19T17:13:29.225Z',
+	requirePassword: true,
+} as const
 
 /**
  * Signup caps, enforced on create_account only (never on login — an existing account
@@ -292,6 +317,20 @@ async function verifyPlatformProof(
 	platformAuth: string,
 	postedPlatformId: string
 ): Promise<PlatformProof> {
+	// A sideloaded APK reports the placeholder id (see SIDELOAD_PLATFORM_ID) because it
+	// has no Meta SDK behind it. Refuse it here, before anything is asked of Meta, so no
+	// caller downstream can treat it as an identity — above all `linkLoginIdentity` on the
+	// password grant, which is the path such a client actually takes. Linking it would
+	// hand every sideloaded headset a password-free login into that account, since they
+	// all report this same id.
+	//
+	// Refusing costs a sideloaded player nothing: their password login still succeeds (a
+	// password grant carries its own credential and only *links* on a verified proof), it
+	// just never gets a cached login, so they type their password each launch. That is
+	// the intended shape of the sideload flow.
+	if (platform === PlatformType.Oculus && postedPlatformId === SIDELOAD_PLATFORM_ID) {
+		return { status: 'rejected', reason: 'sideload placeholder platform id is never an identity' }
+	}
 	if (platform === PlatformType.Steam) {
 		const verified = platformAuth ? await verifySteamTicket(platformAuth) : null
 		if (!verified) return { status: 'rejected', reason: 'invalid or missing Steam ticket' }
@@ -324,6 +363,14 @@ const app = new Hono<App>()
 				release: c.env.SENTRY_RELEASE,
 			})(c, next)
 	)
+
+	// The website (`www`) is a browser origin calling these endpoints directly, the way
+	// rec.net's own site called the game's API — so the responses need CORS headers or
+	// the browser discards them. `origin: '*'` is deliberate and safe HERE because these
+	// endpoints authenticate with a bearer token in the `Authorization` header, never a
+	// cookie: a hostile page can't read another origin's stored token, so there is no
+	// ambient credential for `*` to expose. Do not add cookie auth without narrowing it.
+	.use('*', withDefaultCors())
 
 	.onError(withOnError())
 	.notFound(withNotFound())
@@ -361,6 +408,10 @@ const app = new Hono<App>()
 				'`cached_login` grant (both read the same table). An account linked to several',
 				'platforms appears in each of their pickers. An unknown id yields `[]` (not a 404)',
 				'and the client falls back to a fresh login or create_account.',
+				'EXCEPT the exact identity `1/1` (Oculus, id `1`), which is stubbed for SIDELOADED',
+				'APKs: with no Meta SDK they have no real identity to ask about and stall on an',
+				'empty picker. It consults nothing and returns one canned, non-redeemable entry',
+				'with `requirePassword: true`, sending the build to username/password login.',
 			].join(' '),
 			parameters: [
 				{
@@ -379,13 +430,30 @@ const app = new Hono<App>()
 				},
 			],
 			responses: {
-				200: json(CachedLogin.array(), 'Matching accounts; `[]` if none'),
+				200: json(
+					CachedLogin.or(FakeCachedLogin).array(),
+					'Matching accounts; `[]` if none. The canned entry for `1/1`.'
+				),
 			},
 		}),
 		async (c) => {
 			const { platform, id } = c.req.param()
 			logger.info('cached login lookup', { platform, id })
 			const platformInt = Number.parseInt(platform, 10)
+			// SIDELOADED APKs ONLY. A sideloaded build has no Meta SDK behind it, so it can't
+			// produce a real Meta identity or a nonce to prove one with — it asks about the
+			// placeholder identity `1/1`, and an empty picker leaves it stuck on the platform
+			// login screen with nothing to do. Hand back one canned entry to push it onto the
+			// username/password login instead, which is the only flow such a build can finish.
+			// `requirePassword` is true for exactly that reason: there's no platform proof here,
+			// and the `cached_login` grant would (correctly) refuse this entry.
+			//
+			// Scoped to that ONE identity rather than to all of platform 1 — store builds do
+			// real Meta logins, and shadowing the whole platform would hide genuine links from
+			// their pickers.
+			if (platformInt === PlatformType.Oculus && id === SIDELOAD_PLATFORM_ID) {
+				return c.json([FAKE_OCULUS_CACHED_LOGIN])
+			}
 			// Listed straight from the link table, which is also what the `cached_login`
 			// grant authorizes against — so the picker can't offer an account the grant
 			// then refuses.
@@ -470,6 +538,11 @@ const app = new Hono<App>()
 				'fails. Meta logins therefore need the app secret (`META_APP_SECRET`) and answer 500',
 				'when it is unset. The first identity linked also becomes the account’s primary',
 				'(what the account DTO and a refreshed token report); later ones only link.',
+				'',
+				'The one platform id that is never verified and never linked is `1` on platform `1`',
+				'— what a SIDELOADED Oculus APK reports, having no Meta SDK to ask. Every such',
+				'build reports it, so it identifies nobody. A password login that carries it still',
+				'succeeds; it simply links nothing, and the player types their password each launch.',
 				'',
 				'**Roles.** The token embeds a `role` claim from the account, so developer/moderator',
 				'powers refresh on every login and every refresh grant.',

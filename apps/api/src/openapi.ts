@@ -320,8 +320,14 @@ export const InventionPersonalDetails = z.object({
 /** `POST /api/inventions/v1/settags` JSON body — both lists are replaced wholesale. */
 export const SetTagsRequest = z.object({
 	InventionId: z.int(),
-	AutoTags: z.array(z.string()).optional().describe('Client-derived tags (Type 2)'),
-	CustomTags: z.array(z.string()).optional().describe('Creator-submitted tags (Type 0)'),
+	AutoTags: z
+		.array(z.string())
+		.optional()
+		.describe('Client-derived tags (Type 2); each at most 15 letters once lowercased'),
+	CustomTags: z
+		.array(z.string())
+		.optional()
+		.describe('Creator-submitted tags (Type 0); each at most 15 letters once lowercased'),
 })
 
 /** `POST /api/inventions/v1/settags` response — `Tags` is the flat list of tag NAMES. */
@@ -341,8 +347,14 @@ export const SaveInventionRequest = z.object({
 	inventionDataFilename: z
 		.string()
 		.describe('The blob uploaded through the storage worker; the one required field'),
-	name: z.string().optional().describe('Defaults to “Untitled”'),
-	description: z.string().optional(),
+	name: z
+		.string()
+		.optional()
+		.describe('3–24 chars: letters, digits, spaces, dashes, colons. Omitted/blank ⇒ “Untitled”'),
+	description: z
+		.string()
+		.optional()
+		.describe('At most 512 chars. Omitted/blank ⇒ “No description yet”'),
 	imageName: z.string().optional(),
 	instantiationCost: z.int().optional(),
 	lightsCost: z.int().optional(),
@@ -408,10 +420,68 @@ export const KeepsakeConfig = z.object({
 	SocialXpBoostEnabled: z.boolean(),
 })
 
+/**
+ * A scheduled player event (Rec Room's `PlayerEvent`) — the record every read endpoint
+ * serves verbatim. The `State` / `Accessibility` / `*Permissions` ints are stored and
+ * echoed as the client sends them; their enums aren't reversed yet.
+ */
+export const PlayerEventDto = z.object({
+	PlayerEventId: z.int(),
+	CreatorPlayerId: z.int(),
+	ImageName: z.string().nullable().describe('Banner image; null until one is uploaded'),
+	RoomId: z.int(),
+	SubRoomId: z.int().nullable().describe('Null when the event doesn’t pin a subroom'),
+	ClubId: z.int().nullable().describe('Null when the event isn’t a club’s'),
+	Name: z.string(),
+	Description: z.string(),
+	StartTime: z.string().describe('ISO 8601 UTC, seconds precision (`2020-11-29T22:00:00Z`)'),
+	EndTime: z.string().describe('ISO 8601 UTC, seconds precision'),
+	AttendeeCount: z.int().describe('Starts at 1 — the creator attends their own event'),
+	State: z.int().describe('0 = scheduled'),
+	Accessibility: z.int(),
+	IsMultiInstance: z.boolean(),
+	SupportMultiInstanceRoomChat: z.boolean(),
+	DefaultBroadcastPermissions: z.int(),
+	CanRequestBroadcastPermissions: z.int(),
+})
+
+/** The `{ Result, TagModifyResult, PlayerEvent }` envelope the event writes answer with. */
+export const PlayerEventResultDto = z.object({
+	Result: z.int().describe('0 = success'),
+	TagModifyResult: z
+		.null()
+		.describe('Always null — the write carries no tag edit, as no event tags are stored'),
+	PlayerEvent: PlayerEventDto,
+})
+
+/**
+ * The JSON body of an event create / update. Every field is optional: create defaults
+ * what's missing, update leaves anything absent at its stored value. The fields may be
+ * posted at the top level or nested under `PlayerEvent` — the client posts back the
+ * same envelope it read — and both forms are accepted. `PlayerEventId`,
+ * `CreatorPlayerId` and `AttendeeCount` are ignored if present: the id is assigned
+ * here, the creator comes from the bearer token, and RSVPs aren't set by hand.
+ */
+export const PlayerEventRequest = PlayerEventDto.partial().extend({
+	PlayerEvent: z
+		.unknown()
+		.optional()
+		.describe('The event’s fields, if nested rather than posted at the top level'),
+})
+
+/** `POST /api/playerevents/v1/respond` JSON body — how the caller is answering. */
+export const PlayerEventRespondRequest = z.object({
+	PlayerEventId: z.int(),
+	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
+})
+
 /** `GET /api/playerevents/v1/all` — the caller's created events and RSVPs. */
 export const PlayerEventsAll = z.object({
-	Created: JsonArray,
-	Responses: JsonArray,
+	Created: z.array(PlayerEventDto).describe('Events the caller created, soonest first'),
+	Responses: JsonArray.describe(
+		'Events the caller RSVP’d to — always empty; RSVPs are stored, but this field’s ' +
+			'entry shape has not been observed yet'
+	),
 })
 
 /** `GET /api/playerevents/v1/club/:clubId` — the paged single-club event feed. */

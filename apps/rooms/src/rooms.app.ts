@@ -35,6 +35,7 @@ import {
 	publishSubRoomSave,
 	removeCheer,
 	removeFavorite,
+	roomNameRejection,
 	saveSubRoomData,
 	searchRooms,
 	setRoomDescription,
@@ -1071,6 +1072,9 @@ const app = new Hono<App>()
 			const name = typeof raw === 'string' ? raw.trim() : ''
 
 			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your room.')
+			// Shape before availability, so a rejected name costs no D1 read.
+			const badName = roomNameRejection(name, 'room name')
+			if (badName !== null) return roomEnvelope(c, null, badName)
 			if (await getRoomByName(c.env.DB, name)) {
 				return roomEnvelope(c, null, 'A room with that name already exists!')
 			}
@@ -1194,6 +1198,12 @@ const app = new Hono<App>()
 					ErrorId: 'Rooms.InvalidName',
 					Error: 'You must enter a name for your room!',
 				})
+			}
+			// Same ErrorId as the empty case — the client keys off it to mark the field, and
+			// both are the name being unusable. The sentence is what tells them which.
+			const badName = roomNameRejection(name, 'room name')
+			if (badName !== null) {
+				return roomResult(c, { Success: false, ErrorId: 'Rooms.InvalidName', Error: badName })
 			}
 
 			// Reject if a different room already uses this name (case-insensitive).
@@ -1752,24 +1762,31 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Add a load screen to a room (`LoadScreens[]` — the images shown while the room
-	// loads). Auth-gated (401) and owner/co-owner-only (403). Body is the `imageName`
-	// form field plus optional `title`/`subtitle`. Appends one
-	// `{ ImageName, Title, Subtitle }` to the existing list and returns the updated
-	// room in the `{ success, error, value }` envelope.
+	// Set a room's load screen (`LoadScreens[]` — the image shown while the room loads).
+	// Auth-gated (401) and owner/co-owner-only (403). Body is the `imageName` form field
+	// plus optional `title`/`subtitle`. REPLACES the list with the single posted
+	// `{ ImageName, Title, Subtitle }` and returns the updated room in the
+	// `{ success, error, value }` envelope.
+	//
+	// The field is an array because the client's parser wants one, but the client only
+	// ever renders (and only ever posts) a single screen — appending left the old screen
+	// in slot 0 and the new one unreachable behind it, so setting a load screen appeared
+	// to do nothing. Kept as an array so multi-screen support can land without a
+	// migration.
 	.put(
 		'/rooms/:roomId{[0-9]+}/loadscreen',
 		describeRoute({
 			tags: ['Room settings'],
-			summary: 'Add a load screen to a room',
+			summary: 'Set a room’s load screen',
 			description: [
-				'APPENDS one `{ ImageName, Title, Subtitle }` to the room’s `LoadScreens` — the images',
-				'shown while the room loads. There is no remove or replace counterpart. Owner or',
-				'co-owner only (403 otherwise).',
+				'REPLACES the room’s `LoadScreens` with the single posted `{ ImageName, Title,',
+				'Subtitle }` — the image shown while the room loads. The field is an array (the',
+				'client’s parser expects one) but the client only supports a single screen, so this',
+				'never appends. Owner or co-owner only (403 otherwise).',
 			].join(' '),
 			security: AUTHED,
 			parameters: [roomIdParam],
-			requestBody: form(LoadScreenRequest, 'The load screen to append'),
+			requestBody: form(LoadScreenRequest, 'The load screen to set'),
 			responses: {
 				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
@@ -1793,8 +1810,8 @@ const app = new Hono<App>()
 			const title = typeof body.title === 'string' ? body.title : ''
 			const subtitle = typeof body.subtitle === 'string' ? body.subtitle : ''
 
-			const existing = Array.isArray(room.LoadScreens) ? (room.LoadScreens as unknown[]) : []
-			const loadScreens = [...existing, { ImageName: imageName, Title: title, Subtitle: subtitle }]
+			// The posted screen becomes the whole list — the client shows one load screen.
+			const loadScreens = [{ ImageName: imageName, Title: title, Subtitle: subtitle }]
 			const updated = await updateRoomFields(c.env.DB, roomId, room, { LoadScreens: loadScreens })
 			await pushRoomUpdate(c, accountId, updated)
 			return roomEnvelope(c, updated)
@@ -2067,6 +2084,10 @@ const app = new Hono<App>()
 					ErrorId: 'Rooms.InvalidName',
 					Error: 'You must enter a name for your room!',
 				})
+			}
+			const badName = roomNameRejection(name, 'subroom name')
+			if (badName !== null) {
+				return roomResult(c, { Success: false, ErrorId: 'Rooms.InvalidName', Error: badName })
 			}
 			const maxPlayers =
 				typeof body.maxPlayers === 'string' ? Number.parseInt(body.maxPlayers, 10) : Number.NaN
@@ -2376,6 +2397,8 @@ const app = new Hono<App>()
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const name = typeof body.name === 'string' ? body.name.trim() : ''
 			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
+			const badName = roomNameRejection(name, 'subroom name')
+			if (badName !== null) return roomEnvelope(c, null, badName)
 
 			const result = await createSubRoom(c.env.DB, roomId, accountId, name)
 			if (!result) return roomEnvelope(c, null, 'This room does not exist!')

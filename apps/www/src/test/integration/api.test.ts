@@ -1,9 +1,12 @@
 import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { beforeAll, expect, it } from 'vitest'
 
+import { PRESENCE_SCHEMA_DDL, PRESENCE_TTL_SECONDS } from '@repo/domain/src/presence-db'
+
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
 import { turnstileKeys } from '../../turnstile'
+import { postAuthForm, readAuthError } from '../../upstream'
 
 import type { Env } from '../../context'
 
@@ -21,24 +24,54 @@ const TEST_SECRET_KEY = '1x0000000000000000000000000000000AA'
 beforeAll(async () => {
 	await adminSecretsStore(env.TURNSTILE_SITE_KEY).create(TEST_SITE_KEY)
 	await adminSecretsStore(env.TURNSTILE_SECRET_KEY).create(TEST_SECRET_KEY)
-})
-
-it('rejects unauthenticated account reads', async () => {
-	const res = await SELF.fetch('https://example.com/api/me')
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
+	// `presence` is owned (and migrated) by other workers — www only reads it — so the
+	// table has to be created here for the head-count behind /server-status.
+	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Web signup is open, but only behind the Turnstile check. These pin the closed door:
 // the pass path can't be tested here (it would call Cloudflare's siteverify for real).
-it('advertises signup with the Turnstile site key the widget needs', async () => {
+//
+// The hostnames matter as much as the key: the SPA calls auth/accounts/api/notify
+// DIRECTLY (as rec.net's site did), and this is the only place it learns where they are.
+// A build with them missing can't sign anyone in.
+it('advertises signup and where the other workers live', async () => {
 	const res = await SELF.fetch('https://example.com/api/config')
 	expect(res.status).toBe(200)
 	// Read through the Secrets Store binding, from the value seeded above.
 	expect(await res.json()).toEqual({
 		signupEnabled: true,
 		turnstileSiteKey: TEST_SITE_KEY,
+		hosts: {
+			auth: 'https://auth.rec.example.com',
+			accounts: 'https://accounts.rec.example.com',
+			api: 'https://api.rec.example.com',
+			img: 'https://img.rec.example.com',
+			notify: 'https://notify.rec.example.com',
+		},
 	})
+})
+
+// The BFF proxies are gone: the browser calls those workers itself. Pinned because
+// nothing else would fail if one were left behind — a stale proxy keeps working, it just
+// re-creates the maintenance burden (and the shared-IP bug) this removed. `/api/signup`
+// is the deliberate exception, and it's covered below.
+it('no longer proxies the endpoints the game already serves', async () => {
+	for (const path of [
+		'/api/me',
+		'/api/login',
+		'/api/logout',
+		'/api/username',
+		'/api/email',
+		'/api/password',
+		'/api/maintenance',
+		'/api/coach-message',
+		'/api/slideshow',
+	]) {
+		const res = await SELF.fetch(`https://example.com${path}`, { method: 'POST' })
+		// Falls through to the SPA catch-all, which has no ASSETS binding under test.
+		expect(res.status, path).toBe(404)
+	}
 })
 
 // The keypair is the on/off switch for signup, so a www whose keys don't resolve must
@@ -87,19 +120,6 @@ it('refuses a signup with no Turnstile token', async () => {
 	expect(await res.json()).toEqual({ error: 'Please complete the bot check.' })
 })
 
-// The email is optional, but a malformed one is rejected BEFORE the account is created —
-// the accounts worker would refuse to store it, and by then the account exists and the
-// player would be left with an account whose email silently didn't save.
-it('refuses a signup whose email could not be stored', async () => {
-	const res = await SELF.fetch('https://example.com/api/signup', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ password: 'whatever', email: 'not-an-address', turnstileToken: 'x' }),
-	})
-	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'That email address looks wrong.' })
-})
-
 it('refuses a signup with no password', async () => {
 	const res = await SELF.fetch('https://example.com/api/signup', {
 		method: 'POST',
@@ -110,34 +130,131 @@ it('refuses a signup with no password', async () => {
 	expect(await res.json()).toEqual({ error: 'A password is required.' })
 })
 
-it('requires credentials to log in', async () => {
-	const res = await SELF.fetch('https://example.com/api/login', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ username: 'alice' }),
-	})
-	expect(res.status).toBe(400)
-	expect(await res.json()).toEqual({ error: 'Username and password are required.' })
+// A refused grant reaches the form as a sentence, never as the OAuth code. auth answers
+// `{ error: 'invalid_grant', error_description: <the actual reason> }`, and www used to
+// relay that untouched — so every failed signup, including one the player could act on
+// (the per-network cap), read simply "invalid_grant". Checked directly because the pass
+// path can't be reached from here (it would call the real auth worker).
+it('explains a refused signup instead of relaying invalid_grant', async () => {
+	const refused = (description: string, status = 400) =>
+		new Response(JSON.stringify({ error: 'invalid_grant', error_description: description }), {
+			status,
+			headers: { 'content-type': 'application/json' },
+		})
+
+	const capped = await readAuthError(
+		refused('too many accounts created from this network'),
+		'signup'
+	)
+	expect(capped.status).toBe(400)
+	expect(capped.message).toContain('Too many accounts have already been created from your network')
+	// The raw pair still reaches the operator's log line.
+	expect(capped.upstream).toBe('invalid_grant: too many accounts created from this network')
+
+	const badPassword = await readAuthError(refused('invalid account_id or password'), 'login')
+	expect(badPassword.message).toBe('That username or password is incorrect.')
+
+	// A description auth grew since this table was written must not leak through as-is:
+	// it's written for an operator, so an unmapped one falls back to the generic sentence.
+	const unmapped = await readAuthError(refused('some new internal reason'), 'signup')
+	expect(unmapped.message).not.toContain('some new internal reason')
+	expect(unmapped.message).toContain('could not be created')
+
+	// Nothing about the form was wrong — auth couldn't proceed (an unset JWT_SECRET). Don't
+	// send them back to re-check their details, and don't answer 400 for our own fault.
+	const broken = await readAuthError(
+		new Response(
+			JSON.stringify({
+				error: 'server_error',
+				error_description: 'token signing is not configured',
+			}),
+			{ status: 500, headers: { 'content-type': 'application/json' } }
+		),
+		'signup'
+	)
+	expect(broken.status).toBe(502)
+	expect(broken.message).toContain('problem on our end')
+
+	// A body from something in front of auth (an edge error page) is not JSON at all.
+	const html = await readAuthError(new Response('<html>502</html>', { status: 502 }), 'signup')
+	expect(html.status).toBe(502)
+	expect(html.message).toContain('problem on our end')
+	expect(html.upstream).toBe('HTTP 502')
 })
 
-it('rejects an unauthenticated maintenance broadcast', async () => {
-	const res = await SELF.fetch('https://example.com/api/maintenance', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ startsInMinutes: 15 }),
-	})
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
+// The signup cap counts auth's `CF-Connecting-IP` as the account's immutable `signupIp`,
+// and www used to reach auth over https://auth.<DOMAIN> — a Worker subrequest, which
+// re-enters the Cloudflare edge, which REPLACES that header with Cloudflare's own
+// address. Every browser signup therefore shared one IP, and the cap (3, never decaying)
+// refused the fourth web account ever created, for everyone. The service binding skips
+// the edge, so the header set here is the one auth reads.
+//
+// Checked directly rather than through /api/signup: the pass path would call Cloudflare's
+// siteverify for real (see the Turnstile tests above).
+it('carries the browser IP across to auth instead of losing it to the edge', async () => {
+	const seen: Request[] = []
+	const withAuth = (fetcher?: Fetcher) =>
+		({
+			DOMAIN: 'rec.example.com',
+			AUTH: fetcher,
+		}) as unknown as Env
+	const capture = {
+		fetch: async (request: Request) => {
+			seen.push(request)
+			return new Response('{}', { headers: { 'content-type': 'application/json' } })
+		},
+	} as unknown as Fetcher
+
+	await postAuthForm(
+		withAuth(capture),
+		'/connect/token',
+		{ grant_type: 'create_account', password: 'hunter2' },
+		{ clientIp: '203.0.113.7' }
+	)
+
+	// The binding is used in preference to the hostname, and the real IP rides along.
+	expect(seen).toHaveLength(1)
+	expect(seen[0]!.headers.get('cf-connecting-ip')).toBe('203.0.113.7')
+	// Still the same host/path/body auth already answers — only the transport changed.
+	expect(seen[0]!.url).toBe('https://auth.rec.example.com/connect/token')
+	const body = await seen[0]!.formData()
+	expect(body.get('grant_type')).toBe('create_account')
+	expect(body.get('password')).toBe('hunter2')
+
+	// A call with no IP to forward must not invent one: an absent header leaves auth's
+	// own `clientIp` empty, which SKIPS the cap, rather than counting everyone together.
+	// Reachable in local dev, where the edge sets no `cf-connecting-ip` to pass on.
+	await postAuthForm(withAuth(capture), '/connect/token', { grant_type: 'create_account' })
+	expect(seen[1]!.headers.get('cf-connecting-ip')).toBeNull()
 })
 
-it('rejects an unauthenticated coach message', async () => {
-	const res = await SELF.fetch('https://example.com/api/coach-message', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ messageContent: 'hello all' }),
+// The public status snapshot. Two things are pinned: it needs no auth and no origin (a
+// status page or Discord bot fetches it from anywhere), and its player count is LIVE
+// presence — a row whose TTL has run out is a player who crashed or hard-quit, and
+// counting them would leave the number permanently inflated between sweeps.
+it('serves a public head-count of the players actually online', async () => {
+	const now = Math.floor(Date.now() / 1000)
+	const write = (accountId: number, expiresAt: number) =>
+		env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId, roomInstance: null, expiresAt }))
+			.run()
+
+	// Empty table: online, nobody playing.
+	let res = await SELF.fetch('https://example.com/server-status')
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ status: 'online', players: 0 })
+
+	await write(1, now + PRESENCE_TTL_SECONDS) // in a lobby — still online
+	await write(2, now + PRESENCE_TTL_SECONDS)
+	await write(3, now - 1) // stopped heartbeating, not yet swept
+
+	res = await SELF.fetch('https://example.com/server-status', {
+		headers: { origin: 'https://s.example' },
 	})
-	expect(res.status).toBe(401)
-	expect(await res.json()).toEqual({ error: 'not signed in' })
+	expect(res.status).toBe(200)
+	// Readable from any origin — it's meant to be embedded elsewhere.
+	expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	expect(await res.json()).toEqual({ status: 'online', players: 2 })
 })
 
 it('serves the aggregated docs page with a source per documented service', async () => {

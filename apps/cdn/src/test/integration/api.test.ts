@@ -101,6 +101,21 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('GET /data/:id streams the data blob from R2', async () => {
+		// Date-foldered — the name the storage worker generates for a FileType 2 upload.
+		const name = '2026-08-05/3b9c1f0a-5d2e-4c1b-9a77-2e6f0b4d8c31'
+		await env.CDN_ASSETS.put(`data/${name}`, new Uint8Array([4, 5, 6]))
+		const res = await exports.default.fetch(`${ORIGIN}/data/${name}`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('application/octet-stream')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([4, 5, 6]))
+	})
+
+	test('GET /data/:id 404s when the blob is absent', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/data/missing`)
+		expect(res.status).toBe(404)
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -124,6 +139,7 @@ describe('cdn endpoints', () => {
 		expect([...documented].sort()).toEqual([
 			'GET /',
 			'GET /config/LoadingScreenTipData',
+			'GET /data/{id}',
 			'GET /invention/{dataBlob}',
 			'GET /room/{dataBlob}',
 			'GET /sigs/{sigName}',

@@ -35,7 +35,7 @@ import type { App } from './context'
  */
 const UPLOAD_SUBFOLDER: Record<number, string> = {
 	1: 'room',
-	2: 'holotar',
+	2: 'data',
 	3: 'image',
 	4: 'video',
 	5: 'invention',

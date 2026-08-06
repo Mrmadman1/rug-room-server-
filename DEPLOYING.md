@@ -267,6 +267,15 @@ printf '1x0000000000000000000000000000000AA' |
 Both `auth` account caps above still apply on top of the bot check, and the per-IP one is
 the only cap that can see a web signup.
 
+`www` reaches `auth` through a **service binding**, not over `auth.<DOMAIN>`, so that the
+player's real IP survives the hop: a Worker subrequest to the public hostname re-enters
+the Cloudflare edge, which rewrites `CF-Connecting-IP` to Cloudflare's own address, and
+`auth` would then record one shared `signupIp` for every web account and cap the whole
+internet at three. Two consequences: **deploy `auth` before `www`** on a fresh account
+(the binding refuses to resolve otherwise), and web accounts created before this change
+carry that shared address as their permanent `signupIp` — harmless, but they are not
+counted against any real network.
+
 ## Repository Structure
 
 - `apps/` - The service workers, one deployable Worker per subdirectory. Each has

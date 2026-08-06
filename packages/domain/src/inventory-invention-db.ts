@@ -1,7 +1,7 @@
 /**
  * Owned inventions on the shared `recflare` D1 database — the inventions a player has
- * bought. One row per (account, invention), written at purchase time by
- * `GET /api/storefronts/v2/buyInvention`.
+ * bought. One row per (account, invention), written at purchase time by the `econ`
+ * worker's `GET /api/storefronts/v2/buyInvention`.
  *
  * Only the invention id is stored: the invention record itself lives in the `invention`
  * table, whose schema the `api` worker owns (apps/api/migrations/0002_invention.sql) on
@@ -9,8 +9,10 @@
  * creator is not listed here either — they own their invention through its
  * `CreatorPlayerId`, and the buy path refuses to sell an invention to its own creator.
  *
- * This worker (`econ`) owns the table and its migration — see apps/econ/migrations/
- * 0008_inventory_invention.sql.
+ * The `econ` worker owns the schema/migration (apps/econ/migrations/
+ * 0008_inventory_invention.sql) and is the only writer; `api` only reads, to fold bought
+ * inventions into `GET /api/inventions/v2/mine`. Both import these helpers so the table
+ * name and row shape live in one place — the same split as gifts-db.ts.
  */
 
 /** Schema DDL (mirror of migrations 0008_inventory_invention.sql) — also builds the table in tests. */
@@ -58,6 +60,36 @@ export async function ownsInvention(
 		.bind(accountId, inventionId)
 		.first<{ owned: number }>()
 	return row !== null
+}
+
+/**
+ * How many times each invention was acquired at or after `since`, most-acquired first
+ * (ties broken by newest invention, so paging is stable). Backs the `api` worker's "top
+ * today" feed, which passes 24 hours ago.
+ *
+ * `acquired_at` holds `toISOString()` output, which is fixed-width UTC, so a lexical
+ * `>=` on the string is a chronological comparison — no date parsing in SQL.
+ *
+ * This counts ACQUISITIONS, not spend: a free invention's grant is a row here just like
+ * a paid one, and one player can only ever contribute a single row per invention (the
+ * table's primary key), so a popular invention can't be inflated by one buyer. Creators
+ * are absent by design — they own theirs through `CreatorPlayerId` and never buy it —
+ * which is what makes this a measure of what other people picked up.
+ */
+export async function getInventionAcquisitionCounts(
+	db: D1Database,
+	since: string
+): Promise<Array<{ inventionId: number; count: number }>> {
+	const { results } = await db
+		.prepare(
+			`SELECT invention_id, COUNT(*) AS count FROM inventory_invention
+			 WHERE acquired_at >= ?1
+			 GROUP BY invention_id
+			 ORDER BY count DESC, invention_id DESC`
+		)
+		.bind(since)
+		.all<{ invention_id: number; count: number }>()
+	return results.map((r) => ({ inventionId: r.invention_id, count: r.count }))
 }
 
 /** The ids of every invention a player has bought, oldest purchase first. */

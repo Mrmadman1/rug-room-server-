@@ -198,6 +198,23 @@ describe('auth worker routes', () => {
 		}
 	)
 
+	// The one stubbed identity: `1/1` consults nothing and always answers the canned
+	// entry, which is how a sideloaded APK (no Meta SDK, so no real identity) gets off
+	// the platform login screen and onto username/password.
+	test('GET /cachedlogin/forplatformid/1/1 returns the canned Oculus entry', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/cachedlogin/forplatformid/1/1`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([
+			{
+				platform: 1,
+				platformId: '1',
+				accountId: 1,
+				lastLoginTime: '2026-07-19T17:13:29.225Z',
+				requirePassword: true,
+			},
+		])
+	})
+
 	// Only Steam (0) and Meta (1) can be verified — Steam by its signed platform_auth
 	// ticket, Meta by validating its nonce with Meta. Every OTHER platform is rejected
 	// on the platform-authenticated grants: we won't bind or authorize an identity we
@@ -876,6 +893,26 @@ describe('auth worker routes', () => {
 			expect(await getLinksForAccount(env.DB, 7103)).toEqual([])
 		})
 
+		test('a sideloaded APK (platform id 1) logs in but is never linked', async () => {
+			// The sideload placeholder identifies nobody — every sideloaded headset reports
+			// `1`, so a link on it would be a password-free way into this account from any of
+			// them. The password login still stands; Meta is never even asked, since there is
+			// nothing there to validate.
+			await seedPasswordAccount(7105, 'sideloader')
+			const login = await metaLogin(
+				`grant_type=password&username=sideloader&password=${LOGIN_PASSWORD}` +
+					`&platform=1&platform_id=1` +
+					`&platform_auth=${encodeURIComponent(metaPlatformAuth())}`,
+				true // even with Meta answering yes to everything
+			)
+			expect(login.status).toBe(200)
+			expect(login.graphCalls).toHaveLength(0)
+			expect(await getLinksForAccount(env.DB, 7105)).toEqual([])
+			// And so the picker never offers this account off the placeholder — only the
+			// canned stub entry is there.
+			expect((await cachedLogins(1, '1')).map((a) => a.accountId)).toEqual([1])
+		})
+
 		test('linking obeys the per-identity account cap, without failing the login', async () => {
 			// Otherwise the signup cap would be trivially bypassable: create accounts with a
 			// password, then link the capped identity into all of them.
@@ -1045,5 +1082,69 @@ describe('auth worker routes', () => {
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
 		}
+	})
+})
+
+// The website is a browser origin calling these endpoints directly — the same ones the
+// game calls — instead of proxying them through `www`. That only works if the responses
+// carry CORS headers: without them the browser discards a perfectly good token response
+// and sign-in fails with nothing in any server log to explain it.
+describe('CORS', () => {
+	test('answers the preflight the browser sends before a token grant', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/connect/token`, {
+				method: 'OPTIONS',
+				headers: {
+					origin: 'https://www.example.com',
+					'access-control-request-method': 'POST',
+					'access-control-request-headers': 'content-type',
+				},
+			}),
+			env
+		)
+		expect(res.status).toBe(204)
+		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+			'content-type'
+		)
+	})
+
+	// The header has to be on the REAL response too, not just the preflight — and on a
+	// refusal as much as a success, or a rejected sign-in reaches the page as an opaque
+	// network error rather than "that password is incorrect".
+	test('allows the origin on the response itself, refusals included', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/connect/token`, {
+				method: 'POST',
+				headers: {
+					origin: 'https://www.example.com',
+					'content-type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ grant_type: 'password', username: 'nobody' }).toString(),
+			}),
+			env
+		)
+		expect(res.status).toBe(400)
+		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	})
+
+	// The bearer header is what the SPA authenticates with, so it must be allowed by name
+	// — a preflight that omits it makes every signed-in call fail.
+	test('allows the Authorization header the SPA signs its calls with', async () => {
+		const res = await exports.default.fetch(
+			new Request(`${ORIGIN}/account/me/changepassword`, {
+				method: 'OPTIONS',
+				headers: {
+					origin: 'https://www.example.com',
+					'access-control-request-method': 'POST',
+					'access-control-request-headers': 'authorization',
+				},
+			}),
+			env
+		)
+		expect(res.status).toBe(204)
+		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+			'authorization'
+		)
 	})
 })
