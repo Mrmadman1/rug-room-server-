@@ -4,7 +4,8 @@ import isEmail from 'isemail'
  * Limits on the free text a player can put into their account and their rooms.
  *
  * Shared by `accounts` and `rooms` so one rule can't drift from the other — a username
- * and a room name are held to the same shape, and both are typed into the same client.
+ * and a room name are held to nearly the same shape (a room name also takes underscores),
+ * and both are typed into the same client.
  *
  * These check only what a player SUPPLIES. Names the server generates go around them:
  * a dorm is called `@<username>'s Dorm` (see `rooms-db.ts`), which the name rule below
@@ -89,6 +90,32 @@ export function nameRejection(value: string, label: string, max: number): string
 	}
 	if (!NAME_PATTERN.test(value)) {
 		return `Your ${label} can only contain letters and numbers.`
+	}
+	return null
+}
+
+/**
+ * Letters, digits and underscores — `NAME_PATTERN` plus the one separator a room name is
+ * allowed. A room name is a label other players read in a browse tile rather than
+ * something typed into a sign-in box, and the underscore is how players write the space
+ * the rule still refuses (`Laser_Tag`). It carries none of the homoglyph or
+ * right-to-left risk that widening to arbitrary Unicode would.
+ */
+const ROOM_NAME_PATTERN = /^[A-Za-z0-9_]+$/
+
+/**
+ * Why a player-supplied room or subroom name is unacceptable, or `null` when it's fine.
+ *
+ * Separate from `nameRejection` rather than a flag on it: usernames are held to the
+ * narrower rule, and the two limits differ. `label` names the thing in the returned
+ * sentence ('room name', 'subroom name'), which the client renders verbatim.
+ */
+export function roomNameRejection(value: string, label: string): string | null {
+	if (value.length > MAX_ROOM_NAME_LENGTH) {
+		return `Your ${label} can be at most ${MAX_ROOM_NAME_LENGTH} characters.`
+	}
+	if (!ROOM_NAME_PATTERN.test(value)) {
+		return `Your ${label} can only contain letters, numbers and underscores.`
 	}
 	return null
 }
