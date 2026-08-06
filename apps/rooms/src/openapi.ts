@@ -213,9 +213,10 @@ export const SubRoomDataSaveDto = z.object({
  * sequence, not per-room); a room's `SubRooms` array is reconstructed on read.
  *
  * `CreatorAccountId` starts null on the seeded rooms and is filled in on the first save —
- * the client NREs on a null one. `CurrentSave` is null until the first save; the flat
- * `DataBlob`/`RoomDataBlob`/`DataSavedAt` fields are legacy and are NOT what the client
- * loads from.
+ * the client NREs on a null one. `CurrentSave` is the published save, or the staged one
+ * when nothing has been published; with neither it is ABSENT rather than null (a null one
+ * breaks the client's parser). The flat `DataBlob`/`RoomDataBlob`/`DataSavedAt` fields are
+ * legacy and are NOT what the client loads from.
  */
 export const SubRoomDto = z.object({
 	SubRoomId: z.int(),
@@ -231,8 +232,8 @@ export const SubRoomDto = z.object({
 		.describe('0 Private, 1 Public, 2 Unlisted, 3 Dev_only, 4 Dev_Unlisted — set independently'),
 	ShouldAutoStageSaves: z.boolean(),
 	StagedSubRoomDataSaveId: z.int().nullable(),
-	CurrentSave: SubRoomDataSaveDto.nullable().describe(
-		'The latest room save — where the client finds the scene blob. Null until first save'
+	CurrentSave: SubRoomDataSaveDto.optional().describe(
+		'The room save the client loads the scene blob from: the published one, falling back to the STAGED one when nothing has been published yet. Omitted entirely (never null) when the subroom has neither'
 	),
 	DataBlob: z.string().optional().describe('Legacy flat key; the client reads `CurrentSave`'),
 	RoomDataBlob: z.string().optional().describe('Uploaded room-data key; absent until first save'),

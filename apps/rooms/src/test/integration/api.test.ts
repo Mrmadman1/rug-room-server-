@@ -1470,19 +1470,22 @@ describe('rooms endpoints', () => {
 		expect(coOwnerEnv.value.subRoomDataSave).toMatchObject({ savedByAccountId: 2 })
 	})
 
-	it('GET /rooms/:id gives every subroom a CurrentSave key (null before the first save)', async () => {
-		// The client loads a subroom's scene data from CurrentSave and nothing else, so
-		// the key must be PRESENT — the seeded rooms predate it and have no such field in
-		// their stored blob. `in` rather than a value check: absent and null differ here.
+	it('GET /rooms/:id omits CurrentSave entirely on a never-saved subroom', async () => {
+		// A null CurrentSave breaks the client's room parser, so an unsaved subroom has to
+		// carry no such key at all. `in` rather than a value check: absent and null differ
+		// here, and null is exactly what this must not be.
 		// Room 3 is seeded and never saved by another test (room 2 is the save fixture).
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/3`)).json()) as {
 			SubRooms: Array<Record<string, unknown>>
 		}
 		expect(room.SubRooms.length).toBeGreaterThan(0)
 		for (const sub of room.SubRooms) {
-			expect('CurrentSave' in sub).toBe(true)
-			expect(sub.CurrentSave).toBeNull()
+			expect('CurrentSave' in sub).toBe(false)
 		}
+		// Not just missing from the parsed object — absent from the wire bytes too, which is
+		// what the client's parser actually reads.
+		const raw = await (await SELF.fetch(`${ORIGIN}/rooms/3`)).text()
+		expect(raw).not.toContain('"CurrentSave"')
 	})
 
 	it('a real client room-save body stages, and publish_save makes it live', async () => {
@@ -1493,7 +1496,7 @@ describe('rooms endpoints', () => {
 				body: JSON.stringify(body),
 			})
 		type Sub = {
-			CurrentSave: Record<string, unknown> | null
+			CurrentSave?: Record<string, unknown>
 			StagedSubRoomDataSaveId: number | null
 		}
 		const subOf = async () => (await subRoomOf(5, 5)) as unknown as Sub
@@ -1520,11 +1523,16 @@ describe('rooms endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 
-		// Room 5 is not a dorm → staged, nothing live yet.
+		// Room 5 is not a dorm → the save is STAGED, not published. Nothing has ever been
+		// published here, so there is no older version to keep serving: CurrentSave falls
+		// back to the staged save rather than leaving the subroom reading as never-saved.
 		const stagedSub = await subOf()
-		expect(stagedSub.CurrentSave).toBeNull()
 		const firstId = stagedSub.StagedSubRoomDataSaveId!
 		expect(firstId).toBeGreaterThan(0)
+		expect(stagedSub.CurrentSave).toMatchObject({
+			SubRoomDataSaveId: firstId,
+			DataBlob: '2026-07-28/f176fc3b-scene',
+		})
 
 		// Publishing makes it what the loader fetches, and clears the staging slot.
 		expect((await publish(firstId)).status).toBe(200)
@@ -1548,7 +1556,7 @@ describe('rooms endpoints', () => {
 
 		// It's on the room read too — that's what the loader actually fetches.
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/5`)).json()) as {
-			SubRooms: Array<{ SubRoomId: number; CurrentSave: { SubRoomDataSaveId: number } | null }>
+			SubRooms: Array<{ SubRoomId: number; CurrentSave?: { SubRoomDataSaveId: number } }>
 		}
 		expect(room.SubRooms.find((s) => s.SubRoomId === 5)!.CurrentSave!.SubRoomDataSaveId).toBe(
 			firstId
@@ -1693,9 +1701,9 @@ describe('rooms endpoints', () => {
 			headers: await bearer('1'),
 		})
 		const body = (await res.json()) as {
-			value: { SubRooms: Array<{ SubRoomId: number; CurrentSave: { SubRoomId: number } | null }> }
+			value: { SubRooms: Array<{ SubRoomId: number; CurrentSave?: { SubRoomId: number } }> }
 		}
-		const clone = body.value.SubRooms.find((s) => s.SubRoomId !== 2 && s.CurrentSave !== null)!
+		const clone = body.value.SubRooms.find((s) => s.SubRoomId !== 2 && s.CurrentSave !== undefined)!
 		expect(clone).toBeDefined()
 		// The copy's save must claim the COPY, or the client resolves it against the source.
 		expect(clone.CurrentSave!.SubRoomId).toBe(clone.SubRoomId)
