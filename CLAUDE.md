@@ -90,29 +90,20 @@ inconsistency here without checking the client first.
   no asset arrays; but `unityAsset`/`unityAssetHash`). Don't unify the two projections.
 - A subroom's saved scene loads from `CurrentSave.DataBlob` (`rooms`: `GET /rooms/:id`),
   NOT the flat `DataBlob` on the subroom — a subroom with no `CurrentSave` silently loads
-  nothing. Read it via `subRoomDataBlob()` so `match`/`auth` instance payloads resolve it
-  the same way. It resolves in `attachCurrentSaves`, which every room read goes through:
-  the PUBLISHED save (`current_save_id`), falling back to the STAGED one
-  (`staged_save_id`) when nothing has been published yet, and with NEITHER the key is
-  omitted entirely — a `CurrentSave: null` breaks the client on every endpoint that serves
-  rooms (not just the save flow — `/rooms/ownedby/me` and friends too). Don't reintroduce
-  a null in a hand-built subroom payload.
+  nothing. The key must be present (null before the first publish); read it via
+  `subRoomDataBlob()` so `match`/`auth` instance payloads resolve it the same way.
 - A room save (`rooms`: `POST …/subrooms/:sid/data`) publishes only when the body says
   `AutoPublish: true`; otherwise it STAGES onto `StagedSubRoomDataSaveId` and leaves
-  `current_save_id` alone, so players keep loading the last published version until the
-  owner posts `…/subrooms/:sid/publish_save` with `subRoomDataSaveId=<id>` — except before
-  the FIRST publish, where `CurrentSave` falls back to the staged save (there is no older
-  version to keep serving, and a subroom that has been saved shouldn't read as empty).
-  DORMS always
+  `CurrentSave` alone, so players keep loading the last published version until the owner
+  posts `…/subrooms/:sid/publish_save` with `subRoomDataSaveId=<id>`. DORMS always
   publish: no publish step exists in the client for them. Saves live in the
   `subroom_save` table with globally-unique ids (a bare id has to resolve —
   `StagedSubRoomDataSaveId` carries no subroom context), and nothing is overwritten, so
   `…/saves` is real history and `publish_save` doubles as restore-a-save. `…/saves` is
   auth-gated and CREATOR-only (not co-owners) — it lists unpublished staged saves. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
-- Matchmaking (`match`: `/matchmake/room/:roomId/:subRoomId`) serves whatever
-  `CurrentSave` resolves to — the published save once there is one — to everyone alike,
-  creator included. Joining a private instance, the client itself asks
+- Matchmaking (`match`: `/matchmake/room/:roomId/:subRoomId`) always serves the PUBLISHED
+  `CurrentSave` blob, creator included. Joining a private instance, the client itself asks
   the owner whether to load the latest or the published version and resolves it from the
   `/subrooms/:sid/saves` list — the matchmake call is identical either way. Don't make
   this server-side: it would put two people in one instance on different versions.

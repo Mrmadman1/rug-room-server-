@@ -797,7 +797,7 @@ export async function createSubRoom(
 		LastModeratedSaveModerationState: 0,
 		ShouldAutoStageSaves: true,
 		// Nothing saved yet — the first room save mints one and points current_save_id
-		// at it. Until then the subroom reads with no `CurrentSave` key at all.
+		// at it. Until then the subroom reads with `CurrentSave: null`.
 	})
 	// Refresh the hydrated SubRooms so the returned room includes the one just inserted.
 	await attachSubRooms(db, [room])
@@ -863,11 +863,10 @@ const SUBROOM_COLUMNS = 'sub_room_id, room_id, data, current_save_id, staged_sav
 
 /**
  * Materialize a subroom row into its client shape, with the columns authoritative.
- * `CurrentSave` is left alone here and resolved by {@link attachCurrentSaves} — it lives
- * in `subroom_save`, and resolving it per row would be a query each. Callers must go
- * through the helpers below rather than this: the client reads the scene blob from
- * `CurrentSave` and nowhere else, so a subroom served without one loads nothing, and a
- * stale one spread out of the stored blob would point at another subroom's save.
+ * `CurrentSave` is left undefined here and filled in by {@link attachCurrentSaves} — it
+ * lives in `subroom_save`, and resolving it per row would be a query each. Callers must
+ * go through the helpers below so the key is never missing: the client reads the scene
+ * blob from `CurrentSave` and nowhere else, so a subroom without one loads nothing.
  */
 const parseSubRoomRow = (row: SubRoomRow): SubRoom => ({
 	...(JSON.parse(row.data) as SubRoom),
@@ -905,30 +904,11 @@ const serializeRoom = (room: Room): string => {
 }
 
 /**
- * The save a subroom actually serves as its `CurrentSave`: the published one, or the
- * staged one when nothing has been published yet. Null when it has neither.
- */
-const liveSaveId = (row: SubRoomRow): number | null => row.current_save_id ?? row.staged_save_id
-
-/**
  * Fill in each subroom's `CurrentSave` from `subroom_save`, in ONE query for the whole
- * batch.
+ * batch. Every subroom ends up with the key present — null when it points at no save
+ * (never saved) or the pointer dangles — because the client's loader reads it directly.
  *
- * `current_save_id` (the published save) wins; a subroom that has none FALLS BACK to
- * `staged_save_id`, so a subroom whose only save is unpublished still serves that save as
- * its `CurrentSave` rather than reading as never-saved. Note what this means for staging:
- * before the first publish there is nothing older to keep serving, so the staged work is
- * what everyone loads — but once a save has been published, staging behaves as it did and
- * players keep loading the published version.
- *
- * A subroom with neither pointer (never saved, or both dangling) has the key REMOVED
- * rather than set to null: a null `CurrentSave` breaks the client's room parser, so an
- * unsaved subroom has to look like it has no such field at all. The key is deleted rather
- * than merely left unset because the stored blob of a subroom written before saves moved
- * to their own table can still carry a `CurrentSave: null` of its own, which
- * {@link parseSubRoomRow} would spread straight through.
- *
- * `rows` must line up with `subs` positionally; the pointers live on the row, not the
+ * `rows` must line up with `subs` positionally; the pointer lives on the row, not the
  * parsed blob.
  */
 async function attachCurrentSaves(
@@ -936,7 +916,7 @@ async function attachCurrentSaves(
 	subs: SubRoom[],
 	rows: SubRoomRow[]
 ): Promise<void> {
-	const saveIds = [...new Set(rows.map(liveSaveId).filter((id) => id != null))]
+	const saveIds = [...new Set(rows.map((r) => r.current_save_id).filter((id) => id != null))]
 	const byId = new Map<number, SubRoomDataSave>()
 	if (saveIds.length > 0) {
 		const placeholders = saveIds.map((_, i) => `?${i + 1}`).join(',')
@@ -950,10 +930,8 @@ async function attachCurrentSaves(
 		for (const r of results) byId.set(r.sub_room_data_save_id, parseSubRoomSaveRow(r))
 	}
 	subs.forEach((sub, i) => {
-		const id = liveSaveId(rows[i]!)
-		const save = id == null ? undefined : byId.get(id)
-		if (save) sub.CurrentSave = save
-		else delete sub.CurrentSave
+		const id = rows[i]!.current_save_id
+		sub.CurrentSave = id == null ? null : (byId.get(id) ?? null)
 	})
 }
 
@@ -1324,12 +1302,9 @@ export async function insertSubRoom(
 		...sub,
 		SubRoomId: subRoomId,
 		RoomId: roomId,
+		CurrentSave: null,
 		StagedSubRoomDataSaveId: null,
 	}
-	// A fresh subroom has no save, so the key is absent rather than null — same rule the
-	// read path applies (see {@link attachCurrentSaves}). The delete also drops the SOURCE's
-	// save that the spread carried on a clone; the copy below re-points it at its own row.
-	delete created.CurrentSave
 	// The permission overrides follow the copy too — they live in their own table (keyed by
 	// the id the caller is cloning FROM), so unlike the rest of the settings they aren't
 	// carried by the blob. A fresh subroom (`createSubRoom`) passes no id and copies nothing.
