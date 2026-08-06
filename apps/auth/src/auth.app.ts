@@ -501,6 +501,16 @@ const app = new Hono<App>()
 			// Reads `grant_type`, `account_id`, `platform_id` and `platform` from the
 			// form body.
 			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+
+                        logger.info('TOKEN BODY AFTER PARSE', {
+                                body,
+                                username: body.username,
+                                account_id: body.account_id,
+                        })
+                        logger.info("TOKEN DEBUG BODY", {
+                                body,
+                                contentType: c.req.header("content-type"),
+                        })
 			const grantType = typeof body.grant_type === 'string' ? body.grant_type : ''
 			// `platform`/`platform_id` come from the body for a fresh login; a refresh
 			// grant overrides them below with what was stored when the token was issued.

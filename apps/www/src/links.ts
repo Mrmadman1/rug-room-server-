@@ -8,16 +8,16 @@
  */
 
 /** The community Discord — the join instructions and the build both live there. */
-export const DISCORD_INVITE = 'https://discord.gg/HhmMAKhrz'
+export const DISCORD_INVITE = 'https://discord.gg/m569yWvGEG'
 
 /** Where the stage's "Download for PC" button goes: the client's release listing. */
-export const DOWNLOAD_URL = 'https://github.com/djdevin/recflare-client/releases'
+export const DOWNLOAD_URL = 'https://discord.gg/m569yWvGEG'
 
 /** The stage's "Download for Quest" button: the build's listing on the Meta store. */
-export const QUEST_DOWNLOAD_URL = 'https://www.meta.com/s/22O3QO7ytn'
+export const QUEST_DOWNLOAD_URL = 'https://www.oculus.com/experiences/1034338665907979/release-channels/1015376118029478/?token=MuVtGBbR'
 
-/** The public source repo, linked from the homepage and footer. */
-export const SOURCE_REPO = 'https://github.com/djdevin/recflare'
+/** The Rug Room source repository. */
+export const SOURCE_REPO = 'https://discord.gg/m569yWvGEG'
 
 /** The repo's licence, behind the footer's "MIT licensed". */
 export const LICENSE_URL = `${SOURCE_REPO}/blob/main/LICENSE`
@@ -34,4 +34,4 @@ export const ISSUES_URL = `${SOURCE_REPO}/issues/new`
  * are free and open to anyone in any region — which is what VRC.Privacy.4 asks for. Set
  * it to a real, monitored mailbox and the policy adds it as the preferred contact.
  */
-export const PRIVACY_EMAIL: string = 'privacy@recflare.net'
+export const PRIVACY_EMAIL: string = 'fusionthemadman@gmail.com'
